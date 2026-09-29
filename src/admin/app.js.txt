@@ -476,7 +476,7 @@
   /* ───────── Pagamentos (OxaPay) ───────── */
   var PAY_STATUS = {
     creating: ["", "criando"], pending: ["", "aguardando"], paying: ["warn", "pagando"], paid: ["ok", "pago"],
-    underpaid: ["warn", "pago a menor"], expired: ["", "expirado"], refunding: ["warn", "reembolsando"],
+    underpaid: ["warn", "pago a menor"], expired: ["", "expirado"], canceled: ["", "cancelado"], refunding: ["warn", "reembolsando"],
     refunded: ["bad", "reembolsado"], error: ["bad", "erro"],
   };
   function payBadge(st) { var m = PAY_STATUS[st] || ["", st]; return el("span", { class: "badge " + m[0] }, m[1]); }
@@ -493,7 +493,7 @@
       form.addEventListener("submit", function (e) { e.preventDefault(); pState = { q: q.value.trim(), status: st.value, page: 1 }; router(); });
       var rows = d.payments.map(function (p) {
         var acts = el("div", { class: "row" });
-        if (p.track_id && !p.credited && ["pending", "paying", "expired", "underpaid"].indexOf(p.status) >= 0) {
+        if (p.track_id && !p.credited && ["pending", "paying", "expired", "underpaid", "canceled"].indexOf(p.status) >= 0) {
           acts.appendChild(el("button", { class: "btn s", title: "Consultar status na OxaPay", onclick: function (ev) {
             var b = ev.currentTarget; b.disabled = true;
             api("POST", "/payments/" + encodeURIComponent(p.id) + "/sync").then(function (r) {
@@ -650,6 +650,11 @@
         whBox,
         el("div", { class: "row" },
           el("button", { class: "btn", onclick: function () { api("GET", "/webhook").then(function (r) { showWh(r.info); }, function (e) { toast(e.message, "bad"); }); } }, "Ver status (getWebhookInfo)"),
+          el("button", { class: "btn", onclick: function () {
+            confirmDlg("Atualizar comandos, botão de menu, descrição e descrição curta do bot no Telegram?").then(function (ok) {
+              if (ok) api("POST", "/bot/setup").then(function (r) { toast(r.ok ? "Perfil do bot atualizado" : "Parcial: " + JSON.stringify(r.results), r.ok ? "ok" : "bad"); }, function (e) { toast(e.message, "bad"); });
+            });
+          } }, "Configurar comandos/descrição"),
           el("button", { class: "btn p", onclick: function () {
             confirmDlg("Reconfigurar o webhook do bot para " + info.webhook_url + "? (atualizações pendentes são mantidas)").then(function (ok) {
               if (ok) api("POST", "/webhook/reset").then(function (r) { toast(r.ok ? "Webhook configurado" : "Falhou: " + (r.description || ""), r.ok ? "ok" : "bad"); showWh(r.info); }, function (e) { toast(e.message, "bad"); });

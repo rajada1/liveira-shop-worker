@@ -8,6 +8,7 @@
  *    (callbacks use capitalised forms, e.g. "Paying" / "Paid").
  */
 import { nowIso, generateToken, money, audit, tgApi, getSettings, tgEsc } from "./util.js";
+import { invoiceCard, paidCard, editOrSend, sendMessage as uiSend, HOME } from "./ui.js";
 
 export const PUBLIC_BASE_URL = "https://liveira-shop.kelumayou.workers.dev";
 const DEFAULT_API = "https://api.oxapay.com/v1";
@@ -148,9 +149,24 @@ export async function expireStale(env) {
  * Create an OxaPay invoice and a pending payments row.
  * Returns { ok, payment } or { ok:false, reason }.
  */
-export async function createTopupInvoice(env, { userId, chatId, amount, shopName }) {
+export async function createTopupInvoice(env, { userId, chatId, amount, shopName, resume }) {
   if (!merchantKey(env)) return { ok: false, reason: "unconfigured" };
   await expireStale(env);
+  resume = /^[a-z0-9_-]{1,32}:\d{1,4}$/.test(String(resume || "")) ? String(resume) : null;
+  // Re-use a fresh open invoice for the same amount (double taps, re-opened flows).
+  const reuse = await env.DB.prepare(
+    `SELECT * FROM payments WHERE telegram_user_id=? AND amount_usd=? AND status='pending' AND credited=0
+       AND pay_link IS NOT NULL AND expires_at > ? ORDER BY created_at DESC LIMIT 1`
+  )
+    .bind(userId, amount, new Date(Date.now() + 15 * 60000).toISOString())
+    .first();
+  if (reuse) {
+    if (resume !== (reuse.resume || null)) {
+      await env.DB.prepare("UPDATE payments SET resume=?, updated_at=? WHERE id=? AND credited=0").bind(resume, nowIso(), reuse.id).run();
+      reuse.resume = resume;
+    }
+    return { ok: true, payment: reuse, reused: true };
+  }
   const since = new Date(Date.now() - 3600 * 1000).toISOString();
   const open = await env.DB.prepare(
     "SELECT COUNT(*) AS n FROM payments WHERE telegram_user_id=? AND status IN ('creating','pending') AND created_at >= ?"
@@ -162,10 +178,10 @@ export async function createTopupInvoice(env, { userId, chatId, amount, shopName
   const id = newPaymentId();
   const at = nowIso();
   await env.DB.prepare(
-    `INSERT INTO payments (id, provider, telegram_user_id, chat_id, amount_usd, status, created_at, updated_at)
-     VALUES (?, 'oxapay', ?, ?, ?, 'creating', ?, ?)`
+    `INSERT INTO payments (id, provider, telegram_user_id, chat_id, amount_usd, status, created_at, updated_at, resume)
+     VALUES (?, 'oxapay', ?, ?, ?, 'creating', ?, ?, ?)`
   )
-    .bind(id, userId, chatId ?? null, amount, at, at)
+    .bind(id, userId, chatId ?? null, amount, at, at, resume)
     .run();
 
   const uname = await botUsername(env);
@@ -214,7 +230,7 @@ export async function createTopupInvoice(env, { userId, chatId, amount, shopName
 
 async function notifyUser(env, chatId, text, extra = {}) {
   try {
-    await tgApi(env, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra });
+    await uiSend(env, chatId, text, extra);
   } catch (e) {
     console.error("notify failed", e);
   }
@@ -318,24 +334,64 @@ export async function applyStatus(env, pay, rawStatus, payload, source) {
   return { action: "unknown_status" };
 }
 
+/** Remember which message shows the invoice card so the callback can edit it later. */
+export async function setPaymentMessage(env, id, chatId, messageId) {
+  if (!messageId) return;
+  await env.DB.prepare("UPDATE payments SET message_id=?, chat_id=COALESCE(?, chat_id) WHERE id=?").bind(messageId, chatId ?? null, id).run();
+}
+
+/** User cancels an unpaid invoice (local only: a late payment is still credited). */
+export async function cancelPayment(env, id, userId) {
+  const r = await env.DB.prepare(
+    "UPDATE payments SET status='canceled', updated_at=? WHERE id=? AND telegram_user_id=? AND credited=0 AND status='pending'"
+  )
+    .bind(nowIso(), id, userId)
+    .run();
+  if (r.meta?.changes === 1) await audit(env, `tg:${userId}`, "oxapay_invoice_canceled", { payment_id: id });
+  return r.meta?.changes === 1;
+}
+
+function supportLineFor(s) {
+  return s.support_contact ? `💬 Support: ${tgEsc(s.support_contact)}` : "💬 Please contact the shop admin.";
+}
+
+/** After a successful credit: turn the invoice card into a ✅ paid card, and send a notification. */
 export async function notifyCredit(env, pay, r) {
   const s = await getSettings(env);
   const cur = s.currency_symbol || "$";
-  await notifyUser(
-    env,
-    pay.chat_id || pay.telegram_user_id,
-    `✅ Payment confirmed, +${money(r.amount, cur)} added. New balance: ${money(r.newBalance, cur)}`,
-    { reply_markup: { inline_keyboard: [[{ text: "Shop", callback_data: "shop" }], [{ text: "Menu", callback_data: "menu" }]] } }
-  );
+  const chatId = pay.chat_id || pay.telegram_user_id;
+  const card = paidCard(pay, s, r.newBalance);
+  let edited = false;
+  if (pay.message_id) {
+    const res = await editOrSend(env, chatId, pay.message_id, card.text, { reply_markup: card.reply_markup }, { fallback: false });
+    edited = !!res.ok;
+  }
+  try {
+    await uiSend(
+      env,
+      chatId,
+      `✅ Payment confirmed, +${money(r.amount, cur)} added. New balance: ${money(r.newBalance, cur)}`,
+      edited
+        ? { reply_parameters: { message_id: pay.message_id, allow_sending_without_reply: true } }
+        : { reply_markup: card.reply_markup }
+    );
+  } catch (err) {
+    console.error("notify failed", err);
+  }
 }
 
 async function notifyUnderpaid(env, pay) {
   const s = await getSettings(env);
-  const support = s.support_contact ? `Support: ${tgEsc(s.support_contact)}` : "Please contact the shop admin.";
+  const chatId = pay.chat_id || pay.telegram_user_id;
+  if (pay.message_id) {
+    const card = invoiceCard({ ...pay, status: "underpaid" }, s, supportLineFor(s));
+    await editOrSend(env, chatId, pay.message_id, card.text, { reply_markup: card.reply_markup }, { fallback: false });
+  }
   await notifyUser(
     env,
-    pay.chat_id || pay.telegram_user_id,
-    `⚠️ Your crypto payment for the ${money(pay.amount_usd, s.currency_symbol || "$")} top-up was underpaid, so it was not credited automatically.\n${support}`
+    chatId,
+    `⚠️ Your crypto payment for the ${money(pay.amount_usd, s.currency_symbol || "$")} top-up was underpaid, so it was not credited automatically.\n${supportLineFor(s)}`,
+    { reply_markup: { inline_keyboard: [[HOME()]] } }
   );
 }
 

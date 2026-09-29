@@ -59,9 +59,8 @@ export function b64urlDecode(str) {
 export const SETTING_DEFAULTS = {
   shop_name: "Liveira Shop",
   welcome_text:
-    "Buy products with your balance and receive a time-limited access token.\n" +
-    "Use your token to unlock access in the Liveira program.\n" +
-    "Balance is credited by the shop admin.",
+    "Get your Liveira license in seconds.\n" +
+    "Top up with crypto — your balance is credited automatically.",
   support_contact: "",
   currency_symbol: "$",
   maintenance_mode: "0",

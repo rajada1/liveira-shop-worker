@@ -384,6 +384,7 @@ async function route(ctx, method, api) {
   if (api === "/settings" && method === "PUT") return putSettings(ctx);
   if (api === "/webhook" && method === "GET") return webhookInfo(ctx);
   if (api === "/webhook/reset" && method === "POST") return webhookReset(ctx);
+  if (api === "/bot/setup" && method === "POST") return botSetup(ctx);
   if (api === "/sessions/revoke-all" && method === "POST") {
     const next = String((parseInt(ctx.settings.session_epoch, 10) || 1) + 1);
     await setSetting(env, "session_epoch", next);
@@ -722,7 +723,7 @@ async function listOrders({ env, url }) {
 
 /* ─── crypto payments (OxaPay) ─── */
 
-const PAYMENT_STATUSES = ["creating", "pending", "paying", "paid", "underpaid", "expired", "refunding", "refunded", "error"];
+const PAYMENT_STATUSES = ["creating", "pending", "paying", "paid", "underpaid", "expired", "canceled", "refunding", "refunded", "error"];
 
 async function listPayments({ env, url }) {
   await expireStale(env);
@@ -1000,6 +1001,62 @@ async function webhookReset(ctx) {
   return aj({ ok: !!r.ok, description: r.description || null, info: sanitizeWebhookInfo(info) });
 }
 
+/* ─── bot profile: commands, menu button, descriptions (Bot API setMy*) ─── */
+
+const USER_COMMANDS = [
+  { command: "start", description: "🏠 Home" },
+  { command: "shop", description: "🛒 Browse products" },
+  { command: "topup", description: "💰 Top up balance (crypto)" },
+  { command: "licenses", description: "🔑 My licenses" },
+  { command: "downloads", description: "📥 Downloads" },
+  { command: "profile", description: "👤 Profile & history" },
+  { command: "support", description: "💬 Help & support" },
+];
+const ADMIN_COMMANDS = [
+  ...USER_COMMANDS,
+  { command: "addbal", description: "Admin: add balance (@user amount)" },
+  { command: "subbal", description: "Admin: subtract balance (@user amount)" },
+  { command: "setbal", description: "Admin: set balance (@user amount)" },
+  { command: "bal", description: "Admin: show balance (@user)" },
+  { command: "whoami", description: "Show my Telegram ID" },
+];
+
+export function botProfileTexts(shopName) {
+  const n = String(shopName || "Liveira Shop").slice(0, 60);
+  return {
+    description: (
+      `🛒 ${n} — get your Liveira license in seconds.\n\n` +
+      "💰 Top up your balance with crypto (USDT, BTC, ETH, TON and more) — credited automatically.\n" +
+      "🔑 Receive your license key instantly and download the program.\n\n" +
+      "Tap Start to begin."
+    ).slice(0, 512),
+    short_description: `${n}: Liveira licenses in seconds. Crypto top-ups credited automatically.`.slice(0, 120),
+  };
+}
+
+async function botSetup({ env, settings, actor }) {
+  if (!env.BOT_TOKEN) throw new HttpError(503, "BOT_TOKEN não configurado");
+  const t = botProfileTexts(settings.shop_name);
+  const results = {};
+  const call = async (name, method, body) => {
+    const r = await tgApi(env, method, body);
+    results[name] = r.ok ? "ok" : r.description || "erro";
+  };
+  await call("commands", "setMyCommands", { commands: USER_COMMANDS, scope: { type: "default" } });
+  await call("menu_button", "setChatMenuButton", { menu_button: { type: "commands" } });
+  await call("description", "setMyDescription", { description: t.description });
+  await call("short_description", "setMyShortDescription", { short_description: t.short_description });
+  const ids = String(env.ADMIN_IDS || "").split(",").map((x) => x.trim()).filter((x) => /^\d+$/.test(x));
+  let adminOk = 0;
+  for (const id of ids.slice(0, 10)) {
+    const r = await tgApi(env, "setMyCommands", { commands: ADMIN_COMMANDS, scope: { type: "chat", chat_id: Number(id) } });
+    if (r.ok) adminOk++;
+  }
+  results.admin_commands = `${adminOk}/${ids.length}`;
+  await audit(env, actor, "bot_setup", results);
+  return aj({ ok: Object.entries(results).every(([k, v]) => k === "admin_commands" || v === "ok"), results });
+}
+
 /* ─── audit ─── */
 
 async function listAudit({ env, url }) {
@@ -1035,7 +1092,7 @@ async function broadcast({ request, env, actor }) {
   let sent = 0;
   let failed = 0;
   for (const r of results || []) {
-    const res = await tgApi(env, "sendMessage", { chat_id: r.user_id, text, disable_web_page_preview: true });
+    const res = await tgApi(env, "sendMessage", { chat_id: r.user_id, text, link_preview_options: { is_disabled: true } });
     if (res.ok) sent++;
     else failed++;
   }
