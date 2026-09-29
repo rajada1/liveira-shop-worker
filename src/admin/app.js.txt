@@ -1,0 +1,668 @@
+"use strict";
+(function () {
+  var $app = document.getElementById("app");
+  var ME = null;
+  var PRODUCTS_CACHE = null;
+
+  /* ───────── helpers ───────── */
+  function el(tag, attrs) {
+    var n = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (k) {
+        var v = attrs[k];
+        if (v === null || v === undefined || v === false) return;
+        if (k === "class") n.className = v;
+        else if (k === "text") n.textContent = v;
+        else if (k.slice(0, 2) === "on" && typeof v === "function") n.addEventListener(k.slice(2), v);
+        else if (k === "value") n.value = v;
+        else if (k === "checked") n.checked = !!v;
+        else n.setAttribute(k, v === true ? "" : String(v));
+      });
+    }
+    var kids = Array.prototype.slice.call(arguments, 2);
+    (function add(list) {
+      list.forEach(function (c) {
+        if (c === null || c === undefined || c === false) return;
+        if (Array.isArray(c)) return add(c);
+        n.appendChild(c instanceof Node ? c : document.createTextNode(String(c)));
+      });
+    })(kids);
+    return n;
+  }
+  function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); return n; }
+  function cur() { return (ME && ME.currency_symbol) || "$"; }
+  function money(v) {
+    return cur() + Number(v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  function fmtDate(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso);
+    return d.toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo", day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+  function fmtSize(n) {
+    n = Number(n || 0);
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+    if (n >= 1024) return Math.round(n / 1024) + " KB";
+    return n + " B";
+  }
+  function userLabel(id, username) { return username ? "@" + username + " (" + id + ")" : String(id == null ? "—" : id); }
+  function toast(msg, kind) {
+    var t = el("div", { class: "toast " + (kind || "") }, msg);
+    document.getElementById("toasts").appendChild(t);
+    setTimeout(function () { t.remove(); }, kind === "bad" ? 6000 : 3500);
+  }
+  function statusBadge(s) {
+    var map = { active: ["ok", "ativo"], expired: ["warn", "expirado"], revoked: ["bad", "revogado"] };
+    var m = map[s] || ["", s];
+    return el("span", { class: "badge " + m[0] }, m[1]);
+  }
+  function copy(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { toast("Copiado", "ok"); }, function () { toast("Não foi possível copiar", "bad"); });
+    } else toast("Copie manualmente", "bad");
+  }
+  function qs(obj) {
+    var p = [];
+    Object.keys(obj).forEach(function (k) { if (obj[k] !== "" && obj[k] != null) p.push(encodeURIComponent(k) + "=" + encodeURIComponent(obj[k])); });
+    return p.length ? "?" + p.join("&") : "";
+  }
+
+  function api(method, path, body) {
+    var opt = { method: method, headers: { "X-Requested-With": "liveira-admin" }, credentials: "same-origin" };
+    if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+    return fetch("/admin/api" + path, opt).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) {
+        if (r.status === 401 && path !== "/login") { ME = null; renderLogin("Sessão expirada. Entre novamente."); throw new Error("Não autenticado"); }
+        if (!r.ok) throw new Error(d.error || "Erro HTTP " + r.status);
+        return d;
+      });
+    });
+  }
+
+  /* ───────── modal ───────── */
+  function modal(title, body, actions) {
+    var ov = el("div", { class: "ov" });
+    var box = el("div", { class: "modal", role: "dialog", "aria-modal": "true" }, el("h2", null, title), body);
+    var acts = el("div", { class: "acts" });
+    function close() { ov.remove(); document.removeEventListener("keydown", onKey); }
+    function onKey(e) { if (e.key === "Escape") close(); }
+    (actions || [{ text: "Fechar" }]).forEach(function (a) {
+      var b = el("button", { class: "btn " + (a.cls || ""), type: "button" }, a.text);
+      b.addEventListener("click", function () {
+        if (!a.onClick) return close();
+        var r = a.onClick(close, b);
+        if (r && r.then) { b.disabled = true; r.then(function (v) { b.disabled = false; if (v !== false) close(); }, function (e) { b.disabled = false; toast(e.message, "bad"); }); }
+        else if (r !== false) close();
+      });
+      acts.appendChild(b);
+    });
+    box.appendChild(acts);
+    ov.appendChild(box);
+    ov.addEventListener("mousedown", function (e) { if (e.target === ov) close(); });
+    document.addEventListener("keydown", onKey);
+    document.body.appendChild(ov);
+    var f = box.querySelector("input,textarea,select");
+    if (f) setTimeout(function () { f.focus(); }, 30);
+    return { close: close, box: box };
+  }
+  function confirmDlg(msg, okText, danger) {
+    return new Promise(function (resolve) {
+      var done = false;
+      var m = modal("Confirmar", el("div", { class: "desc" }, msg), [
+        { text: "Cancelar", onClick: function () { done = true; resolve(false); } },
+        { text: okText || "Confirmar", cls: danger ? "d" : "p", onClick: function () { done = true; resolve(true); } },
+      ]);
+      var obs = new MutationObserver(function () { if (!document.body.contains(m.box)) { obs.disconnect(); if (!done) resolve(false); } });
+      obs.observe(document.body, { childList: true });
+    });
+  }
+  function field(label, input) { return el("label", { class: "f" }, el("span", null, label), input); }
+
+  function pager(total, page, size, go) {
+    var pages = Math.max(1, Math.ceil(total / size));
+    return el("div", { class: "pager" },
+      el("span", { class: "muted small" }, total + " registro(s) — pág. " + page + "/" + pages),
+      el("button", { class: "btn s", disabled: page <= 1, onclick: function () { go(page - 1); } }, "‹"),
+      el("button", { class: "btn s", disabled: page >= pages, onclick: function () { go(page + 1); } }, "›"));
+  }
+  function table(headers, rows, emptyText) {
+    if (!rows.length) return el("div", { class: "empty" }, emptyText || "Nada encontrado.");
+    rows.forEach(function (tr) {
+      Array.prototype.forEach.call(tr.children, function (td, i) { var h = headers[i]; if (h) td.setAttribute("data-label", h.t || h); });
+    });
+    return el("div", { class: "tw" }, el("table", { class: "rsp" },
+      el("thead", null, el("tr", null, headers.map(function (h) { return el("th", { class: h.cls || null }, h.t || h); }))),
+      el("tbody", null, rows)));
+  }
+  function loadProducts(force) {
+    if (PRODUCTS_CACHE && !force) return Promise.resolve(PRODUCTS_CACHE);
+    return api("GET", "/products").then(function (d) { PRODUCTS_CACHE = d.products; ME.files_enabled = d.files_enabled; return d.products; });
+  }
+  function productSelect(value, allLabel) {
+    var s = el("select", null, allLabel ? el("option", { value: "" }, allLabel) : null);
+    (PRODUCTS_CACHE || []).forEach(function (p) { s.appendChild(el("option", { value: p.id }, p.name + (p.active ? "" : " (inativo)"))); });
+    s.value = value || "";
+    return s;
+  }
+
+  /* ───────── login ───────── */
+  function renderLogin(msg) {
+    clear($app);
+    var pw = el("input", { type: "password", autocomplete: "current-password", placeholder: "Senha do painel", required: true });
+    var btn = el("button", { class: "btn p", type: "submit" }, "Entrar");
+    var err = el("div", { class: "small", role: "alert" });
+    if (msg) { err.textContent = msg; err.className = "small muted"; }
+    var form = el("form", { class: "card" }, el("h1", null, "Painel Liveira Shop"), field("Senha", pw), err, el("div", { class: "row" }, btn));
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      btn.disabled = true; err.textContent = ""; err.className = "small";
+      api("POST", "/login", { password: pw.value }).then(function () {
+        pw.value = ""; boot();
+      }, function (e2) { err.textContent = e2.message; err.className = "small"; err.style.color = "var(--bad)"; btn.disabled = false; pw.select(); });
+    });
+    $app.appendChild(el("div", { class: "login" }, form));
+    pw.focus();
+  }
+
+  /* ───────── shell ───────── */
+  var NAV = [
+    ["dashboard", "Painel"], ["produtos", "Produtos"], ["usuarios", "Usuários"], ["pedidos", "Pedidos"],
+    ["tokens", "Tokens"], ["config", "Configurações"], ["logs", "Logs"], ["broadcast", "Transmissão"],
+  ];
+  var $main, $side, $scrim, $title;
+  function renderShell() {
+    clear($app);
+    var nav = el("nav", { class: "nav" }, NAV.map(function (n) { return el("a", { href: "#/" + n[0], "data-r": n[0] }, n[1]); }));
+    $side = el("aside", { class: "side" },
+      el("div", { class: "brand" }, ME.shop_name || "Liveira Shop", el("small", null, "Painel administrativo")),
+      nav,
+      el("div", { class: "foot" }, el("button", { class: "btn s", onclick: logout }, "Sair")));
+    $scrim = el("div", { class: "scrim", onclick: closeSide });
+    $title = el("div", { class: "t" }, "");
+    var top = el("div", { class: "top" }, el("button", { class: "btn s", "aria-label": "Menu", onclick: function () { $side.classList.add("open"); $scrim.classList.add("on"); } }, "☰"), $title);
+    $main = el("main", { class: "main" });
+    $app.appendChild(el("div", { class: "shell" }, $side, $scrim, el("div", { class: "grow" }, top, $main)));
+    nav.addEventListener("click", closeSide);
+  }
+  function closeSide() { $side.classList.remove("open"); $scrim.classList.remove("on"); }
+  function logout() {
+    api("POST", "/logout").then(function () { ME = null; renderLogin("Você saiu."); }, function () { renderLogin(); });
+  }
+
+  var VIEWS = {};
+  function router() {
+    if (!ME) return;
+    var h = (location.hash || "#/dashboard").slice(2).split("/");
+    var name = VIEWS[h[0]] ? h[0] : "dashboard";
+    $side.querySelectorAll(".nav a").forEach(function (a) { a.classList.toggle("on", a.getAttribute("data-r") === name); });
+    var label = NAV.filter(function (n) { return n[0] === name; })[0];
+    $title.textContent = label ? label[1] : "";
+    clear($main).appendChild(el("div", { class: "muted" }, "Carregando…"));
+    Promise.resolve(VIEWS[name]($main, h.slice(1))).catch(function (e) {
+      if (e.message !== "Não autenticado") { clear($main).appendChild(el("div", { class: "card" }, "Erro: " + e.message)); }
+    });
+    window.scrollTo(0, 0);
+  }
+  window.addEventListener("hashchange", router);
+
+  /* ───────── Dashboard ───────── */
+  VIEWS.dashboard = function (main) {
+    return api("GET", "/dashboard").then(function (d) {
+      var s = d.stats || {};
+      function stat(k, v, x) { return el("div", { class: "stat" }, el("div", { class: "k" }, k), el("div", { class: "v" }, v), x ? el("div", { class: "x" }, x) : null); }
+      // 14-day chart
+      var start = Date.parse(d.since.d14), map = {};
+      (d.daily || []).forEach(function (r) { map[r.d] = r; });
+      var days = [];
+      for (var i = 0; i < 14; i++) {
+        var key = new Date(start + i * 86400000 - 3 * 3600000).toISOString().slice(0, 10);
+        days.push({ key: key, rev: map[key] ? Number(map[key].rev) : 0, n: map[key] ? map[key].n : 0 });
+      }
+      var max = Math.max.apply(null, days.map(function (x) { return x.rev; }).concat([1]));
+      var bars = el("div", { class: "bars" }, days.map(function (x) {
+        var b = el("div", { class: "b", title: x.key.split("-").reverse().join("/") + ": " + money(x.rev) + " (" + x.n + " pedidos)" });
+        b.style.height = Math.max(2, Math.round((x.rev / max) * 100)) + "%";
+        return b;
+      }));
+      var labels = el("div", { class: "barl" }, days.map(function (x) { return el("span", null, x.key.slice(8, 10)); }));
+      var rows = (d.recent || []).map(function (o) {
+        return el("tr", { class: "click", onclick: function () { location.hash = "#/usuarios/" + o.user_id; } },
+          el("td", null, "#" + o.id), el("td", null, fmtDate(o.created_at)), el("td", null, userLabel(o.user_id, o.username)),
+          el("td", null, o.product_name), el("td", { class: "hide-m" }, (o.duration_days || "—") + " d"), el("td", null, money(o.price)));
+      });
+      clear(main).append(
+        el("h1", null, "Painel"),
+        el("div", { class: "grid" },
+          stat("Usuários", String(s.users || 0), "+" + (s.new_users_7d || 0) + " em 7 dias"),
+          stat("Receita total", money(s.revenue), (s.orders_total || 0) + " pedidos"),
+          stat("Pedidos hoje", String(s.today_n || 0), money(s.today_rev)),
+          stat("Pedidos 7 dias", String(s.d7_n || 0), money(s.d7_rev)),
+          stat("Pedidos 30 dias", String(s.d30_n || 0), money(s.d30_rev)),
+          stat("Tokens ativos", String(s.active_tokens || 0)),
+          stat("Saldo em carteiras", money(s.balances)),
+          stat("Produtos ativos", String(s.active_products || 0))),
+        el("div", { class: "card" }, el("h2", null, "Receita — últimos 14 dias"), bars, labels),
+        el("div", { class: "card" }, el("h2", null, "Pedidos recentes"),
+          table(["#", "Data", "Usuário", "Produto", { t: "Dias", cls: "hide-m" }, "Preço"], rows, "Nenhum pedido ainda.")),
+        el("div", { class: "muted small" }, "Horários em America/Sao_Paulo (BRT)."));
+    });
+  };
+
+  /* ───────── Produtos ───────── */
+  VIEWS.produtos = function (main) {
+    return loadProducts(true).then(function (list) {
+      clear(main);
+      main.appendChild(el("div", { class: "row" }, el("h1", { class: "grow" }, "Produtos"),
+        el("button", { class: "btn p", onclick: function () { productForm(null); } }, "+ Novo produto")));
+      if (!ME.files_enabled) main.appendChild(el("div", { class: "warnbox" }, "Armazenamento de arquivos (R2) não está habilitado — upload de arquivos indisponível."));
+      if (!list.length) main.appendChild(el("div", { class: "card empty" }, "Nenhum produto."));
+      list.forEach(function (p, idx) {
+        var prices = p.prices.length ? el("div", { class: "chips" }, p.prices.map(function (x) { return el("span", { class: "chip" }, x.days + " d — " + money(x.price)); }))
+          : el("div", { class: "badge warn" }, "sem preços (não aparece no bot)");
+        var file = p.file_key ? el("div", { class: "small" }, "📎 " + (p.file_name || "arquivo") + " · " + fmtSize(p.file_size) + " · " + fmtDate(p.file_uploaded_at)) : el("div", { class: "small muted" }, "Sem arquivo");
+        main.appendChild(el("div", { class: "card prod" },
+          el("div", { class: "info" },
+            el("div", { class: "row" }, el("strong", null, p.name), p.active ? el("span", { class: "badge ok" }, "ativo") : el("span", { class: "badge bad" }, "inativo"), el("span", { class: "muted mono" }, p.id)),
+            p.description ? el("div", { class: "desc" }, p.description) : null,
+            prices, el("div", { class: "row", style: null }, file)),
+          el("div", { class: "acts" },
+            el("button", { class: "btn s", title: "Subir", disabled: idx === 0, onclick: function () { move(list, idx, -1); } }, "↑"),
+            el("button", { class: "btn s", title: "Descer", disabled: idx === list.length - 1, onclick: function () { move(list, idx, 1); } }, "↓"),
+            el("button", { class: "btn s", onclick: function () { productForm(p); } }, "Editar"),
+            el("button", { class: "btn s", onclick: function () { fileDlg(p); } }, "Arquivo"),
+            el("button", { class: "btn s", onclick: function () {
+              api("PUT", "/products/" + encodeURIComponent(p.id), { active: !p.active }).then(function () { toast(p.active ? "Desativado" : "Ativado", "ok"); router(); }, function (e) { toast(e.message, "bad"); });
+            } }, p.active ? "Desativar" : "Ativar"),
+            el("button", { class: "btn s d", onclick: function () {
+              confirmDlg("Excluir o produto \"" + p.name + "\"? Preços e arquivo serão removidos. Pedidos e tokens existentes continuam válidos.", "Excluir", true).then(function (ok) {
+                if (ok) api("DELETE", "/products/" + encodeURIComponent(p.id)).then(function () { toast("Produto excluído", "ok"); router(); }, function (e) { toast(e.message, "bad"); });
+              });
+            } }, "Excluir"))));
+      });
+    });
+  };
+  function move(list, idx, dir) {
+    var ids = list.map(function (p) { return p.id; });
+    var j = idx + dir; var t = ids[idx]; ids[idx] = ids[j]; ids[j] = t;
+    api("POST", "/products/reorder", { ids: ids }).then(router, function (e) { toast(e.message, "bad"); });
+  }
+  function productForm(p) {
+    var isNew = !p;
+    var id = el("input", { placeholder: "gerado a partir do nome", maxlength: 32, pattern: "[a-z0-9_-]+", autocapitalize: "off" });
+    var name = el("input", { value: p ? p.name : "", maxlength: 80 });
+    var desc = el("textarea", { maxlength: 2000 }); desc.value = p ? p.description : "";
+    var active = el("input", { type: "checkbox", checked: p ? !!p.active : true });
+    var rowsBox = el("div");
+    function addRow(days, price) {
+      var d = el("input", { type: "number", min: 1, max: 3650, step: 1, placeholder: "Dias", inputmode: "numeric", value: days != null ? days : "" });
+      var pr = el("input", { type: "number", min: 0, step: "0.01", placeholder: "Preço", inputmode: "decimal", value: price != null ? price : "" });
+      var r = el("div", { class: "pricerow" }, d, pr, el("button", { class: "btn s d", type: "button", title: "Remover", onclick: function () { r.remove(); } }, "✕"));
+      r._get = function () { return { days: d.value, price: pr.value }; };
+      rowsBox.appendChild(r);
+    }
+    (p ? p.prices : [{ days: 3 }, { days: 7 }, { days: 30 }]).forEach(function (x) { addRow(x.days, x.price); });
+    var body = el("div", null,
+      isNew ? field("ID (opcional, a-z 0-9 _ -)", id) : el("div", { class: "muted small f" }, "ID: ", el("span", { class: "mono" }, p.id)),
+      field("Nome", name), field("Descrição (exibida no bot)", desc),
+      el("label", { class: "chk" }, active, "Ativo (visível na loja)"),
+      el("div", { class: "f" }, el("span", { class: "muted small" }, "Opções de duração (dias → preço " + cur() + ")"), rowsBox,
+        el("button", { class: "btn s", type: "button", onclick: function () { addRow(); } }, "+ Adicionar opção")));
+    modal(isNew ? "Novo produto" : "Editar produto", body, [
+      { text: "Cancelar" },
+      { text: "Salvar", cls: "p", onClick: function () {
+        var prices = [];
+        rowsBox.childNodes.forEach(function (r) { var v = r._get(); if (v.days !== "" || v.price !== "") prices.push({ days: Number(v.days), price: v.price === "" ? NaN : Number(v.price) }); });
+        var payload = { name: name.value, description: desc.value, active: active.checked, prices: prices };
+        if (isNew && id.value.trim()) payload.id = id.value.trim().toLowerCase();
+        return api(isNew ? "POST" : "PUT", isNew ? "/products" : "/products/" + encodeURIComponent(p.id), payload)
+          .then(function () { toast("Produto salvo", "ok"); router(); });
+      } },
+    ]);
+  }
+  function uploadXhr(pid, file, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var x = new XMLHttpRequest();
+      x.open("PUT", "/admin/api/products/" + encodeURIComponent(pid) + "/file");
+      x.setRequestHeader("X-Requested-With", "liveira-admin");
+      x.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
+      x.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+      x.upload.onprogress = function (e) { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+      x.onload = function () {
+        var d = {}; try { d = JSON.parse(x.responseText); } catch (e) { /* ignore */ }
+        if (x.status >= 200 && x.status < 300) resolve(d); else reject(new Error(d.error || "HTTP " + x.status));
+      };
+      x.onerror = function () { reject(new Error("Falha de rede no upload")); };
+      x.send(file);
+    });
+  }
+  function fileDlg(p) {
+    if (!ME.files_enabled) {
+      modal("Arquivo — " + p.name, el("div", { class: "warnbox" }, "O armazenamento R2 não está habilitado neste Worker. Habilite o R2 no painel da Cloudflare e faça o bind do bucket para usar arquivos."));
+      return;
+    }
+    var inp = el("input", { type: "file" });
+    var bar = el("div"); var prog = el("div", { class: "progress" }, bar);
+    var status = el("div", { class: "small muted" });
+    var info = p.file_key
+      ? el("div", { class: "kv f" }, el("div", null, "Arquivo"), el("div", null, p.file_name || "—"), el("div", null, "Tamanho"), el("div", null, fmtSize(p.file_size)),
+          el("div", null, "Enviado"), el("div", null, fmtDate(p.file_uploaded_at)), el("div", null, "Baixar"), el("div", null, el("a", { href: "/admin/api/products/" + encodeURIComponent(p.id) + "/file" }, "download")))
+      : el("div", { class: "muted f" }, "Nenhum arquivo enviado.");
+    var body = el("div", null, info,
+      field(p.file_key ? "Substituir por novo arquivo (máx. 50 MB)" : "Enviar arquivo (máx. 50 MB)", inp), prog, status,
+      el("div", { class: "muted small" }, "O arquivo é enviado pelo bot (botão Downloads) somente para usuários com token ativo deste produto."));
+    var acts = [{ text: "Fechar" }];
+    if (p.file_key) acts.push({ text: "Remover arquivo", cls: "d", onClick: function () {
+      return confirmDlg("Remover o arquivo de \"" + p.name + "\"?", "Remover", true).then(function (ok) {
+        if (!ok) return false;
+        return api("DELETE", "/products/" + encodeURIComponent(p.id) + "/file").then(function () { toast("Arquivo removido", "ok"); router(); });
+      });
+    } });
+    acts.push({ text: "Enviar", cls: "p", onClick: function () {
+      var f = inp.files && inp.files[0];
+      if (!f) { toast("Escolha um arquivo", "bad"); return false; }
+      if (f.size > 50 * 1024 * 1024) { toast("Arquivo maior que 50 MB", "bad"); return false; }
+      status.textContent = "Enviando…";
+      return uploadXhr(p.id, f, function (r) { bar.style.width = Math.round(r * 100) + "%"; status.textContent = "Enviando… " + Math.round(r * 100) + "%"; })
+        .then(function () { toast("Arquivo enviado", "ok"); router(); }, function (e) { status.textContent = ""; throw e; });
+    } });
+    modal("Arquivo — " + p.name, body, acts);
+  }
+
+  /* ───────── Usuários ───────── */
+  var uState = { q: "", page: 1 };
+  VIEWS.usuarios = function (main, args) {
+    if (args[0]) return userDetail(main, args[0]);
+    return api("GET", "/users" + qs({ q: uState.q, page: uState.page })).then(function (d) {
+      var q = el("input", { type: "search", placeholder: "ID ou @username", value: uState.q, class: "grow" });
+      var form = el("form", { class: "row card" }, q, el("button", { class: "btn p", type: "submit" }, "Buscar"));
+      form.addEventListener("submit", function (e) { e.preventDefault(); uState.q = q.value.trim(); uState.page = 1; router(); });
+      var rows = d.users.map(function (u) {
+        return el("tr", { class: "click", onclick: function () { location.hash = "#/usuarios/" + u.user_id; } },
+          el("td", { class: "mono" }, String(u.user_id)), el("td", null, u.username ? "@" + u.username : "—"), el("td", null, money(u.balance)),
+          el("td", { class: "hide-m" }, String(u.orders_count)), el("td", { class: "hide-m" }, money(u.spent)), el("td", { class: "hide-m" }, fmtDate(u.created_at)));
+      });
+      clear(main).append(el("h1", null, "Usuários"), form, el("div", { class: "card" },
+        table(["ID", "Username", "Saldo", { t: "Pedidos", cls: "hide-m" }, { t: "Gasto", cls: "hide-m" }, { t: "Criado", cls: "hide-m" }], rows),
+        pager(d.total, d.page, d.page_size, function (pg) { uState.page = pg; router(); })));
+    });
+  };
+  function userDetail(main, id) {
+    return Promise.all([api("GET", "/users/" + encodeURIComponent(id)), loadProducts()]).then(function (res) {
+      var d = res[0], u = d.user, sm = d.summary || {};
+      var op = el("select", null, el("option", { value: "add" }, "Adicionar"), el("option", { value: "sub" }, "Subtrair"), el("option", { value: "set" }, "Definir saldo"));
+      var amt = el("input", { type: "number", min: 0, step: "0.01", placeholder: "Valor", inputmode: "decimal" });
+      var note = el("input", { placeholder: "Nota (opcional)", maxlength: 200 });
+      var bform = el("form", null, el("div", { class: "row" }, el("div", { class: "grow" }, op), el("div", { class: "grow" }, amt)), el("div", { class: "row", }, el("div", { class: "grow" }, note), el("button", { class: "btn p", type: "submit" }, "Aplicar")));
+      bform.querySelectorAll(".row").forEach(function (r) { r.classList.add("f"); });
+      bform.addEventListener("submit", function (e) {
+        e.preventDefault();
+        var a = Number(amt.value);
+        if (amt.value === "" || !isFinite(a)) { toast("Informe um valor", "bad"); return; }
+        var label = { add: "Adicionar " + money(a) + " ao", sub: "Subtrair " + money(a) + " do", set: "Definir " + money(a) + " como" }[op.value];
+        confirmDlg(label + " saldo de " + userLabel(u.user_id, u.username) + "?").then(function (ok) {
+          if (!ok) return;
+          api("POST", "/users/" + u.user_id + "/balance", { op: op.value, amount: a, note: note.value }).then(function (r) { toast("Novo saldo: " + money(r.balance), "ok"); router(); }, function (e2) { toast(e2.message, "bad"); });
+        });
+      });
+      var tabBox = el("div");
+      var tabs = [
+        ["Pedidos (" + d.orders.length + ")", function () {
+          return table(["#", "Data", "Produto", "Dias", "Preço", { t: "Token", cls: "hide-m" }], d.orders.map(function (o) {
+            return el("tr", null, el("td", null, "#" + o.id), el("td", null, fmtDate(o.created_at)), el("td", null, o.product_name), el("td", null, String(o.duration_days || "—")), el("td", null, money(o.price)), el("td", { class: "mono hide-m" }, o.token));
+          }), "Sem pedidos.");
+        }],
+        ["Saldo (" + d.topups.length + ")", function () {
+          return table(["Data", "Valor", "Método", "Status"], d.topups.map(function (t) {
+            return el("tr", null, el("td", null, fmtDate(t.created_at)), el("td", null, (t.amount >= 0 ? "+" : "") + money(t.amount)), el("td", null, t.method), el("td", null, t.status));
+          }), "Sem movimentações.");
+        }],
+        ["Tokens (" + d.tokens.length + ")", function () {
+          return table(["Token", "Produto", "Expira", "Status"], d.tokens.map(function (t) {
+            return el("tr", null, el("td", { class: "mono" }, t.token), el("td", null, t.product_name), el("td", null, fmtDate(t.expires_at)), el("td", null, statusBadge(t.computed_status)));
+          }), "Sem tokens.");
+        }],
+      ];
+      var tabBtns = el("div", { class: "tabs" });
+      tabs.forEach(function (tb, i) {
+        var b = el("button", { class: "btn s" + (i === 0 ? " on" : ""), onclick: function () {
+          tabBtns.querySelectorAll(".btn").forEach(function (x) { x.classList.remove("on"); }); b.classList.add("on"); clear(tabBox).appendChild(tb[1]());
+        } }, tb[0]);
+        tabBtns.appendChild(b);
+      });
+      tabBox.appendChild(tabs[0][1]());
+      clear(main).append(
+        el("div", { class: "row f" }, el("a", { href: "#/usuarios", class: "btn s" }, "‹ Voltar"), el("h1", { class: "grow" }, userLabel(u.user_id, u.username))),
+        el("div", { class: "grid" },
+          el("div", { class: "stat" }, el("div", { class: "k" }, "Saldo"), el("div", { class: "v" }, money(u.balance))),
+          el("div", { class: "stat" }, el("div", { class: "k" }, "Pedidos"), el("div", { class: "v" }, String(sm.orders_count || 0))),
+          el("div", { class: "stat" }, el("div", { class: "k" }, "Total gasto"), el("div", { class: "v" }, money(sm.spent))),
+          el("div", { class: "stat" }, el("div", { class: "k" }, "Total creditado"), el("div", { class: "v" }, money(sm.credited)))),
+        el("div", { class: "card" }, el("h2", null, "Ajustar saldo"), bform),
+        el("div", { class: "card" }, el("div", { class: "row f" }, el("h2", { class: "grow" }, "Histórico"),
+          el("button", { class: "btn s", onclick: function () { createTokenDlg(String(u.user_id)); } }, "+ Criar token")), tabBtns, tabBox),
+        el("div", { class: "muted small" }, "Cadastrado em " + fmtDate(u.created_at)));
+    });
+  }
+
+  /* ───────── Pedidos ───────── */
+  var oState = { product: "", user: "", from: "", to: "", page: 1 };
+  VIEWS.pedidos = function (main) {
+    return loadProducts().then(function () { return api("GET", "/orders" + qs(oState)); }).then(function (d) {
+      var ps = productSelect(oState.product, "Todos os produtos");
+      var us = el("input", { placeholder: "ID ou @username", value: oState.user });
+      var fr = el("input", { type: "date", value: oState.from });
+      var to = el("input", { type: "date", value: oState.to });
+      var form = el("form", { class: "card" },
+        el("div", { class: "row" }, el("div", { class: "grow" }, field("Produto", ps)), el("div", { class: "grow" }, field("Usuário", us))),
+        el("div", { class: "row" }, el("div", { class: "grow" }, field("De", fr)), el("div", { class: "grow" }, field("Até", to))),
+        el("div", { class: "row" }, el("button", { class: "btn p", type: "submit" }, "Filtrar"),
+          el("button", { class: "btn", type: "button", onclick: function () { oState = { product: "", user: "", from: "", to: "", page: 1 }; router(); } }, "Limpar")));
+      form.addEventListener("submit", function (e) { e.preventDefault(); oState = { product: ps.value, user: us.value.trim(), from: fr.value, to: to.value, page: 1 }; router(); });
+      var rows = d.orders.map(function (o) {
+        return el("tr", null, el("td", null, "#" + o.id), el("td", null, fmtDate(o.created_at)),
+          el("td", null, el("a", { href: "#/usuarios/" + encodeURIComponent(o.user_id) }, userLabel(o.user_id, o.username))),
+          el("td", null, o.product_name), el("td", { class: "hide-m" }, String(o.duration_days || "—")), el("td", null, money(o.price)),
+          el("td", { class: "mono hide-m" }, o.token), el("td", { class: "hide-m" }, fmtDate(o.expires_at)));
+      });
+      clear(main).append(el("h1", null, "Pedidos"), form, el("div", { class: "card" },
+        el("div", { class: "row f" }, el("span", { class: "badge" }, d.total + " pedido(s)"), el("span", { class: "badge ok" }, "Total " + money(d.sum))),
+        table(["#", "Data", "Usuário", "Produto", { t: "Dias", cls: "hide-m" }, "Preço", { t: "Token", cls: "hide-m" }, { t: "Expira", cls: "hide-m" }], rows),
+        pager(d.total, d.page, d.page_size, function (pg) { oState.page = pg; router(); })));
+    });
+  };
+
+  /* ───────── Tokens ───────── */
+  var tState = { q: "", status: "", product: "", page: 1 };
+  VIEWS.tokens = function (main) {
+    return loadProducts().then(function () { return api("GET", "/tokens" + qs(tState)); }).then(function (d) {
+      var q = el("input", { type: "search", placeholder: "Token, ID ou @username", value: tState.q });
+      var st = el("select", null, el("option", { value: "" }, "Todos"), el("option", { value: "active" }, "Ativos"), el("option", { value: "expired" }, "Expirados"), el("option", { value: "revoked" }, "Revogados"));
+      st.value = tState.status;
+      var ps = productSelect(tState.product, "Todos os produtos");
+      var form = el("form", { class: "card" },
+        el("div", { class: "row" }, el("div", { class: "grow" }, field("Busca", q)), el("div", { class: "grow" }, field("Status", st)), el("div", { class: "grow" }, field("Produto", ps))),
+        el("div", { class: "row" }, el("button", { class: "btn p", type: "submit" }, "Buscar"),
+          el("button", { class: "btn", type: "button", onclick: function () { tState = { q: "", status: "", product: "", page: 1 }; router(); } }, "Limpar")));
+      form.addEventListener("submit", function (e) { e.preventDefault(); tState = { q: q.value.trim(), status: st.value, product: ps.value, page: 1 }; router(); });
+      var rows = d.tokens.map(function (t) {
+        var acts = el("div", { class: "row" },
+          el("button", { class: "btn s", onclick: function () { copy(t.token); } }, "Copiar"),
+          el("button", { class: "btn s", onclick: function () { extendDlg(t); } }, "Estender"),
+          t.status === "revoked"
+            ? el("button", { class: "btn s", onclick: function () { tokenAct("reactivate", t, "Reativar este token?"); } }, "Reativar")
+            : el("button", { class: "btn s d", onclick: function () { tokenAct("revoke", t, "Revogar este token? O programa deixará de aceitá-lo."); } }, "Revogar"));
+        return el("tr", null, el("td", { class: "mono" }, t.token), el("td", null, t.product_name),
+          el("td", null, t.telegram_user_id ? el("a", { href: "#/usuarios/" + encodeURIComponent(t.telegram_user_id) }, userLabel(t.telegram_user_id, t.username)) : "—"),
+          el("td", { class: "hide-m" }, String(t.duration_days)), el("td", { class: "hide-m" }, fmtDate(t.created_at)), el("td", null, fmtDate(t.expires_at)),
+          el("td", null, statusBadge(t.computed_status)), el("td", null, acts));
+      });
+      clear(main).append(el("div", { class: "row" }, el("h1", { class: "grow" }, "Tokens"), el("button", { class: "btn p", onclick: function () { createTokenDlg(""); } }, "+ Criar token")),
+        form, el("div", { class: "card" },
+          table(["Token", "Produto", "Usuário", { t: "Dias", cls: "hide-m" }, { t: "Criado", cls: "hide-m" }, "Expira", "Status", "Ações"], rows),
+          pager(d.total, d.page, d.page_size, function (pg) { tState.page = pg; router(); })));
+    });
+  };
+  function tokenAct(action, t, msg) {
+    confirmDlg(msg, action === "revoke" ? "Revogar" : "Reativar", action === "revoke").then(function (ok) {
+      if (ok) api("POST", "/tokens/" + action, { token: t.token }).then(function () { toast("Feito", "ok"); router(); }, function (e) { toast(e.message, "bad"); });
+    });
+  }
+  function extendDlg(t) {
+    var days = el("input", { type: "number", step: 1, min: -3650, max: 3650, inputmode: "numeric", placeholder: "Dias (negativo reduz)" });
+    var quick = el("div", { class: "chips f" }, [1, 3, 7, 30].map(function (n) { return el("button", { class: "btn s", type: "button", onclick: function () { days.value = n; } }, "+" + n); }));
+    modal("Estender token", el("div", null, el("div", { class: "mono f" }, t.token), el("div", { class: "muted small f" }, "Expira atualmente: " + fmtDate(t.expires_at) + ". Dias positivos são somados a partir do maior entre agora e a expiração atual."), field("Dias", days), quick), [
+      { text: "Cancelar" },
+      { text: "Aplicar", cls: "p", onClick: function () {
+        return api("POST", "/tokens/extend", { token: t.token, days: Number(days.value) }).then(function (r) { toast("Nova expiração: " + fmtDate(r.token.expires_at), "ok"); router(); });
+      } },
+    ]);
+  }
+  function createTokenDlg(userRef) {
+    loadProducts().then(function (list) {
+      if (!list.length) { toast("Cadastre um produto primeiro", "bad"); return; }
+      var user = el("input", { placeholder: "ID ou @username (opcional)", value: userRef || "" });
+      var ps = productSelect(list[0].id);
+      var days = el("input", { type: "number", min: 1, max: 3650, step: 1, inputmode: "numeric", value: 7 });
+      var quick = el("div", { class: "chips f" });
+      function refreshQuick() {
+        clear(quick);
+        var p = list.filter(function (x) { return x.id === ps.value; })[0];
+        (p ? p.prices : []).forEach(function (x) { quick.appendChild(el("button", { class: "btn s", type: "button", onclick: function () { days.value = x.days; } }, x.days + " d")); });
+      }
+      ps.addEventListener("change", refreshQuick); refreshQuick();
+      modal("Criar token manualmente", el("div", null, field("Usuário", user), field("Produto", ps), field("Dias", days), quick,
+        el("div", { class: "muted small" }, "Não debita saldo e não envia mensagem ao usuário. O token aparece em \"My tokens\" no bot.")), [
+        { text: "Cancelar" },
+        { text: "Criar", cls: "p", onClick: function () {
+          return api("POST", "/tokens", { user: user.value.trim(), product_id: ps.value, days: Number(days.value) }).then(function (r) {
+            modal("Token criado", el("div", null, el("div", { class: "mono f" }, r.token), el("div", { class: "muted small" }, "Expira: " + fmtDate(r.expires_at))), [
+              { text: "Copiar", onClick: function () { copy(r.token); return false; } }, { text: "Fechar", cls: "p" }]);
+            if (location.hash.indexOf("#/tokens") === 0 || location.hash.indexOf("#/usuarios/") === 0) router();
+          });
+        } },
+      ]);
+    }, function (e) { toast(e.message, "bad"); });
+  }
+
+  /* ───────── Configurações ───────── */
+  VIEWS.config = function (main) {
+    return api("GET", "/settings").then(function (d) {
+      var s = d.settings, info = d.info;
+      var shop = el("input", { value: s.shop_name, maxlength: 64 });
+      var welcome = el("textarea", { maxlength: 3000 }); welcome.value = s.welcome_text;
+      var support = el("input", { value: s.support_contact, maxlength: 200, placeholder: "@usuario_suporte" });
+      var curr = el("input", { value: s.currency_symbol, maxlength: 5 });
+      var maint = el("input", { type: "checkbox", checked: s.maintenance_mode === "1" });
+      var mtext = el("textarea", { maxlength: 500 }); mtext.value = s.maintenance_text;
+      var save = el("button", { class: "btn p", type: "submit" }, "Salvar");
+      var form = el("form", { class: "card" }, el("h2", null, "Loja"),
+        field("Nome da loja", shop), field("Mensagem de boas-vindas (/start)", welcome), field("Contato de suporte", support), field("Símbolo da moeda", curr),
+        el("label", { class: "chk" }, maint, "Modo manutenção (bot responde só aos admins)"), field("Mensagem de manutenção", mtext), save);
+      form.addEventListener("submit", function (e) {
+        e.preventDefault(); save.disabled = true;
+        api("PUT", "/settings", { shop_name: shop.value, welcome_text: welcome.value, support_contact: support.value, currency_symbol: curr.value, maintenance_mode: maint.checked ? "1" : "0", maintenance_text: mtext.value })
+          .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); ME.currency_symbol = curr.value; ME.shop_name = shop.value; save.disabled = false; },
+            function (e2) { toast(e2.message, "bad"); save.disabled = false; });
+      });
+      var whBox = el("div", { class: "f" });
+      function showWh(wi) {
+        clear(whBox).appendChild(el("div", { class: "kv" },
+          el("div", null, "Status"), el("div", null, wi.ok ? (wi.url === info.webhook_url ? el("span", { class: "badge ok" }, "OK") : el("span", { class: "badge warn" }, "URL diferente")) : el("span", { class: "badge bad" }, wi.description || "erro")),
+          el("div", null, "URL"), el("div", { class: "mono" }, wi.url || "—"),
+          el("div", null, "Pendentes"), el("div", null, String(wi.pending_update_count)),
+          el("div", null, "Último erro"), el("div", null, wi.last_error_message ? fmtDate(wi.last_error_date) + " — " + wi.last_error_message : "nenhum"),
+          el("div", null, "Updates"), el("div", null, (wi.allowed_updates || ["(todos)"]).join(", ")),
+          el("div", null, "Máx. conexões"), el("div", null, String(wi.max_connections == null ? "—" : wi.max_connections))));
+      }
+      var wh = el("div", { class: "card" }, el("h2", null, "Webhook do Telegram"),
+        el("div", { class: "kv f" }, el("div", null, "URL esperada"), el("div", { class: "mono" }, info.webhook_url),
+          el("div", null, "Secret do webhook"), el("div", null, info.webhook_secret_configured ? el("span", { class: "badge ok" }, "configurado") : el("span", { class: "badge warn" }, "não configurado"))),
+        whBox,
+        el("div", { class: "row" },
+          el("button", { class: "btn", onclick: function () { api("GET", "/webhook").then(function (r) { showWh(r.info); }, function (e) { toast(e.message, "bad"); }); } }, "Ver status (getWebhookInfo)"),
+          el("button", { class: "btn p", onclick: function () {
+            confirmDlg("Reconfigurar o webhook do bot para " + info.webhook_url + "? (atualizações pendentes são mantidas)").then(function (ok) {
+              if (ok) api("POST", "/webhook/reset").then(function (r) { toast(r.ok ? "Webhook configurado" : "Falhou: " + (r.description || ""), r.ok ? "ok" : "bad"); showWh(r.info); }, function (e) { toast(e.message, "bad"); });
+            });
+          } }, "Reconfigurar webhook")));
+      var apiCard = el("div", { class: "card" }, el("h2", null, "API de validação"),
+        el("div", { class: "kv f" },
+          el("div", null, "Validar (POST)"), el("div", { class: "mono" }, info.validate_url),
+          el("div", null, "Consultar (GET)"), el("div", { class: "mono" }, info.token_lookup_url),
+          el("div", null, "Health"), el("div", { class: "mono" }, info.health_url)),
+        el("div", { class: "muted small" }, "Requer o cabeçalho X-API-Key (a chave não é exibida no painel). Corpo do POST: {\"token\": \"...\"}."),
+        el("div", { class: "row", }, el("button", { class: "btn s", onclick: function () { copy(info.validate_url); } }, "Copiar URL")));
+      var sys = el("div", { class: "card" }, el("h2", null, "Sistema"),
+        el("div", { class: "kv f" }, el("div", null, "Arquivos (R2)"), el("div", null, info.files_enabled ? el("span", { class: "badge ok" }, "habilitado") : el("span", { class: "badge bad" }, "desabilitado"))),
+        el("button", { class: "btn d", onclick: function () {
+          confirmDlg("Encerrar todas as sessões do painel (inclusive esta)?", "Encerrar", true).then(function (ok) {
+            if (ok) api("POST", "/sessions/revoke-all").then(function () { ME = null; renderLogin("Todas as sessões foram encerradas."); }, function (e) { toast(e.message, "bad"); });
+          });
+        } }, "Encerrar todas as sessões"));
+      clear(main).append(el("h1", null, "Configurações"), form, wh, apiCard, sys);
+    });
+  };
+
+  /* ───────── Logs ───────── */
+  var lState = { action: "", page: 1 };
+  VIEWS.logs = function (main) {
+    return api("GET", "/audit" + qs(lState)).then(function (d) {
+      var a = el("input", { type: "search", placeholder: "Filtrar por ação (ex.: balance, token, login)", value: lState.action, class: "grow" });
+      var form = el("form", { class: "row card" }, a, el("button", { class: "btn p", type: "submit" }, "Filtrar"));
+      form.addEventListener("submit", function (e) { e.preventDefault(); lState = { action: a.value.trim(), page: 1 }; router(); });
+      var rows = d.entries.map(function (x) {
+        var det = x.details_json || "";
+        try { det = JSON.stringify(JSON.parse(det), null, 1); } catch (e) { /* raw */ }
+        return el("tr", null, el("td", null, fmtDate(x.at)), el("td", { class: "mono" }, x.actor), el("td", null, el("span", { class: "badge" }, x.action)), el("td", null, el("div", { class: "pre" }, det)));
+      });
+      clear(main).append(el("h1", null, "Logs de auditoria"), form, el("div", { class: "card" },
+        table(["Data", "Ator", "Ação", "Detalhes"], rows, "Sem registros."),
+        pager(d.total, d.page, d.page_size, function (pg) { lState.page = pg; router(); })));
+    });
+  };
+
+  /* ───────── Transmissão ───────── */
+  VIEWS.broadcast = function (main) {
+    return api("GET", "/broadcast/count").then(function (d) {
+      var txt = el("textarea", { maxlength: 4000, placeholder: "Mensagem (texto simples)" });
+      var bar = el("div"); var prog = el("div", { class: "progress" }, bar);
+      var status = el("div", { class: "small muted" });
+      var btn = el("button", { class: "btn p" }, "Enviar para todos");
+      btn.addEventListener("click", function () {
+        var text = txt.value.trim();
+        if (!text) { toast("Escreva a mensagem", "bad"); return; }
+        confirmDlg("Enviar esta mensagem para " + d.users + " usuário(s)? Esta ação não pode ser desfeita.\n\n" + text, "Enviar", true).then(function (ok) {
+          if (!ok) return;
+          btn.disabled = true; txt.disabled = true;
+          var sent = 0, failed = 0;
+          (function step(offset) {
+            api("POST", "/broadcast", { text: text, offset: offset }).then(function (r) {
+              sent += r.sent; failed += r.failed;
+              bar.style.width = (r.total ? Math.round((r.next_offset / r.total) * 100) : 100) + "%";
+              status.textContent = "Enviadas: " + sent + " · falhas: " + failed + " · " + r.next_offset + "/" + r.total;
+              if (r.done) { toast("Transmissão concluída", "ok"); btn.disabled = false; txt.disabled = false; }
+              else step(r.next_offset);
+            }, function (e) { toast(e.message, "bad"); status.textContent += " — interrompido"; btn.disabled = false; txt.disabled = false; });
+          })(0);
+        });
+      });
+      clear(main).append(el("h1", null, "Transmissão"), el("div", { class: "card" },
+        el("div", { class: "warnbox" }, "Envia uma mensagem do bot para todos os " + d.users + " usuário(s) cadastrados. Enviado em lotes de 25."),
+        field("Mensagem", txt), prog, status, btn));
+    });
+  };
+
+  /* ───────── boot ───────── */
+  function boot() {
+    fetch("/admin/api/me", { credentials: "same-origin" }).then(function (r) {
+      if (r.status === 401) { renderLogin(); return null; }
+      return r.json().then(function (d) { if (!r.ok) throw new Error(d.error || "Erro " + r.status); return d; });
+    }).then(function (me) {
+      if (!me) return;
+      ME = me; PRODUCTS_CACHE = null;
+      renderShell(); router();
+    }).catch(function (e) { clear($app).appendChild(el("div", { class: "boot" }, "Erro: " + e.message)); });
+  }
+  boot();
+})();

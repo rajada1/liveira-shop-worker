@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+api_key.txt
+.env
+*.log
+admin_password.txt
+.index.js.bak-*
