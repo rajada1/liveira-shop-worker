@@ -3,10 +3,12 @@
  * - Token validation API (D1)
  * - Telegram bot webhook (POST /telegram, /webhook)
  * - Admin panel (/admin, /admin/api/*)
+ * - OxaPay payment callback (POST /oxapay/callback)
  */
 import { CORS_HEADERS, json } from "./util.js";
 import { handleTelegramUpdate } from "./bot.js";
 import { handleAdmin } from "./admin.js";
+import { handleOxapayCallback } from "./oxapay.js";
 
 function unauthorized() {
   return json({ error: "Unauthorized" }, 401);
@@ -52,6 +54,34 @@ async function lookupToken(env, token) {
   const expired = isExpired(row.expires_at) || row.status !== "active";
   if (expired) return rowPayload(row, false, "expired");
   return rowPayload(row, true, "active");
+}
+
+/**
+ * Validate + bind token to a machine (first successful validation binds it).
+ * Ported verbatim from the deployed Worker (was not in git yet).
+ */
+async function validateWithMachine(env, token, machineId) {
+  const id = String(machineId || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(id)) return json({ valid: false, error: "machine_required" }, 400);
+  const result = await lookupToken(env, token);
+  if (!result.valid) return json(result);
+  const bound = await env.DB.prepare("SELECT machine_id FROM token_machines WHERE token = ?")
+    .bind(result.token)
+    .first();
+  if (!bound) {
+    await env.DB.prepare(
+      "INSERT INTO token_machines (token, machine_id, bound_at) VALUES (?, ?, ?) ON CONFLICT(token) DO NOTHING"
+    )
+      .bind(result.token, id, new Date().toISOString())
+      .run();
+    const won = await env.DB.prepare("SELECT machine_id FROM token_machines WHERE token = ?")
+      .bind(result.token)
+      .first();
+    if (!won || won.machine_id !== id) return json({ valid: false, error: "machine_mismatch" }, 403);
+    return json(result);
+  }
+  if (bound.machine_id !== id) return json({ valid: false, error: "machine_mismatch" }, 403);
+  return json(result);
 }
 
 async function createToken(env, body) {
@@ -128,6 +158,17 @@ export default {
       return json({ ok: true });
     }
 
+    // OxaPay payment callback (HMAC-SHA512 signed with the merchant API key)
+    if (path === "/oxapay/callback") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      try {
+        return await handleOxapayCallback(request, env, ctx);
+      } catch (err) {
+        console.error("oxapay callback error", err && err.stack ? err.stack : err);
+        return new Response("error", { status: 500 }); // non-200 → OxaPay retries
+      }
+    }
+
     // Protected routes
     const needsKey =
       (request.method === "GET" && path.startsWith("/v1/token/")) ||
@@ -153,7 +194,7 @@ export default {
       } catch {
         return json({ error: "Invalid JSON body" }, 400);
       }
-      return json(await lookupToken(env, body?.token));
+      return validateWithMachine(env, body?.token, body?.machine_id);
     }
 
     if (request.method === "POST" && path === "/v1/tokens") {

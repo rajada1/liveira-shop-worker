@@ -6,3 +6,4 @@ api_key.txt
 *.log
 admin_password.txt
 .index.js.bak-*
+oxapay_merchant_key.txt

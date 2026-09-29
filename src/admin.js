@@ -18,6 +18,7 @@ import {
   getBalance,
   changeBalance,
 } from "./util.js";
+import { topupConfig, syncPayment, expireStale, callbackUrl, round2 } from "./oxapay.js";
 
 const COOKIE = "__Host-lv_admin";
 const SESSION_TTL = 12 * 3600; // seconds
@@ -369,6 +370,10 @@ async function route(ctx, method, api) {
   // Orders
   if (api === "/orders" && method === "GET") return listOrders(ctx);
 
+  // Crypto payments (OxaPay)
+  if (api === "/payments" && method === "GET") return listPayments(ctx);
+  if ((m = api.match(/^\/payments\/([A-Za-z0-9_-]{1,64})\/sync$/)) && method === "POST") return syncPaymentApi(ctx, m[1]);
+
   // Tokens
   if (api === "/tokens" && method === "GET") return listTokens(ctx);
   if (api === "/tokens" && method === "POST") return createTokenAdmin(ctx);
@@ -421,7 +426,9 @@ async function dashboard({ env }) {
       (SELECT COALESCE(SUM(price),0) FROM orders WHERE created_at >= ?3) AS d30_rev,
       (SELECT COUNT(*) FROM tokens WHERE status='active' AND expires_at > ?4) AS active_tokens,
       (SELECT COUNT(*) FROM products WHERE active=1) AS active_products,
-      (SELECT COUNT(*) FROM users WHERE created_at >= ?2) AS new_users_7d`
+      (SELECT COUNT(*) FROM users WHERE created_at >= ?2) AS new_users_7d,
+      (SELECT COUNT(*) FROM payments WHERE credited=1 AND paid_at >= ?3) AS crypto_30d_n,
+      (SELECT COALESCE(SUM(amount_usd),0) FROM payments WHERE credited=1 AND paid_at >= ?3) AS crypto_30d_sum`
   )
     .bind(t0, t7, t30, now)
     .first();
@@ -713,6 +720,61 @@ async function listOrders({ env, url }) {
   return aj({ orders: results || [], total: agg?.n || 0, sum: agg?.sum || 0, page, page_size: limit });
 }
 
+/* ─── crypto payments (OxaPay) ─── */
+
+const PAYMENT_STATUSES = ["creating", "pending", "paying", "paid", "underpaid", "expired", "refunding", "refunded", "error"];
+
+async function listPayments({ env, url }) {
+  await expireStale(env);
+  const { limit, offset, page } = pageOf(url);
+  const conds = [];
+  const binds = [];
+  const status = (url.searchParams.get("status") || "").trim();
+  if (status) {
+    if (!PAYMENT_STATUSES.includes(status)) throw new HttpError(400, "Status inválido");
+    conds.push("p.status = ?");
+    binds.push(status);
+  }
+  let q = (url.searchParams.get("q") || "").trim().slice(0, 64);
+  if (q) {
+    if (/^\d+$/.test(q)) {
+      conds.push("(p.telegram_user_id = ? OR p.track_id = ?)");
+      binds.push(Number(q), q);
+    } else if (q.startsWith("@")) {
+      conds.push("lower(u.username) = lower(?)");
+      binds.push(q.slice(1));
+    } else {
+      conds.push("(p.id = ? OR p.track_id = ? OR lower(COALESCE(u.username,'')) = lower(?))");
+      binds.push(q, q, q);
+    }
+  }
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const base = `FROM payments p LEFT JOIN users u ON u.user_id=p.telegram_user_id ${where}`;
+  const agg = await env.DB.prepare(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN p.credited=1 THEN p.amount_usd ELSE 0 END),0) AS credited_sum ${base}`
+  )
+    .bind(...binds)
+    .first();
+  const { results } = await env.DB.prepare(
+    `SELECT p.id, p.telegram_user_id, u.username, p.amount_usd, p.track_id, p.status, p.last_status, p.pay_link,
+            p.created_at, p.updated_at, p.expires_at, p.paid_at, p.credited ${base}
+      ORDER BY p.created_at DESC LIMIT ${limit} OFFSET ${offset}`
+  )
+    .bind(...binds)
+    .all();
+  return aj({ payments: results || [], total: agg?.n || 0, credited_sum: agg?.credited_sum || 0, page, page_size: limit });
+}
+
+async function syncPaymentApi({ env, actor }, id) {
+  const pay = await env.DB.prepare("SELECT * FROM payments WHERE id=?").bind(id).first();
+  if (!pay) throw new HttpError(404, "Pagamento não encontrado");
+  if (!env.OXAPAY_MERCHANT_KEY) throw new HttpError(503, "OXAPAY_MERCHANT_KEY não configurada");
+  const r = await syncPayment(env, pay, "panel_sync");
+  await audit(env, actor, "payment_sync", { payment_id: id, track_id: pay.track_id, result: r.action, remote_status: r.remoteStatus || null });
+  const upd = await env.DB.prepare("SELECT * FROM payments WHERE id=?").bind(id).first();
+  return aj({ ok: true, result: r.action, remote_status: r.remoteStatus || null, payment: upd });
+}
+
 /* ─── tokens ─── */
 
 async function listTokens({ env, url }) {
@@ -835,6 +897,8 @@ function publicInfo(ctx) {
     health_url: `${o}/health`,
     files_enabled: !!ctx.env.FILES,
     webhook_secret_configured: !!ctx.env.WEBHOOK_SECRET,
+    oxapay_configured: !!ctx.env.OXAPAY_MERCHANT_KEY,
+    oxapay_callback_url: callbackUrl(ctx.env),
   };
 }
 
@@ -854,10 +918,30 @@ async function putSettings({ request, env, settings, actor }) {
     maintenance_text: 500,
   };
   const changed = {};
+  // Crypto top-up numbers: validate together (min ≤ presets ≤ max)
+  const topup = {};
+  if (b.topup_min !== undefined || b.topup_max !== undefined || b.topup_presets !== undefined) {
+    const min = round2(num(b.topup_min ?? settings.topup_min, "Valor mínimo", { min: 0.5, max: 100000 }));
+    const max = round2(num(b.topup_max ?? settings.topup_max, "Valor máximo", { min: 0.5, max: 100000 }));
+    if (max < min) throw new HttpError(400, "Valor máximo deve ser maior ou igual ao mínimo");
+    const rawP = String(b.topup_presets ?? settings.topup_presets).trim();
+    const parts = rawP ? rawP.split(/[,;\s]+/).filter(Boolean) : [];
+    if (parts.length > 8) throw new HttpError(400, "Máximo de 8 valores predefinidos");
+    const presets = [];
+    for (const x of parts) {
+      const n = round2(num(x.replace(",", "."), `Valor predefinido "${x}"`, { min, max }));
+      if (!presets.includes(n)) presets.push(n);
+    }
+    topup.topup_min = String(min);
+    topup.topup_max = String(max);
+    topup.topup_presets = presets.join(",");
+  }
   for (const k of EDITABLE_SETTINGS) {
     if (b[k] === undefined) continue;
     let v;
-    if (k === "maintenance_mode") {
+    if (k in topup) {
+      v = topup[k];
+    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled") {
       v = b[k] === true || b[k] === "1" || b[k] === 1 ? "1" : "0";
     } else {
       v = String(b[k]).replace(/\r\n/g, "\n");

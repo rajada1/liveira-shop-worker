@@ -167,7 +167,7 @@
 
   /* ───────── shell ───────── */
   var NAV = [
-    ["dashboard", "Painel"], ["produtos", "Produtos"], ["usuarios", "Usuários"], ["pedidos", "Pedidos"],
+    ["dashboard", "Painel"], ["produtos", "Produtos"], ["usuarios", "Usuários"], ["pedidos", "Pedidos"], ["pagamentos", "Pagamentos"],
     ["tokens", "Tokens"], ["config", "Configurações"], ["logs", "Logs"], ["broadcast", "Transmissão"],
   ];
   var $main, $side, $scrim, $title;
@@ -241,6 +241,7 @@
           stat("Pedidos 30 dias", String(s.d30_n || 0), money(s.d30_rev)),
           stat("Tokens ativos", String(s.active_tokens || 0)),
           stat("Saldo em carteiras", money(s.balances)),
+          stat("Recargas cripto 30 dias", money(s.crypto_30d_sum), (s.crypto_30d_n || 0) + " pagamento(s)"),
           stat("Produtos ativos", String(s.active_products || 0))),
         el("div", { class: "card" }, el("h2", null, "Receita — últimos 14 dias"), bars, labels),
         el("div", { class: "card" }, el("h2", null, "Pedidos recentes"),
@@ -472,6 +473,54 @@
     });
   };
 
+  /* ───────── Pagamentos (OxaPay) ───────── */
+  var PAY_STATUS = {
+    creating: ["", "criando"], pending: ["", "aguardando"], paying: ["warn", "pagando"], paid: ["ok", "pago"],
+    underpaid: ["warn", "pago a menor"], expired: ["", "expirado"], refunding: ["warn", "reembolsando"],
+    refunded: ["bad", "reembolsado"], error: ["bad", "erro"],
+  };
+  function payBadge(st) { var m = PAY_STATUS[st] || ["", st]; return el("span", { class: "badge " + m[0] }, m[1]); }
+  var pState = { q: "", status: "", page: 1 };
+  VIEWS.pagamentos = function (main) {
+    return api("GET", "/payments" + qs(pState)).then(function (d) {
+      var q = el("input", { type: "search", placeholder: "ID, @username, track id ou referência", value: pState.q });
+      var st = el("select", null, el("option", { value: "" }, "Todos"), Object.keys(PAY_STATUS).map(function (k) { return el("option", { value: k }, PAY_STATUS[k][1]); }));
+      st.value = pState.status;
+      var form = el("form", { class: "card" },
+        el("div", { class: "row" }, el("div", { class: "grow" }, field("Busca", q)), el("div", { class: "grow" }, field("Status", st))),
+        el("div", { class: "row" }, el("button", { class: "btn p", type: "submit" }, "Filtrar"),
+          el("button", { class: "btn", type: "button", onclick: function () { pState = { q: "", status: "", page: 1 }; router(); } }, "Limpar")));
+      form.addEventListener("submit", function (e) { e.preventDefault(); pState = { q: q.value.trim(), status: st.value, page: 1 }; router(); });
+      var rows = d.payments.map(function (p) {
+        var acts = el("div", { class: "row" });
+        if (p.track_id && !p.credited && ["pending", "paying", "expired", "underpaid"].indexOf(p.status) >= 0) {
+          acts.appendChild(el("button", { class: "btn s", title: "Consultar status na OxaPay", onclick: function (ev) {
+            var b = ev.currentTarget; b.disabled = true;
+            api("POST", "/payments/" + encodeURIComponent(p.id) + "/sync").then(function (r) {
+              toast(r.result === "credited" ? "Pago — saldo creditado" : "Status OxaPay: " + (r.remote_status || r.result), r.result === "credited" ? "ok" : "");
+              router();
+            }, function (e2) { b.disabled = false; toast(e2.message, "bad"); });
+          } }, "Sincronizar"));
+        }
+        if (p.track_id) acts.appendChild(el("button", { class: "btn s", onclick: function () { copy(p.track_id); } }, "Copiar track"));
+        return el("tr", null,
+          el("td", null, fmtDate(p.created_at)),
+          el("td", null, el("a", { href: "#/usuarios/" + encodeURIComponent(p.telegram_user_id) }, userLabel(p.telegram_user_id, p.username))),
+          el("td", null, money(p.amount_usd)),
+          el("td", null, payBadge(p.status), p.last_status && p.last_status.length < 40 ? el("div", { class: "muted small" }, "OxaPay: " + p.last_status) : null),
+          el("td", { class: "mono" }, p.track_id || "—"),
+          el("td", { class: "hide-m" }, fmtDate(p.paid_at)),
+          el("td", { class: "mono hide-m small" }, p.id),
+          el("td", null, acts));
+      });
+      clear(main).append(el("h1", null, "Pagamentos (cripto / OxaPay)"), form, el("div", { class: "card" },
+        el("div", { class: "row f" }, el("span", { class: "badge" }, d.total + " pagamento(s)"), el("span", { class: "badge ok" }, "Creditado " + money(d.credited_sum))),
+        table(["Data", "Usuário", "Valor", "Status", "Track ID", { t: "Pago em", cls: "hide-m" }, { t: "Referência", cls: "hide-m" }, "Ações"], rows, "Nenhum pagamento ainda."),
+        pager(d.total, d.page, d.page_size, function (pg) { pState.page = pg; router(); })),
+        el("div", { class: "muted small" }, "Faturas não pagas são marcadas como expiradas ~10 min após o vencimento. Horários em BRT."));
+    });
+  };
+
   /* ───────── Tokens ───────── */
   var tState = { q: "", status: "", product: "", page: 1 };
   VIEWS.tokens = function (main) {
@@ -565,6 +614,26 @@
           .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); ME.currency_symbol = curr.value; ME.shop_name = shop.value; save.disabled = false; },
             function (e2) { toast(e2.message, "bad"); save.disabled = false; });
       });
+      var cEnabled = el("input", { type: "checkbox", checked: s.crypto_topup_enabled === "1" });
+      var cPresets = el("input", { value: s.topup_presets, maxlength: 100, placeholder: "5, 10, 25, 50" });
+      var cMin = el("input", { type: "number", min: 0.5, step: "0.01", value: s.topup_min, inputmode: "decimal" });
+      var cMax = el("input", { type: "number", min: 0.5, step: "0.01", value: s.topup_max, inputmode: "decimal" });
+      var cSave = el("button", { class: "btn p", type: "submit" }, "Salvar");
+      var cform = el("form", { class: "card" }, el("h2", null, "Recarga de saldo com cripto (OxaPay)"),
+        el("div", { class: "kv f" },
+          el("div", null, "Chave OXAPAY_MERCHANT_KEY"), el("div", null, info.oxapay_configured ? el("span", { class: "badge ok" }, "configurada") : el("span", { class: "badge bad" }, "ausente — recarga indisponível no bot")),
+          el("div", null, "Callback URL"), el("div", { class: "mono" }, info.oxapay_callback_url)),
+        el("label", { class: "chk" }, cEnabled, "Recarga com cripto habilitada no bot"),
+        field("Valores predefinidos (USD, separados por vírgula, máx. 8)", cPresets),
+        el("div", { class: "row" }, el("div", { class: "grow" }, field("Valor mínimo (USD)", cMin)), el("div", { class: "grow" }, field("Valor máximo (USD)", cMax))),
+        el("div", { class: "muted small f" }, "O usuário também pode digitar um valor personalizado entre o mínimo e o máximo. O saldo é creditado automaticamente quando a OxaPay confirma o pagamento (status Paid)."),
+        cSave);
+      cform.addEventListener("submit", function (e) {
+        e.preventDefault(); cSave.disabled = true;
+        api("PUT", "/settings", { crypto_topup_enabled: cEnabled.checked ? "1" : "0", topup_presets: cPresets.value, topup_min: cMin.value, topup_max: cMax.value })
+          .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); cSave.disabled = false; router(); },
+            function (e2) { toast(e2.message, "bad"); cSave.disabled = false; });
+      });
       var whBox = el("div", { class: "f" });
       function showWh(wi) {
         clear(whBox).appendChild(el("div", { class: "kv" },
@@ -600,7 +669,7 @@
             if (ok) api("POST", "/sessions/revoke-all").then(function () { ME = null; renderLogin("Todas as sessões foram encerradas."); }, function (e) { toast(e.message, "bad"); });
           });
         } }, "Encerrar todas as sessões"));
-      clear(main).append(el("h1", null, "Configurações"), form, wh, apiCard, sys);
+      clear(main).append(el("h1", null, "Configurações"), form, cform, wh, apiCard, sys);
     });
   };
 

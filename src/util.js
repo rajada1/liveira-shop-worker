@@ -67,6 +67,10 @@ export const SETTING_DEFAULTS = {
   maintenance_mode: "0",
   maintenance_text: "The shop is under maintenance. Please try again later.",
   session_epoch: "1",
+  crypto_topup_enabled: "1",
+  topup_presets: "5,10,25,50",
+  topup_min: "1",
+  topup_max: "1000",
 };
 
 export const EDITABLE_SETTINGS = [
@@ -76,6 +80,10 @@ export const EDITABLE_SETTINGS = [
   "currency_symbol",
   "maintenance_mode",
   "maintenance_text",
+  "crypto_topup_enabled",
+  "topup_presets",
+  "topup_min",
+  "topup_max",
 ];
 
 export async function getSettings(env) {
@@ -156,7 +164,7 @@ export async function audit(env, actor, action, details) {
 export async function tgApi(env, method, body) {
   const token = env.BOT_TOKEN;
   if (!token) throw new Error("BOT_TOKEN missing");
-  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+  const res = await fetch(`${env.TELEGRAM_API_BASE || "https://api.telegram.org"}/bot${token}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -171,7 +179,7 @@ export async function tgApi(env, method, body) {
 export async function tgApiForm(env, method, form) {
   const token = env.BOT_TOKEN;
   if (!token) throw new Error("BOT_TOKEN missing");
-  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+  const res = await fetch(`${env.TELEGRAM_API_BASE || "https://api.telegram.org"}/bot${token}/${method}`, {
     method: "POST",
     body: form,
   });

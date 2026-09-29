@@ -15,6 +15,9 @@ import {
   findUser,
   changeBalance,
 } from "./util.js";
+import { topupConfig, parseAmount, createTopupInvoice, syncPayment, fmtBrt, INVOICE_LIFETIME_MIN } from "./oxapay.js";
+
+const TOPUP_PROMPT = "Enter the top-up amount in USD";
 
 const TG_UPLOAD_LIMIT = 50 * 1024 * 1024; // Bot API sendDocument upload limit
 
@@ -67,6 +70,7 @@ function mainMenuKeyboard() {
     inline_keyboard: [
       [{ text: "Shop", callback_data: "shop" }],
       [{ text: "Balance", callback_data: "balance" }],
+      [{ text: "Top up balance", callback_data: "topup" }],
       [{ text: "My tokens", callback_data: "tokens" }],
       [{ text: "Downloads", callback_data: "downloads" }],
       [{ text: "Help", callback_data: "help" }],
@@ -159,6 +163,14 @@ async function handleCommand(env, message, s) {
   if (cmd === "/menu") {
     await ensureUser(env, user.id, user.username);
     await sendMessage(env, chatId, "Main menu:", { reply_markup: mainMenuKeyboard() });
+    return;
+  }
+
+  if (cmd === "/topup") {
+    await ensureUser(env, user.id, user.username);
+    const args = parseArgs(text);
+    if (args.length) await startTopup(env, user, chatId, null, args.join(" "), s);
+    else await showTopupMenu(env, user, chatId, null, s);
     return;
   }
 
@@ -310,6 +322,144 @@ async function sendProductFile(env, chatId, product) {
   return { ok: true };
 }
 
+/* ─── Crypto top-up (OxaPay) ─── */
+
+function topupUnavailableText(s) {
+  return `Crypto top-up is currently unavailable.\n\nTo top up: ${supportLine(s)}`;
+}
+
+async function show(env, chatId, messageId, text, extra) {
+  if (messageId) return editMessage(env, chatId, messageId, text, extra);
+  return sendMessage(env, chatId, text, extra);
+}
+
+async function showTopupMenu(env, user, chatId, messageId, s) {
+  const tc = topupConfig(s, env);
+  const cur = s.currency_symbol;
+  if (!tc.available) {
+    await show(env, chatId, messageId, topupUnavailableText(s), { reply_markup: backMenuKeyboard("balance") });
+    return;
+  }
+  const bal = await getBalance(env, user.id);
+  const rows = [];
+  for (let i = 0; i < tc.presets.length; i += 2) {
+    rows.push(tc.presets.slice(i, i + 2).map((a) => ({ text: money(a, cur), callback_data: `tu:${a}` })));
+  }
+  rows.push([{ text: "Custom amount", callback_data: "tu:custom" }]);
+  rows.push([{ text: "Back", callback_data: "balance" }]);
+  await show(
+    env,
+    chatId,
+    messageId,
+    `<b>Top up balance</b>\n\nCurrent balance: <b>${e(money(bal, cur))}</b>\n\n` +
+      "Pay with crypto via OxaPay. Your balance is credited automatically once the payment is confirmed.\n" +
+      `Choose an amount (USD, min ${e(money(tc.min, cur))}, max ${e(money(tc.max, cur))}):`,
+    { reply_markup: { inline_keyboard: rows } }
+  );
+}
+
+async function startTopup(env, user, chatId, messageId, amountText, s) {
+  const tc = topupConfig(s, env);
+  const cur = s.currency_symbol;
+  if (!tc.available) {
+    await show(env, chatId, messageId, topupUnavailableText(s), { reply_markup: backMenuKeyboard("menu") });
+    return;
+  }
+  const amount = parseAmount(amountText);
+  if (amount === null || amount < tc.min || amount > tc.max) {
+    await show(
+      env,
+      chatId,
+      messageId,
+      `Invalid amount. Enter a number between ${e(money(tc.min, cur))} and ${e(money(tc.max, cur))} (e.g. 12.50).`,
+      { reply_markup: { inline_keyboard: [[{ text: "Custom amount", callback_data: "tu:custom" }], [{ text: "Back", callback_data: "topup" }]] } }
+    );
+    return;
+  }
+  const r = await createTopupInvoice(env, { userId: user.id, chatId, amount, shopName: s.shop_name });
+  if (!r.ok) {
+    const msg =
+      r.reason === "too_many"
+        ? "You already have several open top-up invoices. Please pay one of them or wait until they expire."
+        : r.reason === "unconfigured"
+          ? topupUnavailableText(s)
+          : `Could not create the payment right now. Please try again later.\n${supportLine(s)}`;
+    await show(env, chatId, messageId, msg, { reply_markup: backMenuKeyboard("topup") });
+    return;
+  }
+  const p = r.payment;
+  await show(
+    env,
+    chatId,
+    messageId,
+    `<b>Top-up invoice: ${e(money(p.amount_usd, cur))}</b>\n\n` +
+      "Tap <b>Pay with crypto</b> and choose any coin on the OxaPay page.\n" +
+      `The link is valid for ${INVOICE_LIFETIME_MIN} minutes (until ${e(fmtBrt(p.expires_at))}).\n\n` +
+      "Your balance is credited automatically once the payment is confirmed on the blockchain — you will get a message here.\n\n" +
+      `Reference: <code>${e(p.id)}</code>`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "Pay with crypto", url: p.pay_link }],
+          [{ text: "Check payment status", callback_data: `tuchk:${p.id}` }],
+          [{ text: "Menu", callback_data: "menu" }],
+        ],
+      },
+    }
+  );
+}
+
+const STATUS_LABEL = {
+  creating: "being created",
+  pending: "waiting for payment",
+  paying: "payment detected, waiting for blockchain confirmation",
+  paid: "paid and credited",
+  underpaid: "underpaid (not credited)",
+  expired: "expired",
+  refunding: "being refunded",
+  refunded: "refunded",
+  error: "failed to create",
+};
+
+async function handleTopupCallback(env, data, user, chatId, messageId, s) {
+  if (data === "topup") return showTopupMenu(env, user, chatId, messageId, s);
+  if (data === "tu:custom") {
+    const tc = topupConfig(s, env);
+    if (!tc.available) return show(env, chatId, messageId, topupUnavailableText(s), { reply_markup: backMenuKeyboard("menu") });
+    await sendMessage(
+      env,
+      chatId,
+      `${TOPUP_PROMPT} (${e(money(tc.min, s.currency_symbol))}–${e(money(tc.max, s.currency_symbol))}), e.g. 15:`,
+      { reply_markup: { force_reply: true, input_field_placeholder: "Amount in USD" } }
+    );
+    return;
+  }
+  if (data.startsWith("tu:")) return startTopup(env, user, chatId, messageId, data.slice(3), s);
+
+  // tuchk:<payment id>
+  const id = data.slice(6);
+  const pay = await env.DB.prepare("SELECT * FROM payments WHERE id=? AND telegram_user_id=?").bind(id, user.id).first();
+  if (!pay) return show(env, chatId, messageId, "Payment not found.", { reply_markup: backMenuKeyboard("menu") });
+  let status = pay.status;
+  if (!pay.credited && pay.track_id && !["error", "refunded"].includes(pay.status)) {
+    const r = await syncPayment(env, pay, "user_check");
+    if (r.action === "credited" || r.action === "duplicate") return; // confirmation message already sent
+    const fresh = await env.DB.prepare("SELECT status FROM payments WHERE id=?").bind(id).first();
+    status = fresh?.status || status;
+  }
+  const kb = [];
+  if (["pending", "paying"].includes(status) && pay.pay_link) kb.push([{ text: "Pay with crypto", url: pay.pay_link }]);
+  if (["pending", "paying"].includes(status)) kb.push([{ text: "Check again", callback_data: `tuchk:${pay.id}` }]);
+  if (["expired", "error"].includes(status)) kb.push([{ text: "New top-up", callback_data: "topup" }]);
+  kb.push([{ text: "Menu", callback_data: "menu" }]);
+  await sendMessage(
+    env,
+    chatId,
+    `Top-up ${e(money(pay.amount_usd, s.currency_symbol))} (<code>${e(pay.id)}</code>)\nStatus: <b>${e(STATUS_LABEL[status] || status)}</b>`,
+    { reply_markup: { inline_keyboard: kb } }
+  );
+}
+
 async function handleCallback(env, query, s) {
   const data = query.data || "";
   const user = query.from;
@@ -337,13 +487,23 @@ async function handleCallback(env, query, s) {
 
   if (data === "balance") {
     const bal = await getBalance(env, user.id);
-    await editMessage(
-      env,
-      chatId,
-      messageId,
-      `Your balance: <b>${e(money(bal, cur))}</b>\n\nTo top up: ${supportLine(s)}`,
-      { reply_markup: backMenuKeyboard("menu") }
-    );
+    const tc = topupConfig(s, env);
+    const hint = tc.available
+      ? "Tap <b>Top up balance</b> to add funds with crypto (credited automatically)."
+      : `To top up: ${supportLine(s)}`;
+    await editMessage(env, chatId, messageId, `Your balance: <b>${e(money(bal, cur))}</b>\n\n${hint}`, {
+      reply_markup: {
+        inline_keyboard: [
+          ...(tc.available ? [[{ text: "Top up balance", callback_data: "topup" }]] : []),
+          [{ text: "Back", callback_data: "menu" }],
+        ],
+      },
+    });
+    return;
+  }
+
+  if (data === "topup" || data.startsWith("tu:") || data.startsWith("tuchk:")) {
+    await handleTopupCallback(env, data, user, chatId, messageId, s);
     return;
   }
 
@@ -353,7 +513,9 @@ async function handleCallback(env, query, s) {
       chatId,
       messageId,
       `<b>${e(s.shop_name)} — Help</b>\n\n` +
-        "1. Ask the admin to credit your balance.\n" +
+        (topupConfig(s, env).available
+          ? "1. Top up your balance with crypto (<b>Top up balance</b>) — it is credited automatically.\n"
+          : "1. Ask the admin to credit your balance.\n") +
         "2. Open <b>Shop</b>, pick a product and duration, confirm.\n" +
         "3. You receive an <b>access token</b>. Enter it in the program to unlock access.\n" +
         "4. Products with a file can be downloaded in <b>Downloads</b> while your token is active.\n\n" +
@@ -476,8 +638,16 @@ async function handleCallback(env, query, s) {
         env,
         chatId,
         messageId,
-        `Insufficient balance.\nYou have ${e(money(bal, cur))}, this costs ${e(money(price, cur))}.\n${supportLine(s)}`,
-        { reply_markup: backMenuKeyboard("shop") }
+        `Insufficient balance.\nYou have ${e(money(bal, cur))}, this costs ${e(money(price, cur))}.\n` +
+          (topupConfig(s, env).available ? "Top up your balance with crypto below." : supportLine(s)),
+        {
+          reply_markup: {
+            inline_keyboard: [
+              ...(topupConfig(s, env).available ? [[{ text: "Top up balance", callback_data: "topup" }]] : []),
+              [{ text: "Back", callback_data: "shop" }],
+            ],
+          },
+        }
       );
       return;
     }
@@ -612,7 +782,23 @@ export async function handleTelegramUpdate(env, update) {
       return;
     }
     if (update.message && update.message.text && update.message.from) {
-      await handleCommand(env, update.message, s);
+      const m = update.message;
+      const replyTo = m.reply_to_message;
+      if (
+        !m.text.startsWith("/") &&
+        replyTo?.from?.is_bot &&
+        String(replyTo.text || "").startsWith(TOPUP_PROMPT) &&
+        m.chat?.type === "private"
+      ) {
+        if (s.maintenance_mode === "1" && !isAdmin(env, m.from.id)) {
+          await sendMessage(env, m.chat.id, e(s.maintenance_text));
+          return;
+        }
+        await ensureUser(env, m.from.id, m.from.username);
+        await startTopup(env, m.from, m.chat.id, null, m.text, s);
+        return;
+      }
+      await handleCommand(env, m, s);
     }
   } catch (err) {
     console.error("Telegram handler error", err);
