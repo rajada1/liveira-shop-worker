@@ -1,5 +1,5 @@
 /* Shared Telegram UI building blocks (HTML parse mode, inline keyboards, BRT time). */
-import { tgEsc as e, money, tgApi } from "./util.js";
+import { tgEsc as e, money, tgApi, acceptedCoins, coinsLabel } from "./util.js";
 
 /* ─── buttons ─── */
 
@@ -121,11 +121,20 @@ const STATUS_LINE = {
   error: "⚠️ Could not be created",
 };
 
-export const HOW_IT_WORKS =
-  "<blockquote><b>How it works</b>\n" +
-  "1. Tap <b>💳 Pay now</b> and choose any crypto (USDT, BTC, ETH, TON, LTC…).\n" +
-  "2. Send the amount shown on the secure OxaPay page.\n" +
-  "3. Your balance is credited automatically — usually within a few minutes.</blockquote>";
+/** Short network hint for the accepted coins ("" if nothing useful to add). */
+export function networkHint(s) {
+  return acceptedCoins(s).includes("USDT") ? " — pick your network on the page (e.g. TRC20 or BEP20)" : "";
+}
+
+/** "How it works" hint; texts adapt to the accepted_currencies setting. */
+export function howItWorks(s, { pickAmount = false } = {}) {
+  return (
+    "<blockquote><b>How it works</b>\n" +
+    `1. ${pickAmount ? "Pick an amount, tap" : "Tap"} <b>💳 Pay now</b> and pay with ${coinsLabel(s, { bold: true })}${networkHint(s)}.\n` +
+    "2. Send the exact amount shown on the secure OxaPay page.\n" +
+    "3. Your balance is credited automatically — usually within a few minutes.</blockquote>"
+  );
+}
 
 export function resumeParts(resume) {
   const m = /^([a-z0-9_-]{1,32}):(\d{1,4})$/.exec(String(resume || ""));
@@ -142,7 +151,7 @@ export function invoiceCard(pay, s, supportLine) {
     text += `⏳ Expires at <b>${e(fmtTimeBrt(pay.expires_at))}</b> (${tgRelTime(pay.expires_at, "60 min")})\n`;
   }
   text += "\n";
-  if (open) text += HOW_IT_WORKS + "\n";
+  if (open) text += howItWorks(s) + "\n";
   if (st === "canceled") text += "<i>If you already sent a payment, it will still be credited automatically.</i>\n\n";
   if (st === "underpaid" || st === "refunding" || st === "refunded") text += `${supportLine}\n\n`;
   text += `Ref: <code>${e(pay.id)}</code>`;

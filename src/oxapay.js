@@ -115,6 +115,38 @@ async function oxapayFetch(env, method, path, body) {
   return { ok, http: res.status, data };
 }
 
+/**
+ * Coins currently enabled for this merchant at OxaPay (they are what the hosted pay page offers;
+ * the v1 invoice API has no per-invoice coin filter) + the networks OxaPay supports for each.
+ * Read-only; used by the admin panel to compare with the accepted_currencies setting.
+ */
+export async function oxapayAcceptedCoins(env) {
+  if (!merchantKey(env)) return { ok: false, reason: "unconfigured" };
+  let acc, common;
+  try {
+    [acc, common] = await Promise.all([
+      oxapayFetch(env, "GET", "/payment/accepted-currencies"),
+      oxapayFetch(env, "GET", "/common/currencies"),
+    ]);
+  } catch (e) {
+    console.error("OxaPay accepted-currencies fetch failed", e);
+    return { ok: false, reason: "api" };
+  }
+  if (!acc.ok || !Array.isArray(acc.data?.data?.list)) return { ok: false, reason: "api", http: acc.http };
+  const list = acc.data.data.list.map((x) => String(x).toUpperCase()).filter((x) => /^[A-Z0-9]{2,10}$/.test(x));
+  const networks = {};
+  const all = common.ok ? common.data.data : {};
+  for (const c of list) {
+    const info = all[c] || all[c.toLowerCase()];
+    if (!info || typeof info.networks !== "object") continue;
+    networks[c] = Object.values(info.networks).map((n) => {
+      const std = (n.keys || []).find((k) => /^(ERC|TRC|BEP)\d+$/.test(k));
+      return std ? `${std} (${n.name || n.network})` : String(n.name || n.network);
+    });
+  }
+  return { ok: true, list, networks };
+}
+
 let BOT_USERNAME = null;
 async function botUsername(env) {
   if (BOT_USERNAME) return BOT_USERNAME;
@@ -390,7 +422,7 @@ async function notifyUnderpaid(env, pay) {
   await notifyUser(
     env,
     chatId,
-    `⚠️ Your crypto payment for the ${money(pay.amount_usd, s.currency_symbol || "$")} top-up was underpaid, so it was not credited automatically.\n${supportLineFor(s)}`,
+    `⚠️ Your payment for the ${money(pay.amount_usd, s.currency_symbol || "$")} top-up was underpaid, so it was not credited automatically.\n${supportLineFor(s)}`,
     { reply_markup: { inline_keyboard: [[HOME()]] } }
   );
 }

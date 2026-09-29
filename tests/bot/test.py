@@ -68,6 +68,7 @@ t = home['body']['text'] if home else ''
 check('/start sends home card (new message)', home and home['tg'] == 'sendMessage')
 check('home: greeting with first name, bold balance, active licenses', 'Hi, <b>Tester</b>' in t and 'Balance: <b>$0.00</b>' in t and 'Active licenses: <b>0</b>' in t, t)
 check('home: welcome text (new default) in blockquote', '<blockquote>Get your Liveira license in seconds.' in t and 'credited by the shop admin' not in t, t)
+check('home: default welcome {coins} → "Top up with USDT", tip mentions USDT, no generic crypto', 'Top up with USDT — your balance is credited automatically.' in t and '{coins}' not in t and 'add funds with USDT' in t and 'crypto' not in t.lower(), t)
 cbs = cbdata(home); rows = home['body']['reply_markup']['inline_keyboard']
 check('home grid 3x2: Shop/Top up/Licenses/Downloads/Profile/Support', [len(r) for r in rows] == [2, 2, 2] and cbs == ['shop', 'topup', 'licenses', 'downloads', 'profile', 'support'], cbs)
 check('home: button labels with emoji', [b['text'] for b in buttons(home)] == ['🛒 Shop', '💰 Top up', '🔑 My licenses', '📥 Downloads', '👤 Profile', '💬 Support'])
@@ -85,6 +86,8 @@ sql("INSERT OR REPLACE INTO settings (key,value) VALUES ('support_contact','@liv
 ev, _, scr = nav(A, 'support', 'support', ['💬 <b>Support</b>', '@liveira_support'])
 check('support: URL button from support_contact', any(b.get('url') == 'https://t.me/liveira_support' for b in buttons(scr)))
 ev, _, scr = nav(A, 'topup', 'top-up', ['💰 <b>Top up balance</b>', 'How it works', 'credited automatically'], ['tuc:5', 'tuc:10', 'tuc:25', 'tuc:50', 'kp:'])
+tt = scr['body']['text']
+check('top-up: USDT only ("We accept: USDT", How it works "pay with USDT", network hint), no other coins', '💳 We accept: <b>USDT</b>' in tt and 'pay with <b>USDT</b> — pick your network on the page (e.g. TRC20 or BEP20)' in tt and not re.search(r'BTC|ETH|LTC|any crypto', tt), tt)
 check('top-up presets as 2x2 grid', [len(r) for r in scr['body']['reply_markup']['inline_keyboard'][:2]] == [2, 2])
 nav(A, 'home', 'home', ['Hi, <b>Tester</b>'], must_home=False)
 nav(A, 'balance', 'legacy "balance" → profile', ['👤 <b>Profile</b>'])
@@ -105,13 +108,16 @@ nav(A, 'kp:1', 'keypad ⌫ (12 → 1)', ['$ 1'])
 ev, ans = A.cb('kpok:')
 check('keypad ✅ empty → "Minimum" toast', len(ans) == 1 and 'Minimum is $1.00' in (ans[0]['body'].get('text') or ''), ans)
 nav(A, 'kp:1000', 'keypad 1000 (max ok)', ['$ 1,000'])
-ev, _, scr = nav(A, 'kpok:12', 'keypad ✅ → confirm top-up', ['💰 <b>Confirm top-up</b>', 'Amount: <b>$12.00</b>'], ['tun:12', 'topup'])
+ev, _, scr = nav(A, 'kpok:12', 'keypad ✅ → confirm top-up', ['💰 <b>Confirm top-up</b>', 'Amount: <b>$12.00</b>', 'Pay with: <b>USDT</b> via OxaPay (network of your choice)'], ['tun:12', 'topup'])
+check('confirm top-up: no "any crypto"', 'any crypto' not in scr['body']['text'])
 
 # ───── invoice card
 ev, ans, scr = nav(A, 'tun:12', 'create invoice → invoice card', ['🧾 <b>Top-up invoice · $12.00</b>', 'Waiting for payment', 'Expires at <b>', 'BRT', '<tg-time unix="', 'How it works'])
 inv = [e for e in ev if e.get('oxapay') == 'invoice']
 check('invoice created once via OxaPay', len(inv) == 1 and inv[0]['body']['amount'] == 12 and inv[0]['body']['lifetime'] == 60 and inv[0]['body']['callback_url'].endswith('/oxapay/callback'))
 T1 = inv[0]['track_id']; P1 = inv[0]['body']['order_id']
+check('invoice card: How it works says USDT only', 'pay with <b>USDT</b>' in scr['body']['text'] and not re.search(r'BTC|ETH|any crypto', scr['body']['text']), scr['body']['text'])
+check('invoice request: priced in USD, only documented OxaPay fields', inv[0]['body']['currency'] == 'USD' and set(inv[0]['body']) <= {'amount', 'currency', 'lifetime', 'callback_url', 'order_id', 'description', 'thanks_message', 'sandbox', 'return_url'}, sorted(inv[0]['body']))
 b = buttons(scr)
 check('invoice card: 💳 Pay now URL (success) / 🔄 Check status / ❌ Cancel (danger) / Home',
       b[0].get('url') == 'https://pay.oxapay.com/' + T1 and b[0]['text'] == '💳 Pay now' and b[0].get('style') == 'success'
@@ -180,7 +186,7 @@ check('licenses: active listed before expired', scr['body']['text'].index('🟢'
 ev, _, scr = nav(B, 'downloads', 'downloads list', ['Tap a product'], ['dl:liveira_access'])
 ev, ans = B.cb('dl:liveira_access')
 check('download: toast + sendDocument', len(ans) == 1 and 'Sending file' in ans[0]['body'].get('text', '') and tg(ev, 'sendDocument'))
-ev, _, scr = nav(B, 'profile', 'profile with history', ['crypto top-up', '+$7.50', 'Liveira Access · 7 days · $10.00'])
+ev, _, scr = nav(B, 'profile', 'profile with history', ['OxaPay top-up', '+$7.50', 'Liveira Access · 7 days · $10.00'])
 ev, _, scr = nav(B, 'home', 'home after purchase', ['Active licenses: <b>1</b>'], must_home=False)
 
 # ───── typing & commands
@@ -262,7 +268,30 @@ cmds = tg(ev, 'setMyCommands')
 check('setMyCommands default + admin chat scope', any(c['body']['scope']['type'] == 'default' for c in cmds) and any(c['body']['scope'] == {'type': 'chat', 'chat_id': 1} for c in cmds) and
       [c['command'] for c in cmds[0]['body']['commands']] == ['start', 'shop', 'topup', 'licenses', 'downloads', 'profile', 'support'])
 check('setChatMenuButton commands + descriptions', tg(ev, 'setChatMenuButton')[0]['body']['menu_button'] == {'type': 'commands'} and tg(ev, 'setMyDescription') and tg(ev, 'setMyShortDescription'))
+desc = tg(ev, 'setMyDescription')[0]['body']['description']; short = tg(ev, 'setMyShortDescription')[0]['body']['short_description']
+check('bot description/short description say USDT, no other coins', 'with USDT' in desc and 'Pay with USDT' in short and not re.search(r'BTC|ETH|TON|crypto', desc + short, re.I), (desc, short))
 s_, body, _ = req('GET', '/admin', None); check('admin page loads', s_ == 200 and 'app.js' in body)
+s_, body, _ = req('GET', '/admin/app.js', None); check('admin app.js: accepted-coins field + OxaPay check', 'Moedas aceitas' in body and '/oxapay/accepted' in body and 'cripto' not in body.lower())
+
+# ───── accepted currencies setting (default USDT, admin-editable, texts adapt)
+s_, body, _ = req('GET', '/admin/api/settings', None, AH); check('settings: accepted_currencies default USDT', s_ == 200 and json.loads(body)['settings']['accepted_currencies'] == 'USDT', body[:300])
+s_, body, _ = req('GET', '/admin/api/oxapay/accepted', None, AH); d = json.loads(body)
+check('admin OxaPay check: live list USDT, matches setting, networks listed', s_ == 200 and d['ok'] and d['oxapay'] == ['USDT'] and d['match'] is True and 'TRC20 (Tron Network)' in d['networks']['USDT'], body)
+for bad in ['US$', '', ',,']:
+    s_, body, _ = req('PUT', '/admin/api/settings', {'accepted_currencies': bad}, AH); check(f'accepted_currencies invalid {bad!r} → 400', s_ == 400, (s_, body))
+s_, body, _ = req('PUT', '/admin/api/settings', {'accepted_currencies': ' usdt, btc usdt '}, AH)
+check('accepted_currencies "usdt, btc usdt" → normalized USDT,BTC', s_ == 200 and sql("SELECT value FROM settings WHERE key='accepted_currencies'")[0]['value'] == 'USDT,BTC', body)
+ev, _, scr = nav(A, 'topup', 'top-up with USDT,BTC setting', ['We accept: <b>USDT</b> or <b>BTC</b>', 'pay with <b>USDT</b> or <b>BTC</b>'])
+s = last_screen(A.msg('/start')); check('home welcome adapts: "Top up with USDT or BTC"', s and 'Top up with USDT or BTC —' in s['body']['text'], s and s['body']['text'])
+s_, body, _ = req('GET', '/admin/api/oxapay/accepted', None, AH); check('admin OxaPay check flags mismatch (setting USDT,BTC vs OxaPay USDT)', json.loads(body)['match'] is False, body)
+m = mark(); req('POST', '/admin/api/bot/setup', None, AH); ev = since(m)
+check('bot description adapts to "USDT or BTC"', 'with USDT or BTC' in tg(ev, 'setMyDescription')[0]['body']['description'])
+sql("INSERT OR REPLACE INTO settings (key,value) VALUES ('welcome_text','Custom hello from the admin')")
+s = last_screen(A.msg('/start')); check('admin-edited welcome text still shown as-is', s and '<blockquote>Custom hello from the admin</blockquote>' in s['body']['text'])
+sql("DELETE FROM settings WHERE key='welcome_text'")
+s_, body, _ = req('PUT', '/admin/api/settings', {'accepted_currencies': 'USDT'}, AH); check('accepted_currencies back to USDT', s_ == 200 and json.loads(body)['changed'] == ['accepted_currencies'])
+ev, _, scr = nav(A, 'topup', 'top-up back to USDT only', ['We accept: <b>USDT</b>\n'])
+check('no BTC after reset', 'BTC' not in scr['body']['text'])
 
 # ───── global: Bot API validation
 viol = [e for e in logs() if 'violation' in e]

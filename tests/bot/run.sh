@@ -16,7 +16,7 @@ OXAPAY_API_BASE=http://127.0.0.1:9911/v1
 TELEGRAM_API_BASE=http://127.0.0.1:9911
 V
 fi
-for f in tests/bot/base_schema.sql migrations/0002_admin_panel.sql migrations/0003_oxapay.sql migrations/0004_bot_ux.sql; do
+for f in tests/bot/base_schema.sql migrations/0002_admin_panel.sql migrations/0003_oxapay.sql migrations/0004_bot_ux.sql migrations/0005_accepted_currencies.sql; do
   env -u CLOUDFLARE_API_TOKEN npx wrangler d1 execute liveira-shop --local --persist-to $T/state --file $f >/dev/null 2>&1
 done
 if curl -s -o /dev/null http://127.0.0.1:8799/health || curl -s -o /dev/null http://127.0.0.1:9911/; then

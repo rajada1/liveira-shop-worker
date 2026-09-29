@@ -60,7 +60,7 @@ export const SETTING_DEFAULTS = {
   shop_name: "Liveira Shop",
   welcome_text:
     "Get your Liveira license in seconds.\n" +
-    "Top up with crypto — your balance is credited automatically.",
+    "Top up with {coins} — your balance is credited automatically.",
   support_contact: "",
   currency_symbol: "$",
   maintenance_mode: "0",
@@ -70,6 +70,7 @@ export const SETTING_DEFAULTS = {
   topup_presets: "5,10,25,50",
   topup_min: "1",
   topup_max: "1000",
+  accepted_currencies: "USDT",
 };
 
 export const EDITABLE_SETTINGS = [
@@ -83,7 +84,37 @@ export const EDITABLE_SETTINGS = [
   "topup_presets",
   "topup_min",
   "topup_max",
+  "accepted_currencies",
 ];
+
+/* ─── Accepted payment coins (setting "accepted_currencies", e.g. "USDT" or "USDT,BTC") ───
+ * OxaPay's v1 invoice API has no per-invoice coin filter: the coins shown on the pay page are
+ * the ones enabled in the OxaPay "Merchant Service" settings (GET /payment/accepted-currencies).
+ * This setting drives the bot texts; the admin panel compares it with OxaPay's live list. */
+
+export function parseCoinList(raw) {
+  const out = [];
+  for (const x of String(raw ?? "").toUpperCase().split(/[\s,;/|]+/)) {
+    if (/^[A-Z0-9]{2,10}$/.test(x) && !out.includes(x)) out.push(x);
+  }
+  return out;
+}
+
+export function acceptedCoins(s) {
+  const l = parseCoinList(s?.accepted_currencies);
+  return l.length ? l.slice(0, 12) : ["USDT"];
+}
+
+/** "USDT" · "USDT or BTC" · "USDT, BTC or ETH" (plain text, safe for HTML: symbols are [A-Z0-9]). */
+export function coinsLabel(s, { bold = false } = {}) {
+  const l = acceptedCoins(s).map((c) => (bold ? `<b>${c}</b>` : c));
+  return l.length === 1 ? l[0] : `${l.slice(0, -1).join(", ")} or ${l[l.length - 1]}`;
+}
+
+/** Welcome/admin texts may contain the placeholder {coins}. */
+export function fillCoins(text, s) {
+  return String(text ?? "").replace(/\{coins\}/g, coinsLabel(s));
+}
 
 export async function getSettings(env) {
   const out = { ...SETTING_DEFAULTS };

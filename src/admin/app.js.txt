@@ -241,7 +241,7 @@
           stat("Pedidos 30 dias", String(s.d30_n || 0), money(s.d30_rev)),
           stat("Tokens ativos", String(s.active_tokens || 0)),
           stat("Saldo em carteiras", money(s.balances)),
-          stat("Recargas cripto 30 dias", money(s.crypto_30d_sum), (s.crypto_30d_n || 0) + " pagamento(s)"),
+          stat("Recargas OxaPay 30 dias", money(s.crypto_30d_sum), (s.crypto_30d_n || 0) + " pagamento(s)"),
           stat("Produtos ativos", String(s.active_products || 0))),
         el("div", { class: "card" }, el("h2", null, "Receita — últimos 14 dias"), bars, labels),
         el("div", { class: "card" }, el("h2", null, "Pedidos recentes"),
@@ -513,7 +513,7 @@
           el("td", { class: "mono hide-m small" }, p.id),
           el("td", null, acts));
       });
-      clear(main).append(el("h1", null, "Pagamentos (cripto / OxaPay)"), form, el("div", { class: "card" },
+      clear(main).append(el("h1", null, "Pagamentos (OxaPay)"), form, el("div", { class: "card" },
         el("div", { class: "row f" }, el("span", { class: "badge" }, d.total + " pagamento(s)"), el("span", { class: "badge ok" }, "Creditado " + money(d.credited_sum))),
         table(["Data", "Usuário", "Valor", "Status", "Track ID", { t: "Pago em", cls: "hide-m" }, { t: "Referência", cls: "hide-m" }, "Ações"], rows, "Nenhum pagamento ainda."),
         pager(d.total, d.page, d.page_size, function (pg) { pState.page = pg; router(); })),
@@ -606,7 +606,7 @@
       var mtext = el("textarea", { maxlength: 500 }); mtext.value = s.maintenance_text;
       var save = el("button", { class: "btn p", type: "submit" }, "Salvar");
       var form = el("form", { class: "card" }, el("h2", null, "Loja"),
-        field("Nome da loja", shop), field("Mensagem de boas-vindas (/start)", welcome), field("Contato de suporte", support), field("Símbolo da moeda", curr),
+        field("Nome da loja", shop), field("Mensagem de boas-vindas (/start) — use {coins} para mostrar as moedas aceitas", welcome), field("Contato de suporte", support), field("Símbolo da moeda", curr),
         el("label", { class: "chk" }, maint, "Modo manutenção (bot responde só aos admins)"), field("Mensagem de manutenção", mtext), save);
       form.addEventListener("submit", function (e) {
         e.preventDefault(); save.disabled = true;
@@ -618,19 +618,38 @@
       var cPresets = el("input", { value: s.topup_presets, maxlength: 100, placeholder: "5, 10, 25, 50" });
       var cMin = el("input", { type: "number", min: 0.5, step: "0.01", value: s.topup_min, inputmode: "decimal" });
       var cMax = el("input", { type: "number", min: 0.5, step: "0.01", value: s.topup_max, inputmode: "decimal" });
+      var cCoins = el("input", { value: s.accepted_currencies, maxlength: 120, placeholder: "USDT", autocapitalize: "characters" });
+      var coinBox = el("div", { class: "f" });
+      var coinBtn = el("button", { class: "btn", type: "button" }, "Verificar moedas na OxaPay");
+      coinBtn.addEventListener("click", function () {
+        coinBtn.disabled = true;
+        api("GET", "/oxapay/accepted").then(function (r) {
+          coinBtn.disabled = false;
+          if (!r.ok) { clear(coinBox).appendChild(el("span", { class: "badge bad" }, r.reason === "unconfigured" ? "OXAPAY_MERCHANT_KEY ausente" : "Falha ao consultar a OxaPay")); return; }
+          var kv = el("div", { class: "kv" },
+            el("div", null, "Ativas na conta OxaPay"), el("div", null, r.oxapay.join(", ") || "—"),
+            el("div", null, "Configuração do bot"), el("div", null, r.setting.join(", ") || "—"),
+            el("div", null, "Situação"), el("div", null, r.match ? el("span", { class: "badge ok" }, "iguais") : el("span", { class: "badge warn" }, "diferentes — ajuste na OxaPay (Merchant Service) ou aqui")));
+          Object.keys(r.networks || {}).forEach(function (c) { kv.append(el("div", null, "Redes " + c), el("div", null, r.networks[c].join(", "))); });
+          clear(coinBox).appendChild(kv);
+        }, function (e2) { coinBtn.disabled = false; toast(e2.message, "bad"); });
+      });
       var cSave = el("button", { class: "btn p", type: "submit" }, "Salvar");
-      var cform = el("form", { class: "card" }, el("h2", null, "Recarga de saldo com cripto (OxaPay)"),
+      var cform = el("form", { class: "card" }, el("h2", null, "Recarga de saldo (OxaPay · " + (s.accepted_currencies || "USDT").split(",").join(", ") + ")"),
         el("div", { class: "kv f" },
           el("div", null, "Chave OXAPAY_MERCHANT_KEY"), el("div", null, info.oxapay_configured ? el("span", { class: "badge ok" }, "configurada") : el("span", { class: "badge bad" }, "ausente — recarga indisponível no bot")),
           el("div", null, "Callback URL"), el("div", { class: "mono" }, info.oxapay_callback_url)),
-        el("label", { class: "chk" }, cEnabled, "Recarga com cripto habilitada no bot"),
+        el("label", { class: "chk" }, cEnabled, "Recarga via OxaPay habilitada no bot"),
+        field("Moedas aceitas (símbolos separados por vírgula, ex.: USDT ou USDT, BTC)", cCoins),
+        el("div", { class: "muted small f" }, "Estes textos aparecem no bot (\"Pay with USDT\"). As moedas realmente oferecidas na página de pagamento são as ativadas na sua conta OxaPay (Merchant Service); a API de fatura não tem filtro por fatura. Use o botão abaixo para conferir."),
+        el("div", { class: "row f" }, coinBtn), coinBox,
         field("Valores predefinidos (USD, separados por vírgula, máx. 8)", cPresets),
         el("div", { class: "row" }, el("div", { class: "grow" }, field("Valor mínimo (USD)", cMin)), el("div", { class: "grow" }, field("Valor máximo (USD)", cMax))),
         el("div", { class: "muted small f" }, "O usuário também pode digitar um valor personalizado entre o mínimo e o máximo. O saldo é creditado automaticamente quando a OxaPay confirma o pagamento (status Paid)."),
         cSave);
       cform.addEventListener("submit", function (e) {
         e.preventDefault(); cSave.disabled = true;
-        api("PUT", "/settings", { crypto_topup_enabled: cEnabled.checked ? "1" : "0", topup_presets: cPresets.value, topup_min: cMin.value, topup_max: cMax.value })
+        api("PUT", "/settings", { crypto_topup_enabled: cEnabled.checked ? "1" : "0", accepted_currencies: cCoins.value, topup_presets: cPresets.value, topup_min: cMin.value, topup_max: cMax.value })
           .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); cSave.disabled = false; router(); },
             function (e2) { toast(e2.message, "bad"); cSave.disabled = false; });
       });

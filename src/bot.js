@@ -15,6 +15,8 @@ import {
   getBalance,
   findUser,
   changeBalance,
+  coinsLabel,
+  fillCoins,
 } from "./util.js";
 import {
   topupConfig,
@@ -42,7 +44,8 @@ import {
   editOrSend,
   invoiceCard,
   paidCard,
-  HOW_IT_WORKS,
+  howItWorks,
+  networkHint,
 } from "./ui.js";
 
 const TG_UPLOAD_LIMIT = 50 * 1024 * 1024; // Bot API sendDocument upload limit
@@ -131,10 +134,10 @@ async function screenHome(env, s, user) {
   const first = user.first_name || user.username || "there";
   const tc = topupConfig(s, env);
   let text = `👋 Hi, <b>${e(first)}</b>! Welcome to <b>${e(s.shop_name)}</b>.\n\n`;
-  if (String(s.welcome_text || "").trim()) text += `<blockquote>${e(s.welcome_text)}</blockquote>\n\n`;
+  if (String(s.welcome_text || "").trim()) text += `<blockquote>${e(fillCoins(s.welcome_text, s))}</blockquote>\n\n`;
   text += `💰 Balance: <b>${e(money(bal, cur))}</b>\n`;
   text += `🔑 Active licenses: <b>${active}</b>`;
-  if (bal <= 0 && tc.available) text += "\n\n<i>Tip: tap 💰 Top up to add funds with crypto — it's credited automatically.</i>";
+  if (bal <= 0 && tc.available) text += `\n\n<i>Tip: tap 💰 Top up to add funds with ${coinsLabel(s)} — it's credited automatically.</i>`;
   return {
     text,
     reply_markup: kb([
@@ -199,7 +202,7 @@ function shortfallBlock(s, env, bal, price, pid, days) {
     const amt = shortfallAmount(missing, tc);
     rows.push([btn(`💰 Top up ${money(amt, cur)}`, `tuc:${amt}:${pid}:${days}`, "success")]);
     rows.push([btn("💰 Other amount", "topup")]);
-    text += "\nTop up with crypto in one tap — you can continue this purchase right after the payment is confirmed.";
+    text += `\nTop up with ${coinsLabel(s)} in one tap — you can continue this purchase right after the payment is confirmed.`;
   } else {
     text += `\n${supportLine(s)}`;
   }
@@ -381,7 +384,7 @@ async function screenDownloads(env, s, user) {
 }
 
 const METHOD_LABEL = {
-  oxapay: "crypto top-up",
+  oxapay: "OxaPay top-up",
   admin_add: "credit",
   panel_add: "credit",
   admin_sub: "adjustment",
@@ -432,7 +435,7 @@ async function screenSupport(env, s) {
   text +=
     "<blockquote expandable><b>Quick guide</b>\n" +
     (tc.available
-      ? "1. 💰 <b>Top up</b> your balance with crypto — it's credited automatically.\n"
+      ? `1. 💰 <b>Top up</b> your balance with ${coinsLabel(s)} — it's credited automatically.\n`
       : "1. Ask the admin to credit your balance.\n") +
     "2. 🛒 Open the <b>Shop</b>, pick a product and a duration, confirm.\n" +
     "3. 🔑 You get a <b>license key</b> — enter it in the Liveira program.\n" +
@@ -447,7 +450,7 @@ async function screenSupport(env, s) {
 
 function unavailableTopup(s) {
   return {
-    text: `💰 <b>Top up</b>\n\nCrypto top-up is currently unavailable.\n\n${supportLine(s)}`,
+    text: `💰 <b>Top up</b>\n\nTop-ups are currently unavailable.\n\n${supportLine(s)}`,
     reply_markup: kb([navRow("home")]),
   };
 }
@@ -463,7 +466,8 @@ async function screenTopup(env, s, user) {
       "💰 <b>Top up balance</b>\n\n" +
       `Current balance: <b>${e(money(bal, cur))}</b>\n\n` +
       `Choose an amount (min ${e(money(tc.min, cur))}, max ${e(money(tc.max, cur))}):\n\n` +
-      HOW_IT_WORKS.replace("1. Tap <b>💳 Pay now</b> and choose", "1. Pick an amount, tap <b>💳 Pay now</b> and choose"),
+      `💳 We accept: ${coinsLabel(s, { bold: true })}\n\n` +
+      howItWorks(s, { pickAmount: true }),
     reply_markup: kb([...grid(presetBtns, presetBtns.length === 4 ? 2 : 3), [btn("✏️ Other amount", "kp:")], navRow("home")]),
   };
 }
@@ -502,7 +506,7 @@ function screenConfirmTopup(s, env, amount, resume) {
     text:
       "💰 <b>Confirm top-up</b>\n\n" +
       `Amount: <b>${e(money(amount, cur))}</b>\n` +
-      "Pay with: <b>any crypto</b> via OxaPay\n" +
+      `Pay with: ${coinsLabel(s, { bold: true })} via OxaPay${networkHint(s) ? " (network of your choice)" : ""}\n` +
       `Invoice valid for: <b>${INVOICE_LIFETIME_MIN} min</b>\n` +
       (resume ? "\n🛒 After the payment is confirmed you can continue your purchase in one tap.\n" : "") +
       "\n<i>Your balance is credited automatically once the payment is confirmed.</i>",
@@ -545,7 +549,7 @@ async function createInvoiceFlow(env, s, user, nav, amount, resume) {
       r.reason === "too_many"
         ? "🧾 You already have several open invoices. Please pay one of them or wait until they expire."
         : r.reason === "unconfigured"
-          ? "Crypto top-up is currently unavailable."
+          ? "Top-ups are currently unavailable."
           : "⚠️ Could not create the payment right now. Please try again in a minute.";
     return show(env, nav, { text: `💰 <b>Top up</b>\n\n${msg}\n\n${supportLine(s)}`, reply_markup: kb([navRow("topup")]) });
   }
@@ -591,14 +595,14 @@ async function show(env, nav, screen) {
 }
 
 async function answerCallback(env, id, text, alert) {
-  try {
-    return await tgApi(env, "answerCallbackQuery", {
-      callback_query_id: id,
-      text: text ? String(text).slice(0, 200) : undefined,
-      show_alert: alert || undefined,
-    });
-  } catch (err) {
-    console.error("answerCallbackQuery failed", err);
+  const body = { callback_query_id: id, text: text ? String(text).slice(0, 200) : undefined, show_alert: alert || undefined };
+  // One retry on a network-level failure so the button spinner never hangs.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await tgApi(env, "answerCallbackQuery", body);
+    } catch (err) {
+      console.error(`answerCallbackQuery failed (attempt ${attempt})`, err);
+    }
   }
 }
 

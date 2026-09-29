@@ -17,8 +17,10 @@ import {
   findUser,
   getBalance,
   changeBalance,
+  parseCoinList,
+  coinsLabel,
 } from "./util.js";
-import { topupConfig, syncPayment, expireStale, callbackUrl, round2 } from "./oxapay.js";
+import { topupConfig, syncPayment, expireStale, callbackUrl, round2, oxapayAcceptedCoins } from "./oxapay.js";
 
 const COOKIE = "__Host-lv_admin";
 const SESSION_TTL = 12 * 3600; // seconds
@@ -385,6 +387,7 @@ async function route(ctx, method, api) {
   if (api === "/webhook" && method === "GET") return webhookInfo(ctx);
   if (api === "/webhook/reset" && method === "POST") return webhookReset(ctx);
   if (api === "/bot/setup" && method === "POST") return botSetup(ctx);
+  if (api === "/oxapay/accepted" && method === "GET") return oxapayAccepted(ctx);
   if (api === "/sessions/revoke-all" && method === "POST") {
     const next = String((parseInt(ctx.settings.session_epoch, 10) || 1) + 1);
     await setSetting(env, "session_epoch", next);
@@ -942,6 +945,14 @@ async function putSettings({ request, env, settings, actor }) {
     let v;
     if (k in topup) {
       v = topup[k];
+    } else if (k === "accepted_currencies") {
+      const raw = String(b[k]).trim();
+      const bad = raw.toUpperCase().split(/[\s,;/|]+/).filter((x) => x && !/^[A-Z0-9]{2,10}$/.test(x));
+      if (bad.length) throw new HttpError(400, `Moedas aceitas: símbolo inválido "${bad[0].slice(0, 20)}"`);
+      const list = parseCoinList(raw);
+      if (!list.length) throw new HttpError(400, "Moedas aceitas: informe pelo menos uma moeda (ex.: USDT)");
+      if (list.length > 12) throw new HttpError(400, "Moedas aceitas: máximo de 12 moedas");
+      v = list.join(",");
     } else if (k === "maintenance_mode" || k === "crypto_topup_enabled") {
       v = b[k] === true || b[k] === "1" || b[k] === 1 ? "1" : "0";
     } else {
@@ -1021,22 +1032,31 @@ const ADMIN_COMMANDS = [
   { command: "whoami", description: "Show my Telegram ID" },
 ];
 
-export function botProfileTexts(shopName) {
+export function botProfileTexts(shopName, settings = {}) {
   const n = String(shopName || "Liveira Shop").slice(0, 60);
+  const coins = coinsLabel(settings);
   return {
     description: (
       `🛒 ${n} — get your Liveira license in seconds.\n\n` +
-      "💰 Top up your balance with crypto (USDT, BTC, ETH, TON and more) — credited automatically.\n" +
+      `💰 Top up your balance with ${coins} — credited automatically.\n` +
       "🔑 Receive your license key instantly and download the program.\n\n" +
       "Tap Start to begin."
     ).slice(0, 512),
-    short_description: `${n}: Liveira licenses in seconds. Crypto top-ups credited automatically.`.slice(0, 120),
+    short_description: `${n}: Liveira licenses in seconds. Pay with ${coins}, credited automatically.`.slice(0, 120),
   };
+}
+
+async function oxapayAccepted({ env, settings }) {
+  const setting = parseCoinList(settings.accepted_currencies);
+  const r = await oxapayAcceptedCoins(env);
+  if (!r.ok) return aj({ ok: false, reason: r.reason, setting });
+  const same = r.list.length === setting.length && r.list.every((c) => setting.includes(c));
+  return aj({ ok: true, oxapay: r.list, networks: r.networks, setting, match: same });
 }
 
 async function botSetup({ env, settings, actor }) {
   if (!env.BOT_TOKEN) throw new HttpError(503, "BOT_TOKEN não configurado");
-  const t = botProfileTexts(settings.shop_name);
+  const t = botProfileTexts(settings.shop_name, settings);
   const results = {};
   const call = async (name, method, body) => {
     const r = await tgApi(env, method, body);

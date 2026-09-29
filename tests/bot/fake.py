@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LOG = open('/tmp/lvtest/fake.log', 'a'); LOCK = threading.Lock()
 tid_counter = itertools.count(1000); mid_counter = itertools.count(100)
 INVOICES, STATUS, MSGS = {}, {}, {}
+ACCEPTED = ['USDT']
 ALLOWED_TAGS = {'b','strong','i','em','u','ins','s','strike','del','span','tg-spoiler','a','tg-emoji','tg-time','code','pre','blockquote'}
 BTN_ACTIONS = {'url','callback_data','web_app','login_url','switch_inline_query','switch_inline_query_current_chat','switch_inline_query_chosen_chat','copy_text','callback_game','pay','disabled'}
 
@@ -54,6 +55,16 @@ class H(BaseHTTPRequestHandler):
         b = json.dumps(obj).encode(); self.send_response(code)
         self.send_header('Content-Type', 'application/json'); self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
+        if self.path == '/v1/payment/accepted-currencies':
+            log({'oxapay': 'accepted', 'key': self.headers.get('merchant_api_key')})
+            return self._send({'data': {'list': ACCEPTED}, 'message': 'Operation completed successfully!', 'error': {}, 'status': 200, 'version': '1.0.0'})
+        if self.path == '/v1/common/currencies':
+            nets = {'Tron': {'network': 'Tron', 'name': 'Tron Network', 'keys': ['Tron', 'TRC20', 'TRX']},
+                    'BSC': {'network': 'BSC', 'name': 'Binance Smart Chain', 'keys': ['BSC', 'BEP20', 'BNB']},
+                    'The Open Network': {'network': 'The Open Network', 'name': 'TON Network', 'keys': ['TON']}}
+            return self._send({'data': {'USDT': {'symbol': 'USDT', 'name': 'Tether', 'status': True, 'networks': nets},
+                                        'BTC': {'symbol': 'BTC', 'name': 'Bitcoin', 'status': True, 'networks': {'Bitcoin': {'network': 'Bitcoin', 'name': 'Bitcoin Network', 'keys': ['BTC']}}}},
+                               'message': 'ok', 'error': {}, 'status': 200, 'version': '1.0.0'})
         if self.path.startswith('/v1/payment/'):
             tid = self.path.rsplit('/', 1)[1]; inv = INVOICES.get(tid)
             log({'oxapay': 'GET', 'track_id': tid, 'key': self.headers.get('merchant_api_key')})
@@ -64,9 +75,16 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get('Content-Length') or 0); body = self.rfile.read(n).decode(errors='replace') if n else ''
         if self.path == '/v1/payment/invoice':
             d = json.loads(body); tid = str(next(tid_counter))
+            # Documented v1 generate-invoice fields only (docs.oxapay.com/api-reference/payment/generate-invoice)
+            DOC = {'amount', 'currency', 'lifetime', 'fee_paid_by_payer', 'under_paid_coverage', 'to_currency', 'auto_withdrawal',
+                   'mixed_payment', 'callback_url', 'return_url', 'email', 'order_id', 'thanks_message', 'description', 'sandbox'}
+            for k in d:
+                if k not in DOC: log({'violation': ['undocumented OxaPay invoice field ' + k], 'method': 'oxapay invoice', 'body': d})
             log({'oxapay': 'invoice', 'key': self.headers.get('merchant_api_key'), 'body': d, 'track_id': tid})
             INVOICES[tid] = {'track_id': tid, 'amount': d['amount'], 'order_id': d.get('order_id'), 'type': 'invoice'}
             return self._send({'data': {'track_id': tid, 'payment_url': 'https://pay.oxapay.com/' + tid, 'expired_at': int(time.time()) + 3600, 'date': int(time.time())}, 'message': 'Operation completed successfully!', 'error': {}, 'status': 200, 'version': '1.0.0'})
+        if self.path.startswith('/_accepted/'):
+            ACCEPTED[:] = [x for x in self.path.split('/')[2].split(',') if x]; return self._send({'ok': True})
         if self.path.startswith('/_status/'):
             _, _, tid, st = self.path.split('/'); STATUS[tid] = st; return self._send({'ok': True})
         if self.path.startswith('/bot'):
