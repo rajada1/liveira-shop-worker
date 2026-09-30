@@ -21,6 +21,7 @@ import {
   coinsLabel,
 } from "./util.js";
 import { topupConfig, syncPayment, expireStale, callbackUrl, round2, oxapayAcceptedCoins } from "./oxapay.js";
+import { noteMessages } from "./chatnav.js";
 
 const COOKIE = "__Host-lv_admin";
 const SESSION_TTL = 12 * 3600; // seconds
@@ -1016,6 +1017,7 @@ async function webhookReset(ctx) {
 
 const USER_COMMANDS = [
   { command: "start", description: "🏠 Home" },
+  { command: "menu", description: "🏠 Main menu (brings it to the bottom)" },
   { command: "shop", description: "🛒 Browse products" },
   { command: "topup", description: "💰 Top up balance (crypto)" },
   { command: "licenses", description: "🔑 My licenses" },
@@ -1111,12 +1113,17 @@ async function broadcast({ request, env, actor }) {
     .all();
   let sent = 0;
   let failed = 0;
+  const delivered = [];
   for (const r of results || []) {
     // track:false — no per-recipient chat_nav write, so a 25-message batch stays within D1's per-request query limit.
     const res = await tgApi(env, "sendMessage", { chat_id: r.user_id, text, link_preview_options: { is_disabled: true } }, { track: false });
-    if (res.ok) sent++;
-    else failed++;
+    if (res.ok) {
+      sent++;
+      delivered.push({ chatId: res.result?.chat?.id ?? r.user_id, messageId: res.result?.message_id });
+    } else failed++;
   }
+  // One query for the whole batch: the broadcast is now the latest message, so the next tap moves the menu below it.
+  await noteMessages(env, delivered);
   const next = offset + (results || []).length;
   const done = next >= total || !(results || []).length;
   if (offset === 0) await audit(env, actor, "broadcast_start", { total, length: text.length });

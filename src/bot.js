@@ -1,5 +1,7 @@
 /* Telegram bot — button-driven UI (HTML parse mode). Products/prices/settings come from D1.
- * Navigation edits one message in place; new messages are only sent for events (/start, payments, files).
+ * Navigation: the current menu is edited in place while it is the latest message in the chat; otherwise the
+ * screen is sent at the bottom and the old menu deleted (see show()). Main sections are also on a persistent
+ * reply keyboard (ensureKeyboard). Per-chat state: table chat_nav (src/chatnav.js).
  */
 import {
   nowIso,
@@ -52,7 +54,7 @@ import {
   REPLY_KB_VERSION,
   REPLY_KB_TEXT,
 } from "./ui.js";
-import { getNav, setMenu, setKeyboardMessage, noteMessage } from "./chatnav.js";
+import { getNav, claimMenu, setKeyboardMessage, noteMessage } from "./chatnav.js";
 
 const TG_UPLOAD_LIMIT = 50 * 1024 * 1024; // Bot API sendDocument upload limit
 const TOPUP_PROMPT = "Enter the top-up amount in USD"; // legacy ForceReply prompt (old messages)
@@ -627,8 +629,24 @@ async function show(env, nav, screen) {
   const res = await editOrSend(env, nav.chatId, latest ? nav.messageId : null, screen.text, extra);
   if (res.message_id) {
     const newMenu = screen.record ? null : res.message_id;
-    await setMenu(env, nav.chatId, newMenu);
-    st.row = { ...row, menu_msg_id: newMenu, last_msg_id: Math.max(Number(row.last_msg_id || 0), res.message_id) };
+    let current = newMenu;
+    // Compare-and-set: rapid double taps read the same old menu and both send a screen. Only one claims it;
+    // the other (a freshly sent screen) takes over and deletes the winner's screen, so exactly one menu is
+    // left at the bottom. An in-place edit or a record (invoice card, receipt) that loses leaves the winner alone.
+    if ((await claimMenu(env, nav.chatId, menuId, newMenu)) === false) {
+      const other = (await getNav(env, nav.chatId)).row?.menu_msg_id;
+      const otherId = other ? Number(other) : null;
+      current = otherId;
+      if (newMenu && !res.edited) {
+        if (otherId !== newMenu && (await claimMenu(env, nav.chatId, otherId, newMenu))) {
+          current = newMenu;
+          if (otherId) await deleteMessageQuiet(env, nav.chatId, otherId);
+        } else {
+          await deleteMessageQuiet(env, nav.chatId, newMenu); // a third request won: drop our duplicate
+        }
+      }
+    }
+    st.row = { ...row, menu_msg_id: current, last_msg_id: Math.max(Number(row.last_msg_id || 0), res.message_id) };
   }
   if (res.ok && menuId && menuId !== res.message_id) await deleteMessageQuiet(env, nav.chatId, menuId);
   return { message_id: res.message_id, toast: screen.toast };
@@ -826,6 +844,9 @@ async function handleCommand(env, message, s) {
     await ensureUser(env, user.id, user.username);
     await ensureKeyboard(env, nav);
     await route(env, s, user, nav, kbTarget);
+    // Keep the chat clean: remove the button press itself ("🛒 Shop") now that its screen is below it.
+    // Best effort — errors ignored (e.g. >48 h old, already deleted).
+    await deleteMessageQuiet(env, chatId, message.message_id);
     return;
   }
 

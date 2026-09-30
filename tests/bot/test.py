@@ -37,7 +37,8 @@ class User:
     def upd(self, obj): return req('POST', '/telegram', obj, {'X-Telegram-Bot-Api-Secret-Token': 'whs_local'})
     def msg(self, text, extra=None):
         # Incoming messages take the next id of the chat's shared sequence, like the real API.
-        mid = json.loads(urllib.request.urlopen(urllib.request.Request(FAKE + '/_nextid', data=b'', method='POST')).read())['mid']
+        mid = json.loads(urllib.request.urlopen(urllib.request.Request(FAKE + f'/_nextid/{self.uid}', data=b'', method='POST')).read())['mid']
+        self.last_in = mid
         body = {'message_id': mid, 'from': self.frm(), 'chat': {'id': self.uid, 'type': 'private'}, 'date': int(time.time())}
         body.update({'text': text} if extra is None else extra)
         m = mark(); self.upd({'update_id': 1, 'message': body}); ev = since(m)
@@ -279,7 +280,8 @@ m = mark(); s_, body, _ = req('POST', '/admin/api/bot/setup', None, AH); ev = si
 check('admin bot setup → ok', s_ == 200 and d['ok'] is True, body)
 cmds = tg(ev, 'setMyCommands')
 check('setMyCommands default + admin chat scope', any(c['body']['scope']['type'] == 'default' for c in cmds) and any(c['body']['scope'] == {'type': 'chat', 'chat_id': 1} for c in cmds) and
-      [c['command'] for c in cmds[0]['body']['commands']] == ['start', 'shop', 'topup', 'licenses', 'downloads', 'profile', 'support'])
+      [c['command'] for c in cmds[0]['body']['commands']] == ['start', 'menu', 'shop', 'topup', 'licenses', 'downloads', 'profile', 'support'])
+check('/menu in the command list with a short description', [c for c in cmds[0]['body']['commands'] if c['command'] == 'menu' and 0 < len(c['description']) <= 256])
 check('setChatMenuButton commands + descriptions', tg(ev, 'setChatMenuButton')[0]['body']['menu_button'] == {'type': 'commands'} and tg(ev, 'setMyDescription') and tg(ev, 'setMyShortDescription'))
 desc = tg(ev, 'setMyDescription')[0]['body']['description']; short = tg(ev, 'setMyShortDescription')[0]['body']['short_description']
 check('bot description/short description say USDT, no other coins', 'with USDT' in desc and 'Pay with USDT' in short and not re.search(r'BTC|ETH|TON|crypto', desc + short, re.I), (desc, short))
@@ -326,6 +328,14 @@ for label, want in [('🛒 Shop', '🛒 <b>Shop</b>'), ('💰 Top up', '💰 <b>
     check(f'keyboard text {label!r} → its screen sent at the bottom, old menu deleted, no edit',
           scr and scr['tg'] == 'sendMessage' and want in scr['body']['text'] and deleted(ev, old) and not tg(ev, 'editMessageText') and not kbmsgs(ev)
           and navrow(C)['menu_msg_id'] == scr['mid'], (scr and scr['body']['text'][:60], [(e.get('tg'), e['body'].get('message_id')) for e in ev]))
+def deleted_ok(ev, mid): return [e for e in deleted(ev, mid) if not e.get('error')]
+old = C.mid; ev = C.msg('👤 Profile'); press = C.last_in
+check('keyboard button press ("👤 Profile") deleted after its screen is sent (user message removed)',
+      deleted_ok(ev, press) and ev.index(deleted(ev, press)[0]) > ev.index(last_screen(ev)), [(e.get('tg'), e['body'].get('message_id')) for e in ev])
+# next incoming id = press + 2 (the screen took press + 1): make its deletion fail like a >48h-old message
+urllib.request.urlopen(urllib.request.Request(FAKE + f'/_faildelete/{C.uid}/{press + 2}', data=b'', method='POST'))
+ev = C.msg('🛒 Shop'); check('button press delete failure (e.g. >48h) ignored: screen still sent', C.last_in == press + 2 and last_screen(ev) and '🛒 <b>Shop</b>' in last_screen(ev)['body']['text'] and [e for e in deleted(ev, C.last_in) if e.get('error')], [(e.get('tg'), e.get('error')) for e in ev])
+ev = C.msg('/whoami'); check('commands are not deleted (only reply-keyboard presses)', not deleted(ev, C.last_in))
 M = C.mid; C.msg('/whoami')
 ev, ans = C.cb('profile', M); scr = last_screen(ev)
 check('tap on a menu that is no longer the latest (bot/user messages after it) → deleteMessage(old) + new at the bottom',
@@ -348,6 +358,7 @@ ev, _, scr = nav(C, 'kp:25', 'keypad digits 25 (live edit in place)', ['$ 25'], 
 nav(C, 'kpok:25', 'keypad ✅ → confirm $25', ['Amount: <b>$25.00</b>'], ['tun:25'])
 old = C.mid; ev = C.msg('30'); scr = last_screen(ev)
 check('typed amount "30" on the keypad flow → confirm $30 at the bottom, old screen deleted', scr and 'Amount: <b>$30.00</b>' in scr['body']['text'] and deleted(ev, old))
+check('typed amount message is kept (not a keyboard press)', not deleted(ev, C.last_in))
 ev = C.msg('💰 Top up'); scr = last_screen(ev)
 check('"💰 Top up" keyboard text opens the top-up menu (not parsed as an amount)', scr and '💰 <b>Top up balance</b>' in scr['body']['text'] and 'Confirm top-up' not in scr['body']['text'])
 ev = C.msg('/topup 12'); check('/topup 12 still works', last_screen(ev) and 'Amount: <b>$12.00</b>' in last_screen(ev)['body']['text'])
@@ -377,6 +388,24 @@ ev = C.msg('/shop'); check('up-to-date keyboard → not re-sent on /shop', not k
 KB3 = navrow(C)['kb_msg_id']
 ev = C.msg('hi there'); check('unrecognised text → keyboard re-attached + home at the bottom, old keyboard message deleted', len(kbmsgs(ev)) == 1 and deleted(ev, KB3) and last_screen(ev)['body']['text'].startswith('👋 Hi, <b>Carla</b>'))
 ev = C.msg('/menu'); check('/menu sends the keyboard and the home card', len(kbmsgs(ev)) == 1 and last_screen(ev)['body']['text'].startswith('👋 Hi'))
+# rapid double taps on an older menu: both requests overlap (slow sendMessage) → exactly one menu survives
+M = C.mid; C.msg('/whoami')
+def menu_survivors(ev):
+    sent = [e['mid'] for e in tg(ev, 'sendMessage') if 'inline_keyboard' in (e['body'].get('reply_markup') or {}) and e['body']['chat_id'] == C.uid]
+    gone = {e['body']['message_id'] for e in tg(ev, 'deleteMessage') if not e.get('error')}
+    return sent, [x for x in sent if x not in gone], gone
+def tap(data, qid_):
+    return C.upd({'update_id': 3, 'callback_query': {'id': qid_, 'from': C.frm(), 'data': data, 'chat_instance': 'x',
+                  'message': {'message_id': M, 'chat': {'id': C.uid, 'type': 'private'}, 'date': int(time.time())}}})
+urllib.request.urlopen(urllib.request.Request(FAKE + f'/_slowsend/{C.uid}/1500', data=b'', method='POST'))
+m = mark()
+with cf.ThreadPoolExecutor(2) as ex: list(ex.map(lambda a: tap(*a), [('shop', str(next(qid))), ('profile', str(next(qid)))]))
+ev = since(m); urllib.request.urlopen(urllib.request.Request(FAKE + f'/_slowsend/{C.uid}/0', data=b'', method='POST'))
+sent, alive, gone = menu_survivors(ev)
+check('rapid double tap on an older menu → two screens sent concurrently, only one menu left (duplicate deleted), state points to it',
+      len(sent) == 2 and len(alive) == 1 and M in gone and navrow(C)['menu_msg_id'] == alive[0], (sent, alive, gone, navrow(C)))
+C.mid = alive[0] if alive else C.mid
+ev = C.msg('🔑 My licenses'); check('after the double tap: next keyboard press deletes the surviving menu (no orphan left)', deleted_ok(ev, alive[0] if alive else -1))
 # maintenance + admin unchanged
 sql("UPDATE settings SET value='1' WHERE key='maintenance_mode'")
 ev = C.msg('🛒 Shop'); check('maintenance: keyboard text → 🛠 message, no screen', last_screen(ev) and '🛠 <b>Maintenance</b>' in last_screen(ev)['body']['text'] and not deleted(ev, C.mid))
@@ -388,9 +417,15 @@ ev = C.msg('/start'); check('without chat_nav table: /start still sends keyboard
 nav(C, 'shop', 'without chat_nav table: edit in place (previous behaviour)', ['🛒 <b>Shop</b>'])
 ev = C.msg('📥 Downloads'); check('without chat_nav table: keyboard text still opens its screen', last_screen(ev) and 'Downloads' in last_screen(ev)['body']['text'])
 sql("ALTER TABLE chat_nav_off RENAME TO chat_nav")
-before = navrow(C)['last_msg_id']
+C.msg('🛒 Shop'); M = C.mid
+check('menu at the bottom before the broadcast', navrow(C)['menu_msg_id'] == M and navrow(C)['last_msg_id'] == M, navrow(C))
 m = mark(); s_, body, _ = req('POST', '/admin/api/broadcast', {'text': 'Local test broadcast'}, AH); ev = since(m)
-check('admin broadcast still works and skips chat_nav writes (D1 query budget)', s_ == 200 and json.loads(body)['sent'] >= 3 and [e for e in tg(ev, 'sendMessage') if e['body']['chat_id'] == C.uid] and navrow(C)['last_msg_id'] == before, (s_, body[:200]))
+bc = [e for e in tg(ev, 'sendMessage') if e['body']['chat_id'] == C.uid]
+check('admin broadcast still works; last_msg_id updated with one batched write', s_ == 200 and json.loads(body)['sent'] >= 3 and bc and navrow(C)['last_msg_id'] == bc[-1]['mid'], (s_, body[:200], navrow(C)))
+ev, ans = C.cb('profile', M); scr = last_screen(ev)
+check('tap on the menu after a broadcast → moved below the broadcast (old menu deleted, not edited)',
+      len(ans) == 1 and scr['tg'] == 'sendMessage' and deleted(ev, M) and not tg(ev, 'editMessageText'), [e.get('tg') for e in ev])
+C.mid = scr['mid']
 ans_all = [e for e in logs() if e.get('tg') == 'answerCallbackQuery']
 ids = [e['body']['callback_query_id'] for e in ans_all]
 check('every callback query answered exactly once (whole run)', len(ids) == len(set(ids)) and len(ids) == next(qid) - 1, (len(ids), len(set(ids))))

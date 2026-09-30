@@ -20,6 +20,10 @@ and any code you uploaded outside this repo will be replaced. So, before deployi
 2. Merge any code you changed outside the repo into this repo first.
 3. Check with a dry run: `npx wrangler deploy --dry-run` lists the bindings that will be deployed.
 
+As of 2026-09-30 the live version (`7d7e63b5`) also has an R2 binding **`CHASE_FILES` → bucket `cf-chase-files`**
+that is not in `wrangler.toml` (the code does not use it). Decide whether to add it to `wrangler.toml` before
+deploying; otherwise the deploy removes it.
+
 Secrets (`BOT_TOKEN`, `WEBHOOK_SECRET`, `ADMIN_*`, `SESSION_SECRET`, `TOKEN_API_KEY`, `OXAPAY_MERCHANT_KEY`) are
 kept across deploys; nothing new is required.
 
@@ -82,4 +86,10 @@ additive and can stay.
   payment notifications. Buttons on an invoice card (Check status / Cancel) still update that card.
 - The keyboard is sent on `/start`, `/menu` and unrecognised text, and re-sent automatically if a chat never got it
   or got an older layout (`REPLY_KB_VERSION` in `src/ui.js`).
-- Admin broadcasts skip the per-message navigation write to stay within D1's per-request query limit.
+- Admin broadcasts record the delivered message ids with **one** batched D1 write per batch (not one per
+  message), so the next tap after a broadcast moves the menu below it.
+- Reply-keyboard button presses ("🛒 Shop"…) are deleted after their screen is sent (best effort; commands and
+  typed text are kept).
+- Rapid double taps: the menu id is claimed with a compare-and-set on `chat_nav.menu_msg_id`; the request that
+  loses deletes the duplicate, so only one menu stays at the bottom. No new migration.
+- `/menu` is in the command list (run step 4 again after deploying to publish it).

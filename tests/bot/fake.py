@@ -8,6 +8,7 @@ LOG = open('/tmp/lvtest/fake.log', 'a'); LOCK = threading.Lock()
 tid_counter = itertools.count(1000); mid_counter = itertools.count(100)
 INVOICES, STATUS, MSGS = {}, {}, {}
 FAIL_DELETE = set()  # (chat, mid) whose deleteMessage fails like a >48h-old message
+SLOW_SEND = {}  # chat -> seconds to wait before answering sendMessage
 ACCEPTED = ['USDT']
 ALLOWED_TAGS = {'b','strong','i','em','u','ins','s','strike','del','span','tg-spoiler','a','tg-emoji','tg-time','code','pre','blockquote'}
 BTN_ACTIONS = {'url','callback_data','web_app','login_url','switch_inline_query','switch_inline_query_current_chat','switch_inline_query_chosen_chat','copy_text','callback_game','pay','disabled'}
@@ -99,8 +100,12 @@ class H(BaseHTTPRequestHandler):
             log({'oxapay': 'invoice', 'key': self.headers.get('merchant_api_key'), 'body': d, 'track_id': tid})
             INVOICES[tid] = {'track_id': tid, 'amount': d['amount'], 'order_id': d.get('order_id'), 'type': 'invoice'}
             return self._send({'data': {'track_id': tid, 'payment_url': 'https://pay.oxapay.com/' + tid, 'expired_at': int(time.time()) + 3600, 'date': int(time.time())}, 'message': 'Operation completed successfully!', 'error': {}, 'status': 200, 'version': '1.0.0'})
-        if self.path == '/_nextid':  # incoming user messages share the chat's message id sequence
-            return self._send({'mid': next(mid_counter)})
+        if self.path == '/_nextid' or self.path.startswith('/_nextid/'):  # incoming user messages share the chat's id sequence
+            mid = next(mid_counter)
+            if self.path.startswith('/_nextid/'): MSGS[(self.path.split('/')[2], mid)] = ('<user message>', 'null')  # deletable by the bot
+            return self._send({'mid': mid})
+        if self.path.startswith('/_slowsend/'):  # delay sendMessage to a chat (ms; 0 = off) to force concurrent requests to overlap
+            _, _, chat, ms = self.path.split('/'); SLOW_SEND[chat] = int(ms) / 1000; return self._send({'ok': True})
         if self.path.startswith('/_faildelete/'):
             _, _, chat, mid = self.path.split('/'); FAIL_DELETE.add((chat, int(mid))); return self._send({'ok': True})
         if self.path.startswith('/_accepted/'):
@@ -117,6 +122,7 @@ class H(BaseHTTPRequestHandler):
             if method == 'getMe':
                 log(entry); return self._send({'ok': True, 'result': {'id': 1, 'is_bot': True, 'username': 'liveira_test_bot'}})
             if method == 'sendMessage':
+                if SLOW_SEND.get(str(d.get('chat_id'))): time.sleep(SLOW_SEND[str(d.get('chat_id'))])
                 mid = next(mid_counter); MSGS[(str(d.get('chat_id')), mid)] = (d.get('text'), json.dumps(d.get('reply_markup'), sort_keys=True))
                 entry['mid'] = mid; log(entry)
                 return self._send({'ok': True, 'result': {'message_id': mid, 'chat': {'id': d.get('chat_id'), 'type': 'private'}, 'text': d.get('text')}})
