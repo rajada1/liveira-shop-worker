@@ -11,6 +11,10 @@ database_id = "b4c7c78f-4e79-4587-a559-6f794c607bfc"
 binding = "FILES"
 bucket_name = "liveira-shop-files"
 
+[[r2_buckets]]
+binding = "CHASE_FILES"
+bucket_name = "cf-chase-files"
+
 [[rules]]
 type = "Text"
 globs = ["**/*.html", "**/*.txt"]

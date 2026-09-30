@@ -5,12 +5,13 @@ on top of the USDT-only top-ups. Nothing here was deployed or applied automatica
 
 ## 0. Before you deploy — bindings and out-of-repo changes
 
-`wrangler.toml` in this repo declares **only two bindings**:
+`wrangler.toml` in this repo declares **three bindings**:
 
 | binding | type |
 |---|---|
 | `DB` | D1 database `liveira-shop` |
 | `FILES` | R2 bucket for product files |
+| `CHASE_FILES` | R2 bucket `cf-chase-files` (kept as on the live Worker) |
 
 `wrangler deploy` replaces the Worker's code **and its binding list** with what is in the repo. Any binding you
 added yourself (dashboard or another project) that is not in `wrangler.toml` **will be removed** by the deploy,
@@ -20,9 +21,8 @@ and any code you uploaded outside this repo will be replaced. So, before deployi
 2. Merge any code you changed outside the repo into this repo first.
 3. Check with a dry run: `npx wrangler deploy --dry-run` lists the bindings that will be deployed.
 
-As of 2026-09-30 the live version (`7d7e63b5`) also has an R2 binding **`CHASE_FILES` → bucket `cf-chase-files`**
-that is not in `wrangler.toml` (the code does not use it). Decide whether to add it to `wrangler.toml` before
-deploying; otherwise the deploy removes it.
+`CHASE_FILES` (R2 `cf-chase-files`) was added on the live Worker outside this repo and is now declared in
+`wrangler.toml` (2026-09-30), so deploys keep it.
 
 Secrets (`BOT_TOKEN`, `WEBHOOK_SECRET`, `ADMIN_*`, `SESSION_SECRET`, `TOKEN_API_KEY`, `OXAPAY_MERCHANT_KEY`) are
 kept across deploys; nothing new is required.
