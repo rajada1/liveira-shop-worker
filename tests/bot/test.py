@@ -35,8 +35,15 @@ class User:
         self.uid, self.first, self.username = uid, first, username; self.mid = None
     def frm(self): return {'id': self.uid, 'is_bot': False, 'first_name': self.first, 'username': self.username}
     def upd(self, obj): return req('POST', '/telegram', obj, {'X-Telegram-Bot-Api-Secret-Token': 'whs_local'})
-    def msg(self, text):
-        m = mark(); self.upd({'update_id': 1, 'message': {'message_id': 5, 'from': self.frm(), 'chat': {'id': self.uid, 'type': 'private'}, 'text': text}}); return since(m)
+    def msg(self, text, extra=None):
+        # Incoming messages take the next id of the chat's shared sequence, like the real API.
+        mid = json.loads(urllib.request.urlopen(urllib.request.Request(FAKE + '/_nextid', data=b'', method='POST')).read())['mid']
+        body = {'message_id': mid, 'from': self.frm(), 'chat': {'id': self.uid, 'type': 'private'}, 'date': int(time.time())}
+        body.update({'text': text} if extra is None else extra)
+        m = mark(); self.upd({'update_id': 1, 'message': body}); ev = since(m)
+        menus = [e for e in tg(ev, 'sendMessage') if 'inline_keyboard' in (e['body'].get('reply_markup') or {}) and str(e['body']['chat_id']) == str(self.uid)]
+        if menus: self.mid = menus[-1]['mid']  # the newest navigation screen is at the bottom
+        return ev
     def cb(self, data, mid=None):
         q = str(next(qid)); m = mark()
         self.upd({'update_id': 2, 'callback_query': {'id': q, 'from': self.frm(), 'data': data, 'chat_instance': 'x',
@@ -47,15 +54,21 @@ class User:
     def bal(self):
         r = sql(f'SELECT balance FROM users WHERE user_id={self.uid}'); return r[0]['balance'] if r else None
 
-def nav(u, data, name, expect_text=None, expect_cb=(), must_home=True):
+def nav(u, data, name, expect_text=None, expect_cb=(), must_home=True, move=False):
+    """move=False: the tapped message is the latest menu → edited in place.
+    move=True: tapped message is older / a record → screen sent fresh at the bottom (tapped message not edited)."""
     ev, ans = u.cb(data)
     scr = last_screen(ev)
-    ok = len(ans) == 1 and scr is not None and scr['tg'] == 'editMessageText' and scr['body']['message_id'] == u.mid and not tg(ev, 'sendMessage')
+    if move:
+        ok = len(ans) == 1 and scr is not None and scr['tg'] == 'sendMessage' and not [e for e in tg(ev, 'editMessageText') if e['body']['message_id'] == u.mid]
+    else:
+        ok = len(ans) == 1 and scr is not None and scr['tg'] == 'editMessageText' and scr['body']['message_id'] == u.mid and not tg(ev, 'sendMessage')
     if expect_text: ok = ok and all(t in scr['body']['text'] for t in ([expect_text] if isinstance(expect_text, str) else expect_text))
     cbs = cbdata(scr)
     ok = ok and all(c in cbs for c in expect_cb)
     if must_home: ok = ok and 'home' in cbs
-    check(f'nav {name}: edits same message, answered once' + (', has 🏠 Home' if must_home else ''), ok, (ans, scr and scr['body'].get('text'), cbs, [e.get('tg') for e in ev]))
+    check(f'nav {name}: ' + ('sent fresh at the bottom' if move else 'edits same message') + ', answered once' + (', has 🏠 Home' if must_home else ''), ok, (ans, scr and scr['body'].get('text'), cbs, [e.get('tg') for e in ev]))
+    if move and scr and scr['tg'] == 'sendMessage': u.mid = scr['mid']
     return ev, ans, scr
 
 # ───── setup: product with a file (cached tg file id so no R2 needed)
@@ -144,7 +157,7 @@ m = mark(); callback({'track_id': T1, 'status': 'Paid', 'type': 'invoice', 'amou
 check('duplicate Paid callback: no double credit, no new messages', abs(A.bal() - (b0 + 12)) < 1e-9 and not tg(since(m), 'sendMessage') and not tg(since(m), 'editMessageText'))
 
 # ───── cancel + late payment still credited
-ev, _, scr = nav(A, 'tuc:5', 'preset $5 → confirm top-up', ['Amount: <b>$5.00</b>'], ['tun:5'])
+ev, _, scr = nav(A, 'tuc:5', 'preset $5 tapped on the invoice card (a record) → confirm top-up', ['Amount: <b>$5.00</b>'], ['tun:5'], move=True)
 ev, _, scr = nav(A, 'tun:5', 'invoice $5')
 T2 = [e for e in ev if e.get('oxapay') == 'invoice'][0]['track_id']; P2 = [e for e in ev if e.get('oxapay') == 'invoice'][0]['body']['order_id']
 ev, ans, scr = nav(A, f'tux:{P2}', '❌ Cancel → canceled card', ['Canceled', 'still be credited'], ['topup'])
@@ -171,14 +184,14 @@ m = mark(); ev, ans = B.cb(f'tuchk:{P3}'); time.sleep(0.3); ev = since(m)
 card = [e for e in tg(ev, 'editMessageText') if e['body']['message_id'] == B.mid]
 check('"I\'ve paid" check → Paid → card edited with 🛒 Continue purchase', card and 'Payment received!' in card[-1]['body']['text'] and 'days:liveira_access:7' in cbdata(card[-1]) and '✅' in (ans[0]['body'].get('text') or ''), (ans, card and cbdata(card[-1])))
 check('balance now $10.00', abs(B.bal() - 10) < 1e-9, B.bal())
-ev, _, scr = nav(B, 'days:liveira_access:7', 'continue purchase → confirm', ['Confirm purchase', 'after purchase <b>$0.00</b>'], ['confirm:liveira_access:7'])
+ev, _, scr = nav(B, 'days:liveira_access:7', 'continue purchase (tapped on paid card) → confirm', ['Confirm purchase', 'after purchase <b>$0.00</b>'], ['confirm:liveira_access:7'], move=True)
 ev, ans, scr = nav(B, 'confirm:liveira_access:7', 'buy → success screen', ['✅ <b>Purchase successful!</b>', 'Expires: <b>', ' BRT</b>', '<code>'], ['dl:liveira_access', 'licenses'])
 key = re.search(r'<code>([^<]+)</code>', scr['body']['text']).group(1)
 check('success: 📋 copy_text button with the key', any(b.get('copy_text', {}).get('text') == key for b in buttons(scr)))
 check('balance 0 after purchase', abs(B.bal()) < 1e-9)
 ev, ans = B.cb('confirm:liveira_access:7'); scr = last_screen(ev)
 check('second confirm with no balance → shortfall, not negative', 'Not enough balance' in scr['body']['text'] and abs(B.bal()) < 1e-9)
-ev, _, scr = nav(B, 'licenses', 'licenses list', ['🟢 <b>Liveira Access</b>', '7 days left', f'<code>{key}</code>'])
+ev, _, scr = nav(B, 'licenses', 'licenses list (tapped on purchase receipt)', ['🟢 <b>Liveira Access</b>', '7 days left', f'<code>{key}</code>'], move=True)
 check('licenses: copy button for active key', any(b.get('copy_text', {}).get('text') == key for b in buttons(scr)))
 sql(f"INSERT INTO tokens (token,product_id,product_name,telegram_user_id,duration_days,created_at,expires_at,status) VALUES ('oldkey1','liveira_access','Liveira Access',{B.uid},3,'2026-01-01T00:00:00Z','2026-01-04T00:00:00Z','active')")
 ev, _, scr = nav(B, 'licenses', 'licenses with expired', ['🔴 <b>Liveira Access</b>', 'expired'])
@@ -186,7 +199,7 @@ check('licenses: active listed before expired', scr['body']['text'].index('🟢'
 ev, _, scr = nav(B, 'downloads', 'downloads list', ['Tap a product'], ['dl:liveira_access'])
 ev, ans = B.cb('dl:liveira_access')
 check('download: toast + sendDocument', len(ans) == 1 and 'Sending file' in ans[0]['body'].get('text', '') and tg(ev, 'sendDocument'))
-ev, _, scr = nav(B, 'profile', 'profile with history', ['OxaPay top-up', '+$7.50', 'Liveira Access · 7 days · $10.00'])
+ev, _, scr = nav(B, 'profile', 'profile with history (menu no longer latest after the file)', ['OxaPay top-up', '+$7.50', 'Liveira Access · 7 days · $10.00'], move=True)
 ev, _, scr = nav(B, 'home', 'home after purchase', ['Active licenses: <b>1</b>'], must_home=False)
 
 # ───── typing & commands
@@ -218,7 +231,7 @@ sql("UPDATE settings SET value='0' WHERE key='maintenance_mode'")
 
 # ───── toggle off
 sql("UPDATE settings SET value='0' WHERE key='crypto_topup_enabled'")
-ev, _, scr = nav(A, 'topup', 'top-up disabled → unavailable', ['unavailable'])
+ev, _, scr = nav(A, 'topup', 'top-up disabled → unavailable (menu not latest)', ['unavailable'], move=True)
 ev, ans = A.cb('tun:10'); check('disabled → no invoice', not [e for e in ev if e.get('oxapay')])
 sql("UPDATE settings SET value='1' WHERE key='crypto_topup_enabled'")
 
@@ -236,11 +249,11 @@ check('12 concurrent Paid → all 200, credited exactly once', all(r[0] == 200 f
 check('one topups row for concurrent callbacks', len(sql(f"SELECT id FROM topups WHERE ref='{P4}'")) == 1)
 b3 = A.bal()
 s_, body, _ = callback({**paid, 'track_id': '424242', 'order_id': 'lv_x'}); check('unknown track_id → ok, ignored', s_ == 200 and A.bal() == b3)
-ev, _, _ = nav(A, 'tun:10', 'invoice $10'); inv = [e for e in ev if e.get('oxapay') == 'invoice'][0]; T5, P5 = inv['track_id'], inv['body']['order_id']
+ev, _, _ = nav(A, 'tun:10', 'invoice $10 (tapped on previous card)', move=True); inv = [e for e in ev if e.get('oxapay') == 'invoice'][0]; T5, P5 = inv['track_id'], inv['body']['order_id']
 callback({'track_id': T5, 'status': 'Paid', 'type': 'invoice', 'amount': 10, 'order_id': 'lv_other'}); check('order_id mismatch → ignored', A.bal() == b3)
 callback({'track_id': T5, 'status': 'Paid', 'type': 'invoice', 'amount': 5000, 'order_id': P5}); time.sleep(0.3)
 check('credits invoiced $10, not claimed $5000', abs(A.bal() - (b3 + 10)) < 1e-9, A.bal())
-ev, _, _ = nav(A, 'tun:50', 'invoice $50'); inv = [e for e in ev if e.get('oxapay') == 'invoice'][0]; T6, P6 = inv['track_id'], inv['body']['order_id']
+ev, _, _ = nav(A, 'tun:50', 'invoice $50 (tapped on previous card)', move=True); inv = [e for e in ev if e.get('oxapay') == 'invoice'][0]; T6, P6 = inv['track_id'], inv['body']['order_id']
 m = mark(); callback({'track_id': T6, 'status': 'Underpaid', 'type': 'invoice', 'amount': 50, 'order_id': P6}); time.sleep(0.5); ev = since(m)
 check('Underpaid → marked, card edited to underpaid, user told', sql(f"SELECT status FROM payments WHERE id='{P6}'")[0]['status'] == 'underpaid' and any('Underpaid' in e['body']['text'] for e in tg(ev, 'editMessageText')) and tg(ev, 'sendMessage'))
 callback({'track_id': T6, 'status': 'Expired', 'type': 'invoice', 'amount': 50, 'order_id': P6})
@@ -281,7 +294,7 @@ for bad in ['US$', '', ',,']:
     s_, body, _ = req('PUT', '/admin/api/settings', {'accepted_currencies': bad}, AH); check(f'accepted_currencies invalid {bad!r} → 400', s_ == 400, (s_, body))
 s_, body, _ = req('PUT', '/admin/api/settings', {'accepted_currencies': ' usdt, btc usdt '}, AH)
 check('accepted_currencies "usdt, btc usdt" → normalized USDT,BTC', s_ == 200 and sql("SELECT value FROM settings WHERE key='accepted_currencies'")[0]['value'] == 'USDT,BTC', body)
-ev, _, scr = nav(A, 'topup', 'top-up with USDT,BTC setting', ['We accept: <b>USDT</b> or <b>BTC</b>', 'pay with <b>USDT</b> or <b>BTC</b>'])
+ev, _, scr = nav(A, 'topup', 'top-up with USDT,BTC setting (tapped on card)', ['We accept: <b>USDT</b> or <b>BTC</b>', 'pay with <b>USDT</b> or <b>BTC</b>'], move=True)
 s = last_screen(A.msg('/start')); check('home welcome adapts: "Top up with USDT or BTC"', s and 'Top up with USDT or BTC —' in s['body']['text'], s and s['body']['text'])
 s_, body, _ = req('GET', '/admin/api/oxapay/accepted', None, AH); check('admin OxaPay check flags mismatch (setting USDT,BTC vs OxaPay USDT)', json.loads(body)['match'] is False, body)
 m = mark(); req('POST', '/admin/api/bot/setup', None, AH); ev = since(m)
@@ -292,6 +305,95 @@ sql("DELETE FROM settings WHERE key='welcome_text'")
 s_, body, _ = req('PUT', '/admin/api/settings', {'accepted_currencies': 'USDT'}, AH); check('accepted_currencies back to USDT', s_ == 200 and json.loads(body)['changed'] == ['accepted_currencies'])
 ev, _, scr = nav(A, 'topup', 'top-up back to USDT only', ['We accept: <b>USDT</b>\n'])
 check('no BTC after reset', 'BTC' not in scr['body']['text'])
+
+# ───── persistent reply keyboard + "active screen follows the user"
+def kbmsgs(ev): return [e for e in tg(ev, 'sendMessage') if 'keyboard' in (e['body'].get('reply_markup') or {})]
+def navrow(u): return sql(f"SELECT * FROM chat_nav WHERE chat_id={u.uid}")[0]
+def deleted(ev, mid): return [e for e in tg(ev, 'deleteMessage') if e['body']['message_id'] == mid]
+C = User(555003, 'Carla', 'carla')
+ev = C.msg('/start'); sends = tg(ev, 'sendMessage'); k = kbmsgs(ev)
+rm = k[0]['body']['reply_markup'] if k else {}
+check('/start: persistent reply keyboard sent (is_persistent, resize_keyboard, placeholder ≤64)',
+      len(k) == 1 and rm.get('is_persistent') is True and rm.get('resize_keyboard') is True and 1 <= len(rm.get('input_field_placeholder', '')) <= 64 and 'one_time_keyboard' not in rm, rm)
+check('reply keyboard: 6 sections with emoji, 2 columns', [[b['text'] for b in r] for r in rm.get('keyboard', [])] == [['🛒 Shop', '💰 Top up'], ['🔑 My licenses', '📥 Downloads'], ['👤 Profile', '💬 Support']], rm)
+check('/start: keyboard message first, home card (inline) last at the bottom', k and sends[-1]['body']['text'].startswith('👋 Hi, <b>Carla</b>') and sends.index(k[0]) == 0 and 'inline_keyboard' in sends[-1]['body']['reply_markup'], [x['body']['text'][:30] for x in sends])
+KB1, H1 = k[0]['mid'], sends[-1]['mid']
+r = navrow(C); check('chat_nav stores menu, keyboard message, version, last id', r['menu_msg_id'] == H1 and r['kb_msg_id'] == KB1 and r['kb_version'] == 1 and r['last_msg_id'] == H1, r)
+nav(C, 'shop', 'latest message tapped → edited in place', ['🛒 <b>Shop</b>'])
+ev, ans = C.cb('shop'); check('latest tap, same screen → "not modified" tolerated, no new message', len(ans) == 1 and not tg(ev, 'sendMessage') and not tg(ev, 'deleteMessage'))
+for label, want in [('🛒 Shop', '🛒 <b>Shop</b>'), ('💰 Top up', '💰 <b>Top up balance</b>'), ('🔑 My licenses', 'No licenses yet'), ('📥 Downloads', 'No downloads yet'), ('👤 Profile', '👤 <b>Profile</b>'), ('💬 Support', '💬 <b>Support</b>'), ('shop', '🛒 <b>Shop</b>')]:
+    old = C.mid; ev = C.msg(label); scr = last_screen(ev)
+    check(f'keyboard text {label!r} → its screen sent at the bottom, old menu deleted, no edit',
+          scr and scr['tg'] == 'sendMessage' and want in scr['body']['text'] and deleted(ev, old) and not tg(ev, 'editMessageText') and not kbmsgs(ev)
+          and navrow(C)['menu_msg_id'] == scr['mid'], (scr and scr['body']['text'][:60], [(e.get('tg'), e['body'].get('message_id')) for e in ev]))
+M = C.mid; C.msg('/whoami')
+ev, ans = C.cb('profile', M); scr = last_screen(ev)
+check('tap on a menu that is no longer the latest (bot/user messages after it) → deleteMessage(old) + new at the bottom',
+      len(ans) == 1 and scr['tg'] == 'sendMessage' and deleted(ev, M) and not tg(ev, 'editMessageText') and navrow(C)['menu_msg_id'] == scr['mid'], [e.get('tg') for e in ev])
+C.mid = scr['mid']; M = C.mid
+C.msg(None, {'sticker': {'file_id': 'STK', 'file_unique_id': 'u', 'type': 'regular', 'width': 512, 'height': 512, 'is_animated': False, 'is_video': False}})
+ev, ans = C.cb('shop', M); scr = last_screen(ev)
+check('any incoming user message (sticker) makes the menu "not latest" → moved', len(ans) == 1 and scr['tg'] == 'sendMessage' and deleted(ev, M), [e.get('tg') for e in ev])
+C.mid = scr['mid']; M = C.mid
+urllib.request.urlopen(urllib.request.Request(FAKE + f'/_faildelete/{C.uid}/{M}', data=b'', method='POST'))
+C.msg('/whoami'); ev, ans = C.cb('support', M); scr = last_screen(ev)
+check('deleteMessage failure (e.g. >48h) tolerated: new screen still sent, answered once, state updated',
+      len(ans) == 1 and 'text' not in ans[0]['body'] and [e for e in deleted(ev, M) if e.get('error')] and scr['tg'] == 'sendMessage' and '💬 <b>Support</b>' in scr['body']['text'] and navrow(C)['menu_msg_id'] == scr['mid'], (ans, [e.get('tg') for e in ev]))
+C.mid = scr['mid']
+ev = C.msg('💰 Top up'); check('keyboard text after a failed delete still works', last_screen(ev) and 'Top up balance' in last_screen(ev)['body']['text'])
+# keypad + custom amount are not confused with keyboard texts
+nav(C, 'kp:', 'keypad from the keyboard-opened top-up', ['✏️ <b>Other amount</b>'])
+nav(C, 'kp:2', 'keypad digit 2', ['$ 2'])
+ev, _, scr = nav(C, 'kp:25', 'keypad digits 25 (live edit in place)', ['$ 25'], ['kpok:25'])
+nav(C, 'kpok:25', 'keypad ✅ → confirm $25', ['Amount: <b>$25.00</b>'], ['tun:25'])
+old = C.mid; ev = C.msg('30'); scr = last_screen(ev)
+check('typed amount "30" on the keypad flow → confirm $30 at the bottom, old screen deleted', scr and 'Amount: <b>$30.00</b>' in scr['body']['text'] and deleted(ev, old))
+ev = C.msg('💰 Top up'); scr = last_screen(ev)
+check('"💰 Top up" keyboard text opens the top-up menu (not parsed as an amount)', scr and '💰 <b>Top up balance</b>' in scr['body']['text'] and 'Confirm top-up' not in scr['body']['text'])
+ev = C.msg('/topup 12'); check('/topup 12 still works', last_screen(ev) and 'Amount: <b>$12.00</b>' in last_screen(ev)['body']['text'])
+ev = C.msg('/start topup_7'); check('deep link /start topup_7 → keyboard + confirm $7 at the bottom', kbmsgs(ev) and 'Amount: <b>$7.00</b>' in last_screen(ev)['body']['text'])
+# records are kept: invoice card and purchase receipt never deleted
+ev, _, scr = nav(C, 'tun:7', 'invoice from deep-link confirm (edited into the card)', ['🧾 <b>Top-up invoice · $7.00</b>'])
+CARD = C.mid; check('invoice card is a record (menu cleared)', sql(f"SELECT (menu_msg_id IS NULL) AS n FROM chat_nav WHERE chat_id={C.uid}")[0]['n'] == 1, navrow(C))
+ev = C.msg('🛒 Shop'); check('keyboard after invoice card: new screen, invoice card NOT deleted', last_screen(ev)['tg'] == 'sendMessage' and not deleted(ev, CARD))
+ev, ans = C.cb('home', CARD); check('"Home" on the invoice card → home sent at the bottom, card kept (not edited/deleted)', len(ans) == 1 and last_screen(ev)['tg'] == 'sendMessage' and not deleted(ev, CARD) and not [e for e in tg(ev, 'editMessageText') if e['body']['message_id'] == CARD])
+C.mid = last_screen(ev)['mid']
+ev, ans = C.cb(f'tuchk:{[x for x in sql(f"SELECT id FROM payments WHERE telegram_user_id={C.uid} ORDER BY created_at DESC LIMIT 1")][0]["id"]}', CARD)
+check('"Check status" on the card updates the card itself (record action in place)', len(ans) == 1 and not tg(ev, 'sendMessage') and not tg(ev, 'deleteMessage'))
+sql(f"UPDATE users SET balance=20 WHERE user_id={C.uid}")
+nav(C, 'days:liveira_access:3', 'confirm purchase', ['Confirm purchase'])
+ev, _, scr = nav(C, 'confirm:liveira_access:3', 'purchase success (receipt)', ['✅ <b>Purchase successful!</b>'])
+RCPT = C.mid; check('purchase receipt is a record (menu cleared)', sql(f"SELECT (menu_msg_id IS NULL) AS n FROM chat_nav WHERE chat_id={C.uid}")[0]['n'] == 1, navrow(C))
+ev = C.msg('👤 Profile'); check('keyboard after purchase: receipt NOT deleted', last_screen(ev)['tg'] == 'sendMessage' and not deleted(ev, RCPT))
+ev, ans = C.cb('licenses', RCPT); check('"My licenses" on the receipt → list at the bottom, receipt kept, previous menu deleted', len(ans) == 1 and last_screen(ev)['tg'] == 'sendMessage' and not deleted(ev, RCPT) and deleted(ev, C.mid))
+C.mid = last_screen(ev)['mid']
+# keyboard re-attach
+sql(f"UPDATE chat_nav SET kb_msg_id=NULL WHERE chat_id={C.uid}")
+ev = C.msg('🔑 My licenses'); check('keyboard missing in state → re-attached on the next message', len(kbmsgs(ev)) == 1 and 'My licenses' in last_screen(ev)['body']['text'])
+KB2 = kbmsgs(ev)[0]['mid']
+sql(f"UPDATE chat_nav SET kb_version=0 WHERE chat_id={C.uid}")
+ev = C.msg('/shop'); check('older keyboard version → new keyboard sent, previous keyboard message deleted', len(kbmsgs(ev)) == 1 and deleted(ev, KB2))
+ev = C.msg('/shop'); check('up-to-date keyboard → not re-sent on /shop', not kbmsgs(ev))
+KB3 = navrow(C)['kb_msg_id']
+ev = C.msg('hi there'); check('unrecognised text → keyboard re-attached + home at the bottom, old keyboard message deleted', len(kbmsgs(ev)) == 1 and deleted(ev, KB3) and last_screen(ev)['body']['text'].startswith('👋 Hi, <b>Carla</b>'))
+ev = C.msg('/menu'); check('/menu sends the keyboard and the home card', len(kbmsgs(ev)) == 1 and last_screen(ev)['body']['text'].startswith('👋 Hi'))
+# maintenance + admin unchanged
+sql("UPDATE settings SET value='1' WHERE key='maintenance_mode'")
+ev = C.msg('🛒 Shop'); check('maintenance: keyboard text → 🛠 message, no screen', last_screen(ev) and '🛠 <b>Maintenance</b>' in last_screen(ev)['body']['text'] and not deleted(ev, C.mid))
+sql("UPDATE settings SET value='0' WHERE key='maintenance_mode'")
+s2 = last_screen(ADM.msg('/bal @carla')); check('/bal (admin) unchanged with keyboard feature', s2 and '@carla (<code>555003</code>)\nBalance: $' in s2['body']['text'] and 'keyboard' not in (s2['body'].get('reply_markup') or {}))
+# graceful fallback while migration 0006 is not applied
+sql("ALTER TABLE chat_nav RENAME TO chat_nav_off")
+ev = C.msg('/start'); check('without chat_nav table: /start still sends keyboard + home', kbmsgs(ev) and last_screen(ev)['body']['text'].startswith('👋 Hi'))
+nav(C, 'shop', 'without chat_nav table: edit in place (previous behaviour)', ['🛒 <b>Shop</b>'])
+ev = C.msg('📥 Downloads'); check('without chat_nav table: keyboard text still opens its screen', last_screen(ev) and 'Downloads' in last_screen(ev)['body']['text'])
+sql("ALTER TABLE chat_nav_off RENAME TO chat_nav")
+before = navrow(C)['last_msg_id']
+m = mark(); s_, body, _ = req('POST', '/admin/api/broadcast', {'text': 'Local test broadcast'}, AH); ev = since(m)
+check('admin broadcast still works and skips chat_nav writes (D1 query budget)', s_ == 200 and json.loads(body)['sent'] >= 3 and [e for e in tg(ev, 'sendMessage') if e['body']['chat_id'] == C.uid] and navrow(C)['last_msg_id'] == before, (s_, body[:200]))
+ans_all = [e for e in logs() if e.get('tg') == 'answerCallbackQuery']
+ids = [e['body']['callback_query_id'] for e in ans_all]
+check('every callback query answered exactly once (whole run)', len(ids) == len(set(ids)) and len(ids) == next(qid) - 1, (len(ids), len(set(ids))))
 
 # ───── global: Bot API validation
 viol = [e for e in logs() if 'violation' in e]

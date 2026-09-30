@@ -1,4 +1,5 @@
 /* Shared helpers: responses, time, settings, products, audit */
+import { noteMessage } from "./chatnav.js";
 
 export const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -191,7 +192,8 @@ export async function audit(env, actor, action, details) {
 
 /* ─── Telegram API ─── */
 
-export async function tgApi(env, method, body) {
+/** opts.track=false skips the chat_nav "latest message" write (bulk sends: D1 allows 50 queries per request on the free plan). */
+export async function tgApi(env, method, body, { track = true } = {}) {
   const token = env.BOT_TOKEN;
   if (!token) throw new Error("BOT_TOKEN missing");
   const res = await fetch(`${env.TELEGRAM_API_BASE || "https://api.telegram.org"}/bot${token}/${method}`, {
@@ -202,8 +204,19 @@ export async function tgApi(env, method, body) {
   const data = await res.json().catch(() => ({}));
   if (!data.ok) {
     console.error("Telegram API error", method, data?.error_code, data?.description);
+  } else if (track && SEND_METHODS.has(method)) {
+    await noteSent(env, body?.chat_id, data.result);
   }
   return data;
+}
+
+// Methods that create a new message: their ids feed the "latest message" tracking (chat_nav).
+const SEND_METHODS = new Set(["sendMessage", "sendDocument", "sendPhoto", "sendVideo", "sendAnimation", "sendAudio", "sendVoice", "sendSticker", "copyMessage", "forwardMessage"]);
+
+async function noteSent(env, chatId, result) {
+  const msgId = result?.message_id;
+  const cid = result?.chat?.id ?? chatId;
+  if (msgId && Number(cid) > 0) await noteMessage(env, cid, msgId);
 }
 
 export async function tgApiForm(env, method, form) {
@@ -216,6 +229,8 @@ export async function tgApiForm(env, method, form) {
   const data = await res.json().catch(() => ({}));
   if (!data.ok) {
     console.error("Telegram API error", method, data?.error_code, data?.description);
+  } else if (SEND_METHODS.has(method)) {
+    await noteSent(env, form.get("chat_id"), data.result);
   }
   return data;
 }

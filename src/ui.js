@@ -178,3 +178,62 @@ export function paidCard(pay, s, newBalance) {
   rows.push([HOME()]);
   return { text, reply_markup: kb(rows) };
 }
+
+/* ─── persistent reply keyboard (ReplyKeyboardMarkup) ─── */
+
+/** Bump when the layout changes: chats with an older version get the new keyboard on their next message. */
+export const REPLY_KB_VERSION = 1;
+
+/** [label, route target, style] — same sections as the inline home grid. */
+export const REPLY_KB_SECTIONS = [
+  ["🛒 Shop", "shop", "primary"],
+  ["💰 Top up", "topup", "success"],
+  ["🔑 My licenses", "licenses"],
+  ["📥 Downloads", "downloads"],
+  ["👤 Profile", "profile"],
+  ["💬 Support", "support"],
+];
+
+export const REPLY_KB_TEXT = "⌨️ Your menu is pinned below the chat — tap a section anytime.";
+
+export function replyKeyboard() {
+  const buttons = REPLY_KB_SECTIONS.map(([text, , style]) => (style ? { text, style } : { text }));
+  return {
+    keyboard: grid(buttons, 2),
+    is_persistent: true,
+    resize_keyboard: true,
+    input_field_placeholder: "Pick a section or type an amount",
+  };
+}
+
+const normLabel = (t) =>
+  String(t || "")
+    .replace(/[\uFE0E\uFE0F\u200D]/g, "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+
+const KB_LOOKUP = new Map();
+for (const [text, target] of REPLY_KB_SECTIONS) {
+  KB_LOOKUP.set(normLabel(text), target); // exact button text
+  KB_LOOKUP.set(normLabel(text.replace(/^\S+\s+/, "")), target); // same label typed without the emoji
+}
+KB_LOOKUP.set("licenses", "licenses");
+KB_LOOKUP.set("top-up", "topup");
+KB_LOOKUP.set("topup", "topup");
+
+/** Route target for a reply-keyboard button text (or the same label typed by hand), else null. */
+export function keyboardTarget(text) {
+  return KB_LOOKUP.get(normLabel(text)) || null;
+}
+
+/** deleteMessage, ignoring every error (e.g. messages older than 48 h can't be deleted). */
+export async function deleteMessageQuiet(env, chatId, messageId) {
+  if (!chatId || !messageId) return false;
+  try {
+    const r = await tgApi(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
+    return !!r?.ok;
+  } catch {
+    return false;
+  }
+}

@@ -1112,7 +1112,8 @@ async function broadcast({ request, env, actor }) {
   let sent = 0;
   let failed = 0;
   for (const r of results || []) {
-    const res = await tgApi(env, "sendMessage", { chat_id: r.user_id, text, link_preview_options: { is_disabled: true } });
+    // track:false — no per-recipient chat_nav write, so a 25-message batch stays within D1's per-request query limit.
+    const res = await tgApi(env, "sendMessage", { chat_id: r.user_id, text, link_preview_options: { is_disabled: true } }, { track: false });
     if (res.ok) sent++;
     else failed++;
   }

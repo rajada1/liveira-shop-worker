@@ -46,7 +46,13 @@ import {
   paidCard,
   howItWorks,
   networkHint,
+  replyKeyboard,
+  keyboardTarget,
+  deleteMessageQuiet,
+  REPLY_KB_VERSION,
+  REPLY_KB_TEXT,
 } from "./ui.js";
+import { getNav, setMenu, setKeyboardMessage, noteMessage } from "./chatnav.js";
 
 const TG_UPLOAD_LIMIT = 50 * 1024 * 1024; // Bot API sendDocument upload limit
 const TOPUP_PROMPT = "Enter the top-up amount in USD"; // legacy ForceReply prompt (old messages)
@@ -296,6 +302,7 @@ async function doPurchase(env, s, user, pid, days) {
       "<i>Enter this key in the Liveira program to unlock access.</i>",
     reply_markup: kb(rows),
     toast: "✅ Purchase successful!",
+    record: true, // kept in the chat as a receipt: never deleted or reused as the menu
   };
 }
 
@@ -554,7 +561,9 @@ async function createInvoiceFlow(env, s, user, nav, amount, resume) {
     return show(env, nav, { text: `💰 <b>Top up</b>\n\n${msg}\n\n${supportLine(s)}`, reply_markup: kb([navRow("topup")]) });
   }
   const card = invoiceCard(r.payment, s, supportLine(s));
-  const res = await show(env, nav, card);
+  // Double tap on "Create invoice" arrives from the message that already became this card: refresh it in place.
+  if (r.reused && nav.messageId && r.payment.message_id === nav.messageId) nav.inPlace = true;
+  const res = await show(env, nav, { ...card, record: true });
   if (res?.message_id) await setPaymentMessage(env, r.payment.id, nav.chatId, res.message_id);
   return { ...res, toast: r.reused ? "Your open invoice for this amount" : "🧾 Invoice created" };
 }
@@ -589,9 +598,58 @@ async function checkStatusFlow(env, s, user, nav, id) {
 
 /* ─── routing helpers ─── */
 
+async function navState(env, nav) {
+  if (!nav.state) nav.state = await getNav(env, nav.chatId);
+  return nav.state;
+}
+
+/**
+ * Show a screen — the active screen follows the user:
+ *  - tapped message is the current menu AND still the latest message in the chat → edit it in place;
+ *  - otherwise (older message tapped, reply keyboard, command, typed text) → send the screen fresh at the
+ *    bottom, then delete the previous menu message (errors ignored: >48 h old messages can't be deleted).
+ * screen.record: the message becomes a record (invoice card, purchase receipt) — it is never deleted and
+ *   never reused as the menu. nav.inPlace: edit the tapped message itself (actions on a record).
+ * Without the chat_nav table (migration 0006 not applied) the previous edit-in-place behaviour is used.
+ */
 async function show(env, nav, screen) {
-  const res = await editOrSend(env, nav.chatId, nav.messageId, screen.text, { reply_markup: screen.reply_markup });
+  const extra = { reply_markup: screen.reply_markup };
+  const plain = async () => {
+    const res = await editOrSend(env, nav.chatId, nav.messageId, screen.text, extra);
+    return { message_id: res.message_id, toast: screen.toast };
+  };
+  if (nav.inPlace && nav.messageId) return plain();
+  const st = await navState(env, nav);
+  if (!st.available) return plain();
+  const row = st.row || {};
+  const menuId = row.menu_msg_id ? Number(row.menu_msg_id) : null;
+  const latest = !!nav.messageId && menuId === nav.messageId && nav.messageId >= Number(row.last_msg_id || 0);
+  const res = await editOrSend(env, nav.chatId, latest ? nav.messageId : null, screen.text, extra);
+  if (res.message_id) {
+    const newMenu = screen.record ? null : res.message_id;
+    await setMenu(env, nav.chatId, newMenu);
+    st.row = { ...row, menu_msg_id: newMenu, last_msg_id: Math.max(Number(row.last_msg_id || 0), res.message_id) };
+  }
+  if (res.ok && menuId && menuId !== res.message_id) await deleteMessageQuiet(env, nav.chatId, menuId);
   return { message_id: res.message_id, toast: screen.toast };
+}
+
+/**
+ * Attach the persistent reply keyboard (a message can carry only one reply_markup, so it rides on a short
+ * message of its own). force: always (re)send — /start, /menu, unrecognised text. Otherwise only when this
+ * chat never got it or got an older layout. The previous keyboard message is deleted after the new one.
+ */
+async function ensureKeyboard(env, nav, { force = false } = {}) {
+  if (!(Number(nav.chatId) > 0)) return;
+  const st = await navState(env, nav);
+  const row = st.row || {};
+  if (!force && (!st.available || (row.kb_msg_id && Number(row.kb_version) >= REPLY_KB_VERSION))) return;
+  const r = await sendMessage(env, nav.chatId, REPLY_KB_TEXT, { reply_markup: replyKeyboard() });
+  const mid = r?.ok ? r.result?.message_id : null;
+  if (!mid || !st.available) return;
+  await setKeyboardMessage(env, nav.chatId, mid, REPLY_KB_VERSION);
+  st.row = { ...row, kb_msg_id: mid, kb_version: REPLY_KB_VERSION, last_msg_id: Math.max(Number(row.last_msg_id || 0), mid) };
+  if (row.kb_msg_id && Number(row.kb_msg_id) !== mid) await deleteMessageQuiet(env, nav.chatId, row.kb_msg_id);
 }
 
 async function answerCallback(env, id, text, alert) {
@@ -689,8 +747,12 @@ async function route(env, s, user, nav, data) {
     if (m[1] === "tun") return createInvoiceFlow(env, s, user, nav, p.amount, p.resume);
     return show(env, nav, screenConfirmTopup(s, env, p.amount, p.resume));
   }
-  if (data.startsWith("tuchk:")) return checkStatusFlow(env, s, user, nav, data.slice(6));
+  if (data.startsWith("tuchk:")) {
+    nav.inPlace = true; // actions on the invoice card (a record) update that card itself
+    return checkStatusFlow(env, s, user, nav, data.slice(6));
+  }
   if (data.startsWith("tux:")) {
+    nav.inPlace = true;
     const id = data.slice(4);
     const ok = await cancelPayment(env, id, user.id);
     const pay = await env.DB.prepare("SELECT * FROM payments WHERE id=? AND telegram_user_id=?").bind(id, user.id).first();
@@ -751,14 +813,25 @@ async function handleCommand(env, message, s) {
   const cmd = text.split(/\s+/)[0].split("@")[0].toLowerCase();
   const admin = isAdmin(env, user.id);
   const nav = { chatId, messageId: null };
+  // Persistent reply keyboard buttons send their label as text ("🛒 Shop"…). Matched exactly, so typed
+  // amounts ("25") and the keypad flow are never confused with them.
+  const kbTarget = !cmd.startsWith("/") && message.chat?.type === "private" ? keyboardTarget(text) : null;
 
   if (s.maintenance_mode === "1" && !admin && cmd !== "/whoami") {
-    if (cmd.startsWith("/")) await sendMessage(env, chatId, maintenanceText(s));
+    if (cmd.startsWith("/") || kbTarget) await sendMessage(env, chatId, maintenanceText(s));
+    return;
+  }
+
+  if (kbTarget) {
+    await ensureUser(env, user.id, user.username);
+    await ensureKeyboard(env, nav);
+    await route(env, s, user, nav, kbTarget);
     return;
   }
 
   if (cmd === "/start") {
     await ensureUser(env, user.id, user.username);
+    await ensureKeyboard(env, nav, { force: true });
     // Deep links: t.me/<bot>?start=topup | shop | licenses | profile | support | topup_25
     const payload = (parseArgs(text)[0] || "").toLowerCase();
     let m;
@@ -770,18 +843,21 @@ async function handleCommand(env, message, s) {
 
   if (cmd === "/menu" || cmd === "/home") {
     await ensureUser(env, user.id, user.username);
+    await ensureKeyboard(env, nav, { force: true });
     await show(env, nav, await screenHome(env, s, user));
     return;
   }
 
   if (["/shop", "/licenses", "/profile", "/support", "/help", "/downloads"].includes(cmd)) {
     await ensureUser(env, user.id, user.username);
+    await ensureKeyboard(env, nav);
     await route(env, s, user, nav, cmd.slice(1));
     return;
   }
 
   if (cmd === "/topup") {
     await ensureUser(env, user.id, user.username);
+    await ensureKeyboard(env, nav);
     const args = parseArgs(text);
     if (args.length) {
       const tc = topupConfig(s, env);
@@ -892,10 +968,13 @@ async function handleCommand(env, message, s) {
     const amount = parseAmount(text);
     const tc = topupConfig(s, env);
     if (amount !== null && tc.available) {
+      await ensureKeyboard(env, nav);
       const err = amountError(tc, amount, s.currency_symbol);
       if (err) return show(env, nav, screenKeypad(s, env, "", err));
       return show(env, nav, screenConfirmTopup(s, env, amount, null));
     }
+    // Unrecognised text: the user may have lost the keyboard — re-attach it, then the home card below it.
+    await ensureKeyboard(env, nav, { force: true });
     await show(env, nav, await screenHome(env, s, user));
   }
 }
@@ -906,6 +985,10 @@ export async function handleTelegramUpdate(env, update) {
     if (update.callback_query) {
       await handleCallback(env, update.callback_query, s);
       return;
+    }
+    // Any incoming message in a private chat makes the current menu "not the latest" any more.
+    if (update.message?.chat?.type === "private" && update.message.message_id) {
+      await noteMessage(env, update.message.chat.id, update.message.message_id);
     }
     if (update.message && update.message.text && update.message.from) {
       const m = update.message;

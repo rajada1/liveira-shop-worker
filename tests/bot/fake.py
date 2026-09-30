@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LOG = open('/tmp/lvtest/fake.log', 'a'); LOCK = threading.Lock()
 tid_counter = itertools.count(1000); mid_counter = itertools.count(100)
 INVOICES, STATUS, MSGS = {}, {}, {}
+FAIL_DELETE = set()  # (chat, mid) whose deleteMessage fails like a >48h-old message
 ACCEPTED = ['USDT']
 ALLOWED_TAGS = {'b','strong','i','em','u','ins','s','strike','del','span','tg-spoiler','a','tg-emoji','tg-time','code','pre','blockquote'}
 BTN_ACTIONS = {'url','callback_data','web_app','login_url','switch_inline_query','switch_inline_query_current_chat','switch_inline_query_chosen_chat','copy_text','callback_game','pay','disabled'}
@@ -44,12 +45,27 @@ def validate(method, d):
             if 'style' in b and b['style'] not in ('danger', 'success', 'primary'): v.append('bad style ' + b['style'])
             if 'copy_text' in b and not (1 <= len(b['copy_text'].get('text', '')) <= 256): v.append('copy_text len')
             if not b.get('text'): v.append('empty button text')
+    if 'keyboard' in rm:  # ReplyKeyboardMarkup (Bot API: keyboard, is_persistent, resize_keyboard, one_time_keyboard, input_field_placeholder, selective)
+        if method != 'sendMessage': v.append('reply keyboard only allowed on send, not ' + method)
+        for k in rm:
+            if k not in ('keyboard', 'is_persistent', 'resize_keyboard', 'one_time_keyboard', 'input_field_placeholder', 'selective'): v.append('unknown ReplyKeyboardMarkup field ' + k)
+        for k in ('is_persistent', 'resize_keyboard', 'one_time_keyboard', 'selective'):
+            if k in rm and not isinstance(rm[k], bool): v.append(k + ' not bool')
+        if 'input_field_placeholder' in rm and not (1 <= len(rm['input_field_placeholder']) <= 64): v.append('placeholder len')
+        for row in rm['keyboard']:
+            for b in row:
+                if not isinstance(b, dict) or not b.get('text'): v.append('keyboard button without text')
+                elif 'style' in b and b['style'] not in ('danger', 'success', 'primary'): v.append('bad keyboard style')
+                elif set(b) - {'text', 'style', 'icon_custom_emoji_id'}: v.append('keyboard button not a plain text button')
+    if method == 'editMessageText' and rm and 'inline_keyboard' not in rm: v.append('edit with non-inline markup')
+    if method == 'deleteMessage' and not (d.get('chat_id') and isinstance(d.get('message_id'), int)): v.append('deleteMessage params')
     if method == 'answerCallbackQuery' and d.get('text') and len(d['text']) > 200: v.append('toast > 200')
     if method == 'setMyDescription' and len(d.get('description', '')) > 512: v.append('description > 512')
     if method == 'setMyShortDescription' and len(d.get('short_description', '')) > 120: v.append('short > 120')
     return v
 
 class H(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'  # keep-alive like the real API (workerd pools connections)
     def log_message(self, *a): pass
     def _send(self, obj, code=200):
         b = json.dumps(obj).encode(); self.send_response(code)
@@ -83,6 +99,10 @@ class H(BaseHTTPRequestHandler):
             log({'oxapay': 'invoice', 'key': self.headers.get('merchant_api_key'), 'body': d, 'track_id': tid})
             INVOICES[tid] = {'track_id': tid, 'amount': d['amount'], 'order_id': d.get('order_id'), 'type': 'invoice'}
             return self._send({'data': {'track_id': tid, 'payment_url': 'https://pay.oxapay.com/' + tid, 'expired_at': int(time.time()) + 3600, 'date': int(time.time())}, 'message': 'Operation completed successfully!', 'error': {}, 'status': 200, 'version': '1.0.0'})
+        if self.path == '/_nextid':  # incoming user messages share the chat's message id sequence
+            return self._send({'mid': next(mid_counter)})
+        if self.path.startswith('/_faildelete/'):
+            _, _, chat, mid = self.path.split('/'); FAIL_DELETE.add((chat, int(mid))); return self._send({'ok': True})
         if self.path.startswith('/_accepted/'):
             ACCEPTED[:] = [x for x in self.path.split('/')[2].split(',') if x]; return self._send({'ok': True})
         if self.path.startswith('/_status/'):
@@ -99,7 +119,17 @@ class H(BaseHTTPRequestHandler):
             if method == 'sendMessage':
                 mid = next(mid_counter); MSGS[(str(d.get('chat_id')), mid)] = (d.get('text'), json.dumps(d.get('reply_markup'), sort_keys=True))
                 entry['mid'] = mid; log(entry)
-                return self._send({'ok': True, 'result': {'message_id': mid, 'chat': {'id': d.get('chat_id')}, 'text': d.get('text')}})
+                return self._send({'ok': True, 'result': {'message_id': mid, 'chat': {'id': d.get('chat_id'), 'type': 'private'}, 'text': d.get('text')}})
+            if method == 'deleteMessage':
+                key = (str(d.get('chat_id')), d.get('message_id'))
+                if key in FAIL_DELETE:
+                    entry['error'] = 'cant delete'; log(entry)
+                    return self._send({'ok': False, 'error_code': 400, 'description': "Bad Request: message can't be deleted"}, 400)
+                if key not in MSGS:
+                    entry['error'] = 'not found'; log(entry)
+                    return self._send({'ok': False, 'error_code': 400, 'description': 'Bad Request: message to delete not found'}, 400)
+                del MSGS[key]; log(entry)
+                return self._send({'ok': True, 'result': True})
             if method == 'editMessageText':
                 key = (str(d.get('chat_id')), d.get('message_id'))
                 new = (d.get('text'), json.dumps(d.get('reply_markup'), sort_keys=True))
@@ -112,7 +142,10 @@ class H(BaseHTTPRequestHandler):
                 MSGS[key] = new; entry['mid'] = d.get('message_id'); log(entry)
                 return self._send({'ok': True, 'result': {'message_id': d.get('message_id'), 'text': d.get('text')}})
             log(entry)
-            return self._send({'ok': True, 'result': True if method != 'sendDocument' else {'message_id': next(mid_counter), 'document': {'file_id': 'FILEID'}}})
+            if method == 'sendDocument':
+                mid = next(mid_counter); entry['mid'] = mid; log(entry)
+                return self._send({'ok': True, 'result': {'message_id': mid, 'chat': {'id': d.get('chat_id'), 'type': 'private'}, 'document': {'file_id': 'FILEID'}}})
+            return self._send({'ok': True, 'result': True})
         self._send({'ok': False}, 404)
 
 if __name__ == '__main__':
