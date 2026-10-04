@@ -23,3 +23,9 @@ bucket_name = "cf-chase-files"
 type = "Text"
 globs = ["**/*.html", "**/*.txt"]
 fallthrough = true
+
+# Binance requests leave through liveira-shop-binance-egress (egress/), pinned near Binance's API region, because
+# Binance answers HTTP 451 to Cloudflare data centers in restricted countries (e.g. US). Deploy egress/ first.
+[[services]]
+binding = "BINANCE_EGRESS"
+service = "liveira-shop-binance-egress"

@@ -25,7 +25,7 @@ BINANCE_API_BASE=http://127.0.0.1:9911
 BINANCE_CACHE_TTL_SEC=1
 V
 grep -v -E '^BINANCE_API_(KEY|SECRET)=' .dev.vars > tests/bot/nosecrets/.dev.vars
-MIGS="tests/bot/base_schema.sql migrations/0002_admin_panel.sql migrations/0003_oxapay.sql migrations/0004_bot_ux.sql migrations/0005_accepted_currencies.sql migrations/0006_chat_nav.sql migrations/0007_binance.sql"
+MIGS="tests/bot/base_schema.sql migrations/0002_admin_panel.sql migrations/0003_oxapay.sql migrations/0004_bot_ux.sql migrations/0005_accepted_currencies.sql migrations/0006_chat_nav.sql migrations/0007_binance.sql migrations/0008_binance_order_id.sql"
 for st in state state2; do
   for f in $MIGS; do
     env -u CLOUDFLARE_API_TOKEN npx wrangler d1 execute liveira-shop --local --persist-to $T/$st --file $f >/dev/null 2>&1

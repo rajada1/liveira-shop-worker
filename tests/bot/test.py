@@ -547,6 +547,29 @@ bals = sorted([J.bal() or 0, K.bal() or 0])
 check('same new ID pasted concurrently by two accounts → one claim, credited once', bals == [0, 4] and sql(f"SELECT COUNT(*) AS n FROM payments WHERE track_id='binance:{TX['race']}'")[0]['n'] == 1
       and len(sql(f"SELECT t.id FROM topups t JOIN payments p ON p.id=t.ref WHERE p.track_id='binance:{TX['race']}'")) == 1, bals)
 
+# Order ID vs transactionId (live shape 2026-10-04: transactionId = 18 chars like "A_A99…", orderId = other 18 digits;
+# the shop's Pay ID is the receiver's binanceId). Either form is accepted; one transfer is credited once.
+def bn_tx2(txid, oid, amount):
+    t = bn_tx(txid, amount); t['orderId'] = oid
+    t['receiverInfo'] = {'name': 'Liveira', 'type': 'USER', 'binanceId': 290455535, 'accountId': 48120001}; return t
+def topups_for(txid): return len(sql(f"SELECT t.id FROM topups t JOIN payments p ON p.id=t.ref WHERE p.track_id='binance:{txid}'"))
+fpost('/_bn/tx', bn_tx2('P_A1b2C3d4E5f6G7h8', '381234567890124001', '6'))
+O1, O2 = User(555040, 'Otto', 'otto'), User(555041, 'Olga', 'olga'); O1.msg('/start'); O2.msg('/start'); time.sleep(1.1)
+ev = O1.msg('381234567890124001'); c = claim('P_A1b2C3d4E5f6G7h8')
+check('Order ID pasted → found by orderId, claim keyed by canonical transactionId, credited $6 (Pay ID = receiverInfo.binanceId)',
+      c and c['credited'] == 1 and abs(O1.bal() - 6) < 1e-9 and not claim('381234567890124001'), (c, O1.bal()))
+time.sleep(1.1); ask_prompt(O2); ev = prompt_reply(O2, 'P_A1b2C3d4E5f6G7h8')
+check('same transfer by its transactionId from another account → refused, credited once', not O2.bal() and topups_for('P_A1b2C3d4E5f6G7h8') == 1, O2.bal())
+Q1, Q2 = User(555042, 'Quim', 'quim'), User(555043, 'Quel', 'quel'); Q1.msg('/start'); Q2.msg('/start'); time.sleep(1.1)
+ev = Q1.msg('381234567890124002'); c1 = claim('381234567890124002')
+check('Order ID not in history yet → pending claim under the Order ID', c1 and c1['status'] == 'pending' and not Q1.bal(), c1)
+fpost('/_bn/tx', bn_tx2('M_P7x8Y9z0A1b2C3d4', '381234567890124002', '9')); time.sleep(1.1)
+ask_prompt(Q2); ev = prompt_reply(Q2, 'M_P7x8Y9z0A1b2C3d4')
+check('other account pastes the transactionId → credited $9', abs((Q2.bal() or 0) - 9) < 1e-9, Q2.bal())
+time.sleep(1.1); ev = cron(); r1 = sql(f"SELECT * FROM payments WHERE id='{c1['id']}'")[0]
+check('the Order-ID claim for the same transfer → rejected "duplicate" (re-key hits UNIQUE), no second credit',
+      r1['status'] == 'rejected' and r1['last_status'] == 'duplicate' and not Q1.bal() and topups_for('M_P7x8Y9z0A1b2C3d4') == 1, r1)
+
 # invalid ID, hourly limit
 N = User(555034, 'Nina', 'nina'); N.msg('/start'); ask_prompt(N)
 ev = prompt_reply(N, 'hello world!'); s_ = last_screen(ev)

@@ -7,7 +7,8 @@ default `290455535`), then pastes the transaction ID (reply to the prompt, plain
 The Worker looks the ID up in the shop's own Binance Pay history (`GET /sapi/v1/pay/transactions`, read-only key, HMAC-SHA256)
 and credits the **amount actually received**, 1 USDT = $1. Code: `src/binance.js`.
 
-Rules: exact `transactionId`; amount > 0 (incoming); `orderType` C2C or PAY; currency in `binance_currencies` (default USDT);
+Rules: exact `transactionId` **or** `orderId` (the Binance app shows the Order ID; claims are re-keyed to the canonical
+`transactionId` before crediting, so both forms of one transfer can't be credited twice); amount > 0 (incoming); `orderType` C2C or PAY; currency in `binance_currencies` (default USDT);
 receiver ids (Pay ID `accountId` / UID `binanceId`) must include the configured Pay ID, otherwise → **review**; above
 `binance_max` (default $1000) → **review** (admin: Pagamentos → "Aprovar e creditar"). Each ID can be claimed by one account
 only (`payments.track_id = 'binance:<txid>'` UNIQUE) and is credited exactly once (nonce batch, `topups.method='binance'`,
@@ -30,6 +31,25 @@ Steps for this release: (1) `npx wrangler d1 execute liveira-shop --remote --fil
 (idempotent: new tables `binance_tx`, `binance_state`, `binance_checks`, index, default settings); (2) `npx wrangler deploy`
 (adds the cron trigger `* * * * *`; bindings unchanged). Tests: `bash tests/bot/run.sh` (fake Binance, plus a second local
 instance without the secrets).
+
+### Binance egress (2026-10-04) — why there is a second Worker
+Live test: from the main Worker, Binance answered **451** (request ran in IAD/US). Cloudflare egress IPs geolocate as US even
+from non-US data centers: `api.binance.com` / `api1-4` answered **403** (CloudFront geo-block) even from Tokyo (NRT).
+The official alternate endpoint **`api-gcp.binance.com`** accepts requests from a non-US data center (still 451 from IAD).
+So Binance calls go through **`liveira-shop-binance-egress`** (`egress/`): pinned with `[placement] region = "aws:ap-northeast-1"`
+(runs in NRT), forwards only `GET /sapi/v1/pay/transactions`, `/sapi/v1/account/apiRestrictions`, `/api/v3/time` to
+`api-gcp.binance.com`, no workers.dev URL / routes (reachable only via the service binding `BINANCE_EGRESS`), stores no
+secrets (the main Worker signs and passes `X-MBX-APIKEY`). Deploy it **before** the main Worker (needs wrangler ≥ 4 with
+Node 20 → 4.80.0):
+```
+cd egress && CLOUDFLARE_API_TOKEN="$CLOUDFLARE_STORE_TOKEN" CLOUDFLARE_ACCOUNT_ID=0d3330f1cc9f7a3f2f18afba43570277 npx -y wrangler@4.80.0 deploy
+```
+Diagnostics (admin only, privacy-safe): `POST /admin/api/binance/diag` → egress colo, API key restrictions (booleans), and the
+*shape* of recent Pay history (field names/kinds, counts, where the Pay ID appears) — no payer data.
+Verified live shapes: `transactionId` = 18-char string with underscore (`A_A99…`), `orderId` = different 18-digit number,
+`amount` decimal string, negative for outgoing; `orderType` C2C; the Pay ID 290455535 is the account UID (`uid`, and
+`payerInfo.binanceId` on outgoing → `receiverInfo.binanceId` on incoming); `receiverInfo.accountId` is a different number.
+Migration `0008_binance_order_id.sql` (adds `binance_tx.order_id`, not idempotent) — applied remotely 2026-10-04.
 
 Notes / caveats: if a cross-bot setup ever verifies the same Binance account from another bot (@LiveiraStore_bot), the
 duplicate protection is per database — don't auto-verify the same account in both bots. Binance answers 451 from

@@ -22,7 +22,7 @@ import {
 } from "./util.js";
 import { topupConfig, syncPayment, expireStale, callbackUrl, round2, oxapayAcceptedCoins } from "./oxapay.js";
 import { noteMessages } from "./chatnav.js";
-import { binanceConfigured, binanceStatus, refreshHistory, verifyClaim, approveClaim, notifyClaim } from "./binance.js";
+import { binanceConfigured, binanceStatus, binanceDiag, refreshHistory, verifyClaim, approveClaim, notifyClaim } from "./binance.js";
 
 const COOKIE = "__Host-lv_admin";
 const SESSION_TTL = 12 * 3600; // seconds
@@ -382,6 +382,11 @@ async function route(ctx, method, api) {
   // Binance Pay (status / connection test; secrets are never returned)
   if (api === "/binance/status" && method === "GET") return aj(await binanceStatus(env, ctx.settings));
   if (api === "/binance/test" && method === "POST") return binanceTest(ctx);
+  if (api === "/binance/diag" && method === "POST") {
+    const d = await binanceDiag(ctx.env, ctx.settings);
+    await audit(ctx.env, ctx.actor, "binance_diag", { ok: d.ok, reason: d.reason || null, colo: d.egress?.colo || null });
+    return aj(d);
+  }
 
   // Tokens
   if (api === "/tokens" && method === "GET") return listTokens(ctx);
@@ -821,7 +826,7 @@ async function approveBinanceApi({ env, actor, settings }, id) {
 
 async function binanceTest({ env, actor, settings }) {
   if (!binanceConfigured(env)) return aj({ ok: false, reason: "unconfigured", status: await binanceStatus(env, settings) });
-  const r = await refreshHistory(env);
+  const r = await refreshHistory(env, { force: true }); // a manual test ignores an earlier backoff
   await audit(env, actor, "binance_test", { result: r.ok ? (r.fresh ? "fetched" : "cached") : r.reason });
   return aj({ ok: r.ok, reason: r.reason || null, fresh: !!r.fresh, count: r.count ?? null, status: await binanceStatus(env, settings) });
 }

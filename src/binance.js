@@ -89,11 +89,19 @@ export async function signedQuery(env, params) {
 
 const BACKOFF_MS = { region: 10 * 60000, blocked: 5 * 60000, rate: 60000, banned: 5 * 60000, auth: 5 * 60000, clock: 30000, unavailable: 30000, network: 30000, api: 60000 };
 
-async function binanceGet(env, params) {
+/** fetch() towards Binance. In production the request leaves through the BINANCE_EGRESS service binding (a small Worker
+ * pinned near Binance's API region, egress/), because Binance answers 451 to Cloudflare data centers in restricted
+ * countries (e.g. the US). A custom BINANCE_API_BASE (tests) or a missing binding → direct fetch. */
+function binanceFetch(env, url, init) {
+  if (env.BINANCE_EGRESS && !env.BINANCE_API_BASE) return env.BINANCE_EGRESS.fetch(new Request(url, init));
+  return fetch(url, init);
+}
+
+async function binanceGet(env, params, path = HISTORY_PATH) {
   const base = String(env.BINANCE_API_BASE || DEFAULT_API).replace(/\/+$/, "");
   let res;
   try {
-    res = await fetch(`${base}${HISTORY_PATH}?${await signedQuery(env, params)}`, {
+    res = await binanceFetch(env, `${base}${path}?${await signedQuery(env, params)}`, {
       headers: { "X-MBX-APIKEY": String(env.BINANCE_API_KEY).trim() },
     });
   } catch (err) {
@@ -115,11 +123,91 @@ async function binanceGet(env, params) {
     console.error("Binance API error", res.status, data?.code, String(data?.msg || "").slice(0, 120));
     return { ok: false, reason, http: res.status, code: data?.code ?? null, retryAfter };
   }
+  if (path !== HISTORY_PATH) return data && typeof data === "object" ? { ok: true, data } : { ok: false, reason: "api", http: res.status };
   if (!data || data.success === false || (data.code != null && String(data.code) !== "000000") || !Array.isArray(data.data)) {
     console.error("Binance API unexpected body", res.status, data?.code, String(data?.message || "").slice(0, 120));
     return { ok: false, reason: "api", http: res.status, code: data?.code ?? null };
   }
   return { ok: true, list: data.data };
+}
+
+/** Where Binance requests leave from: { via: 'egress'|'direct', colo, loc } (no secrets involved). */
+async function egressWhere(env) {
+  try {
+    if (env.BINANCE_EGRESS && !env.BINANCE_API_BASE) {
+      const r = await env.BINANCE_EGRESS.fetch("https://egress.internal/__egress");
+      return { via: "egress", ...(await r.json()) };
+    }
+    const t = await (await fetch("https://www.cloudflare.com/cdn-cgi/trace")).text();
+    const m = (k) => (t.match(new RegExp(`^${k}=(.*)$`, "m")) || [])[1] || null;
+    return { via: "direct", colo: m("colo"), loc: m("loc") };
+  } catch {
+    return { via: env.BINANCE_EGRESS ? "egress" : "direct", colo: null, loc: null };
+  }
+}
+
+/** Shape of a value without its content: "string(18,digits)", "number(+)", "object", … */
+function shapeOf(v) {
+  if (v === null || v === undefined) return String(v);
+  if (typeof v === "number") return `number(${v > 0 ? "+" : v < 0 ? "-" : "0"})`;
+  if (typeof v === "string") {
+    const kind = /^\d+$/.test(v) ? "digits" : /^-?\d+(\.\d+)?$/.test(v) ? (v.startsWith("-") ? "decimal-" : "decimal+") : "text";
+    return `string(${v.length},${kind})`;
+  }
+  return Array.isArray(v) ? "array" : typeof v;
+}
+
+/**
+ * Admin diagnostics, privacy-safe: egress location, API key restrictions (booleans only) and the SHAPE of the recent
+ * Pay history (field names, value kinds, counts; where the configured Pay ID appears). No names, ids or amounts of payers.
+ */
+export async function binanceDiag(env, settings) {
+  const out = { egress: await egressWhere(env) };
+  if (!env.BINANCE_API_BASE) {
+    // Would a direct request from this data center work? (unsigned, public endpoint)
+    try {
+      const t = await fetch("https://api-gcp.binance.com/api/v3/time");
+      out.direct = { colo: out.egress.via === "direct" ? out.egress.colo : null, binanceTime: t.status };
+    } catch {
+      out.direct = { binanceTime: "error" };
+    }
+  }
+  if (!binanceConfigured(env)) return { ...out, ok: false, reason: "unconfigured" };
+  const bc = binanceConfig(settings, env);
+  const rr = await binanceGet(env, {}, "/sapi/v1/account/apiRestrictions");
+  if (!rr.ok) return { ...out, ok: false, reason: rr.reason, http: rr.http ?? null, code: rr.code ?? null };
+  const restr = {};
+  for (const [k, v] of Object.entries(rr.data)) if (typeof v === "boolean") restr[k] = v;
+  out.apiRestrictions = restr;
+  out.ipRestrict = rr.data.ipRestrict ?? null;
+  const now = Date.now();
+  const h = await binanceGet(env, { startTime: String(now - 89 * 86400000), endTime: String(now), limit: "20" });
+  if (!h.ok) return { ...out, ok: false, reason: h.reason, http: h.http ?? null, code: h.code ?? null };
+  const fields = {};
+  const count = (o, k) => (o[k] = (o[k] || 0) + 1);
+  const st = { total: h.list.length, orderType: {}, currency: {}, amountSign: {}, payIdAt: {}, incomingWithPayIdAsReceiver: 0, txidShape: {}, txidMask: {}, txidVsOrderId: {}, receiverAccountVsBinanceId: {} };
+  const walk = (obj, prefix) => {
+    for (const [k, v] of Object.entries(obj || {})) {
+      const key = prefix + k;
+      if (v && typeof v === "object" && !Array.isArray(v)) walk(v, key + ".");
+      else count((fields[key] ||= {}), shapeOf(v));
+      if (bc.validId && String(v) === bc.payId) count(st.payIdAt, key);
+    }
+  };
+  for (const x of h.list) {
+    walk(x, "");
+    count(st.orderType, String(x.orderType));
+    count(st.currency, String(x.currency));
+    const a = Number(x.amount);
+    count(st.amountSign, a > 0 ? "positive" : a < 0 ? "negative" : "zero/NaN");
+    count(st.txidShape, shapeOf(x.transactionId));
+    const tid = String(x.transactionId ?? ""), oid = String(x.orderId ?? "");
+    count(st.txidMask, tid.replace(/[0-9]/g, "9").replace(/[A-Za-z]/g, "A"));
+    count(st.txidVsOrderId, !oid ? "no orderId" : tid === oid ? "equal" : tid.includes(oid) ? "txid contains orderId" : "different");
+    count(st.receiverAccountVsBinanceId, String(x.receiverInfo?.accountId ?? "") === String(x.receiverInfo?.binanceId ?? "") ? "equal" : "different");
+    if (a > 0 && [x.receiverInfo?.accountId, x.receiverInfo?.binanceId].map(String).includes(bc.payId)) st.incomingWithPayIdAsReceiver++;
+  }
+  return { ...out, ok: true, history: st, fields };
 }
 
 /* ─── cache + throttle ─── */
@@ -150,6 +238,7 @@ function slim(x) {
     p: s(x.payerInfo?.binanceId),
     r: s(x.receiverInfo?.binanceId),
     ra: s(x.receiverInfo?.accountId),
+    oi: s(x.orderId),
   };
 }
 
@@ -157,11 +246,11 @@ function slim(x) {
  * Refresh the cached Pay history if it is older than the TTL. Only one request per TTL wins the fetch slot;
  * the others return { ok:true, fresh:false } (the cache is as current as it gets). Errors set a backoff.
  */
-export async function refreshHistory(env) {
+export async function refreshHistory(env, { force = false } = {}) {
   if (!binanceConfigured(env)) return { ok: false, reason: "unconfigured" };
   const now = Date.now();
   const st = await getState(env);
-  if (Number(st.backoff_until || 0) > now) return { ok: false, reason: st.last_error || "backoff", backoff: true };
+  if (!force && Number(st.backoff_until || 0) > now) return { ok: false, reason: st.last_error || "backoff", backoff: true };
   const claim = await env.DB.prepare(
     `INSERT INTO binance_state (k, v) VALUES ('fetch_at', ?1)
      ON CONFLICT(k) DO UPDATE SET v=excluded.v WHERE CAST(binance_state.v AS INTEGER) <= ?2`
@@ -188,12 +277,14 @@ export async function refreshHistory(env) {
   if (rows.length) {
     stmts.unshift(
       env.DB.prepare(
-        `INSERT INTO binance_tx (transaction_id, order_type, amount, currency, tx_time, payer_id, receiver_id, receiver_account, seen_at)
+        `INSERT INTO binance_tx (transaction_id, order_type, amount, currency, tx_time, payer_id, receiver_id, receiver_account, order_id, seen_at)
          SELECT json_extract(value,'$.t'), json_extract(value,'$.o'), json_extract(value,'$.a'), json_extract(value,'$.c'),
-                json_extract(value,'$.tt'), json_extract(value,'$.p'), json_extract(value,'$.r'), json_extract(value,'$.ra'), ?2
+                json_extract(value,'$.tt'), json_extract(value,'$.p'), json_extract(value,'$.r'), json_extract(value,'$.ra'),
+                json_extract(value,'$.oi'), ?2
            FROM json_each(?1) WHERE json_extract(value,'$.t') IS NOT NULL
          ON CONFLICT(transaction_id) DO UPDATE SET order_type=excluded.order_type, amount=excluded.amount, currency=excluded.currency,
-           tx_time=excluded.tx_time, payer_id=excluded.payer_id, receiver_id=excluded.receiver_id, receiver_account=excluded.receiver_account`
+           tx_time=excluded.tx_time, payer_id=excluded.payer_id, receiver_id=excluded.receiver_id, receiver_account=excluded.receiver_account,
+           order_id=excluded.order_id`
       ).bind(JSON.stringify(rows), at)
     );
   }
@@ -201,8 +292,28 @@ export async function refreshHistory(env) {
   return { ok: true, fresh: true, count: rows.length };
 }
 
+/** By transactionId or by orderId (the Binance app shows the Order ID). transaction_id is the canonical key. */
 export async function lookupTx(env, txid) {
-  return env.DB.prepare("SELECT * FROM binance_tx WHERE transaction_id=?").bind(txid).first();
+  return env.DB.prepare("SELECT * FROM binance_tx WHERE transaction_id=?1 OR order_id=?1 ORDER BY transaction_id=?1 DESC LIMIT 1")
+    .bind(txid)
+    .first();
+}
+
+/**
+ * A claim made with the Order ID (before the transaction was cached) is re-keyed to the canonical transactionId, so the
+ * UNIQUE track_id also covers "same transfer, other ID form". false → another claim already holds the transaction.
+ */
+async function canonicalize(env, pay, tx) {
+  const canon = trackOf(tx.transaction_id);
+  if (pay.track_id === canon) return true;
+  try {
+    const r = await env.DB.prepare("UPDATE payments SET track_id=?, updated_at=? WHERE id=? AND credited=0").bind(canon, nowIso(), pay.id).run();
+    if (r.meta?.changes === 1) pay.track_id = canon;
+    return r.meta?.changes === 1;
+  } catch (err) {
+    if (/UNIQUE/i.test(String(err?.message || err))) return false;
+    throw err;
+  }
 }
 
 async function findTransaction(env, txid) {
@@ -289,6 +400,8 @@ function newPaymentId() {
  *       'rate' (wait / hourly), 'too_many' (open claims), 'new' (row created — verify next).
  */
 export async function openClaim(env, { userId, chatId, txid }) {
+  const cached = await lookupTx(env, txid);
+  if (cached) txid = cached.transaction_id; // Order ID pasted → canonical transactionId
   const track = trackOf(txid);
   const existing = await env.DB.prepare("SELECT * FROM payments WHERE track_id=?").bind(track).first();
   if (existing && Number(existing.telegram_user_id) === Number(userId)) return { kind: "own", payment: existing };
@@ -399,6 +512,11 @@ export async function verifyClaim(env, s, pay, source) {
     if (f.apiError) await env.DB.prepare("UPDATE payments SET last_status=?, updated_at=? WHERE id=? AND credited=0").bind(`api:${f.apiError}`, nowIso(), pay.id).run();
     return { action: "pending", apiError: f.apiError || null, payment: (await getClaim(env, pay.id)) || pay };
   }
+  if (!(await canonicalize(env, pay, f.tx))) {
+    await markClaim(env, pay, "rejected", "duplicate", f.tx, 0);
+    await audit(env, "binance", "binance_claim_conflict", { payment_id: pay.id, txid: f.tx.transaction_id, user_id: pay.telegram_user_id, rekey: true });
+    return { action: "rejected", reason: "duplicate", payment: (await getClaim(env, pay.id)) || pay, tx: f.tx };
+  }
   const ev = evaluateTx(f.tx, bc);
   if (ev.ok) {
     const r = await creditClaim(env, pay, ev.credit, f.tx, { source });
@@ -441,6 +559,7 @@ const REJECT_TEXT = {
   outgoing: "This transaction is not an incoming payment to the shop.",
   type: "This type of Binance Pay transaction can't be used for top-ups.",
   too_small: "The amount is too small to be credited.",
+  duplicate: "This transaction was already submitted from another account.",
 };
 
 export function binanceScreen(s, bc) {
