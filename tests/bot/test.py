@@ -1,17 +1,18 @@
-"""Local integration tests: bot UX + OxaPay security + token API + admin. Run against wrangler dev on :8799."""
+"""Local integration tests: bot UX + OxaPay security + Binance Pay + token API + admin. Run against wrangler dev on :8799
+(and :8798 = same Worker without the Binance secrets)."""
 import json, hmac, hashlib, subprocess, time, urllib.request, urllib.error, concurrent.futures as cf, itertools, re
 BASE = 'http://127.0.0.1:8799'; KEY = b'local_test_merchant_key'; FAKE = 'http://127.0.0.1:9911'
 RESULTS = []; qid = itertools.count(1)
 def check(name, cond, info=''):
     RESULTS.append((name, bool(cond))); print(('PASS' if cond else 'FAIL'), name, '' if cond else str(info)[:600])
-def req(method, path, body=None, headers=None, raw=None):
+def req(method, path, body=None, headers=None, raw=None, base=None):
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
-    r = urllib.request.Request(BASE + path, data=data, method=method, headers={'Content-Type': 'application/json', **(headers or {})})
+    r = urllib.request.Request((base or BASE) + path, data=data, method=method, headers={'Content-Type': 'application/json', **(headers or {})})
     try:
         with urllib.request.urlopen(r) as resp: return resp.status, resp.read().decode(), resp.headers
     except urllib.error.HTTPError as e: return e.code, e.read().decode(), e.headers
-def sql(q):
-    out = subprocess.run(['npx', 'wrangler', 'd1', 'execute', 'liveira-shop', '--local', '--persist-to', '/tmp/lvtest/state', '--json', '--command', q],
+def sql(q, state='/tmp/lvtest/state'):
+    out = subprocess.run(['npx', 'wrangler', 'd1', 'execute', 'liveira-shop', '--local', '--persist-to', state, '--json', '--command', q],
                          cwd='/workspace/liveira-shop-worker', capture_output=True, text=True, env={'PATH': '/usr/bin:/bin:/usr/local/bin', 'HOME': '/home/box'})
     try: return json.loads(out.stdout)[0]['results']
     except Exception: print(out.stdout[-500:], out.stderr[-500:]); raise
@@ -34,7 +35,8 @@ class User:
     def __init__(self, uid, first, username):
         self.uid, self.first, self.username = uid, first, username; self.mid = None
     def frm(self): return {'id': self.uid, 'is_bot': False, 'first_name': self.first, 'username': self.username}
-    def upd(self, obj): return req('POST', '/telegram', obj, {'X-Telegram-Bot-Api-Secret-Token': 'whs_local'})
+    base = None
+    def upd(self, obj): return req('POST', '/telegram', obj, {'X-Telegram-Bot-Api-Secret-Token': 'whs_local'}, base=self.base)
     def msg(self, text, extra=None):
         # Incoming messages take the next id of the chat's shared sequence, like the real API.
         mid = json.loads(urllib.request.urlopen(urllib.request.Request(FAKE + f'/_nextid/{self.uid}', data=b'', method='POST')).read())['mid']
@@ -426,6 +428,193 @@ ev, ans = C.cb('profile', M); scr = last_screen(ev)
 check('tap on the menu after a broadcast → moved below the broadcast (old menu deleted, not edited)',
       len(ans) == 1 and scr['tg'] == 'sendMessage' and deleted(ev, M) and not tg(ev, 'editMessageText'), [e.get('tg') for e in ev])
 C.mid = scr['mid']
+# ───── Binance Pay top-ups (fake Binance on :9911, cache TTL 1 s)
+from datetime import datetime
+def fpost(path, body=None):
+    return urllib.request.urlopen(urllib.request.Request(FAKE + path, data=json.dumps(body).encode() if body is not None else b'', method='POST')).read()
+def now_ms(): return int(time.time() * 1000)
+def bn_tx(txid, amount='12.5', currency='USDT', otype='C2C', pay_id='290455535', payer=70001, ago_s=30):
+    return {'orderType': otype, 'transactionId': txid, 'transactionTime': now_ms() - ago_s * 1000, 'amount': amount, 'currency': currency,
+            'walletType': 1, 'walletTypes': [1], 'fundsDetail': [{'currency': currency, 'amount': amount.lstrip('-')}],
+            'payerInfo': {'name': 'Payer', 'type': 'USER', 'binanceId': payer, 'accountId': payer + 1},
+            'receiverInfo': {'name': 'Liveira', 'type': 'USER', 'binanceId': 39990001, 'accountId': int(pay_id)}}
+def bn_calls(ev): return [x for x in ev if x.get('binance') == 'GET']
+def cron(base=BASE):
+    m = mark(); urllib.request.urlopen(base + '/__scheduled?cron=*+*+*+*+*').read(); time.sleep(0.5); return since(m)
+def bn_card(ev):
+    x = [e for e in ev if e.get('tg') in ('sendMessage', 'editMessageText') and not e.get('error') and 'Transaction ID: <code>' in (e['body'].get('text') or '')]
+    return x[-1] if x else None
+def ctext(c): return c['body']['text'] if c else ''
+PROMPT = '🟡 Paste your Binance Pay transaction ID below:'
+def ask_prompt(u):
+    ev, ans = u.cb('bnp'); pr = [e for e in tg(ev, 'sendMessage') if (e['body'].get('reply_markup') or {}).get('force_reply')]
+    u.prompt_mid = pr[0]['mid'] if pr else 0
+    return ev, ans, pr
+def prompt_reply(u, text):
+    return u.msg(None, {'text': text, 'reply_to_message': {'message_id': u.prompt_mid, 'from': {'id': 1, 'is_bot': True, 'first_name': 'Liveira'},
+                                                         'chat': {'id': u.uid, 'type': 'private'}, 'date': int(time.time()), 'text': PROMPT}})
+def claim(txid): r = sql(f"SELECT * FROM payments WHERE track_id='binance:{txid}'"); return r[0] if r else None
+def admin_msgs(ev): return [e for e in tg(ev, 'sendMessage') if e['body']['chat_id'] == 1]
+def iso_ms(s): return int(datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp() * 1000)
+TX = {k: '3812345678901230%02d' % i for i, k in enumerate(['ok', 'late', 'btc', 'out', 'big', 'race', 'err', 'foreign', 'box'], 1)}
+
+fpost('/_bn/tx', bn_tx(TX['ok'], '12.5'))
+D = User(555020, 'Diego', 'diego')
+ev = D.msg('/start'); D.mid = last_screen(ev)['mid']
+ev, _, scr = nav(D, 'topup', 'top-up menu offers 🟡 Binance Pay', ['💰 <b>Top up balance</b>', '<b>Binance Pay</b>'], ['bn', 'kp:', 'tuc:5'])
+brow = [r for r in scr['body']['reply_markup']['inline_keyboard'] if any(b.get('callback_data') == 'bn' for b in r)]
+check('🟡 Binance Pay button next to ✏️ Other amount (OxaPay)', brow and [b['text'] for b in brow[0]] == ['✏️ Other amount', '🟡 Binance Pay'], brow)
+ev, _, scr = nav(D, 'bn', 'Binance Pay screen', ['🟡 <b>Binance Pay</b>', 'Send any amount of <b>USDT</b> via Binance Pay to this Pay ID, then paste the transaction ID here.', 'Pay ID: <code>290455535</code>'], ['bnp', 'topup'])
+check('Binance screen: 📋 Copy Pay ID (copy_text 290455535)', any(b.get('copy_text', {}).get('text') == '290455535' for b in buttons(scr)))
+ev, ans, pr = ask_prompt(D)
+check('✏️ Enter transaction ID → ForceReply prompt (placeholder), answered once', len(ans) == 1 and pr and pr[0]['body']['text'] == PROMPT and pr[0]['body']['reply_markup'].get('input_field_placeholder') == 'Transaction ID', [e.get('tg') for e in ev])
+b0 = D.bal(); time.sleep(1.1)
+ev = prompt_reply(D, TX['ok']); card = bn_card(ev); calls = bn_calls(ev)
+check('reply with a real transaction ID → ✅ credited with the amount received (12.5 USDT → $12.50)',
+      '✅ <b>Binance Pay top-up received!</b>' in ctext(card) and '+<b>$12.50</b>' in ctext(card) and '(12.5 USDT)' in ctext(card) and 'New balance: <b>$12.50</b>' in ctext(card), ctext(card))
+check('balance +12.50', abs(D.bal() - (b0 + 12.5)) < 1e-9, D.bal())
+check('Binance request signed: X-MBX-APIKEY, HMAC-SHA256 hex (64) as last param, timestamp+recvWindow, startTime/endTime/limit=100',
+      len(calls) == 1 and all(c['sig_ok'] and c['key_ok'] and c['sig_last'] and c['ts_ok'] and re.fullmatch(r'[0-9a-f]{64}', c['sig'])
+                              and {'timestamp', 'recvWindow', 'startTime', 'endTime', 'limit'} <= set(c['params']) and c['params']['limit'] == '100' for c in calls), calls)
+check('ForceReply prompt deleted after the reply', [e for e in tg(ev, 'deleteMessage') if e['body']['message_id'] == D.prompt_mid and not e.get('error')])
+c = claim(TX['ok'])
+check("payments: provider=binance, track_id=binance:<txid>, paid, credited, amount 12.5, payer Binance id stored",
+      c and c['provider'] == 'binance' and c['status'] == 'paid' and c['credited'] == 1 and abs(c['amount_usd'] - 12.5) < 1e-9 and json.loads(c['last_payload'])['payer_binance_id'] == '70001', c)
+check('payments.message_id = claim card', c and card and c['message_id'] == card['mid'])
+tp = sql(f"SELECT * FROM topups WHERE ref='{c['id']}'")
+check("topups: one row method='binance' +12.5", len(tp) == 1 and tp[0]['method'] == 'binance' and abs(tp[0]['amount'] - 12.5) < 1e-9, tp)
+au = sql("SELECT details_json FROM audit_log WHERE action='binance_credit'")
+check('audit_log binance_credit with txid + payer', au and json.loads(au[-1]['details_json'])['txid'] == TX['ok'] and json.loads(au[-1]['details_json'])['payer_binance_id'] == '70001', au)
+an = admin_msgs(ev)
+check('admin notice (ADMIN_IDS) with user, amount and txid', an and '@diego' in an[-1]['body']['text'] and '+$12.50' in an[-1]['body']['text'] and TX['ok'] in an[-1]['body']['text'], an)
+s_ = last_screen(D.msg('/profile')); check('profile lists "Binance Pay top-up"', s_ and 'Binance Pay top-up' in s_['body']['text'] and '+$12.50' in s_['body']['text'], s_ and s_['body']['text'])
+
+time.sleep(1.1)
+ev = D.msg(TX['ok']); card = bn_card(ev)
+check('same user pastes the same ID again (plain digits) → shows it was credited, no double credit, no Binance request',
+      'Binance Pay top-up received' in ctext(card) and abs(D.bal() - (b0 + 12.5)) < 1e-9 and not bn_calls(ev), ctext(card))
+E = User(555021, 'Eva', 'eva'); E.msg('/start')
+ev = E.msg(f"/binance {TX['ok']}"); s_ = last_screen(ev)
+check('another user claims the same ID (/binance <id>) → refused, no credit', s_ and 'already submitted from another account' in s_['body']['text'] and not E.bal(), s_ and s_['body']['text'])
+check('transaction credited exactly once overall', len(sql(f"SELECT id FROM topups WHERE method='binance'")) == 1 and sql("SELECT COUNT(*) AS n FROM payments WHERE track_id='binance:%s'" % TX['ok'])[0]['n'] == 1)
+
+# not found yet → pending → found later by the cron
+F = User(555022, 'Fabio', 'fabio'); ev = F.msg('/start'); F.mid = last_screen(ev)['mid']
+time.sleep(1.1)
+ev = F.msg(f"/binance {TX['late']}"); card = bn_card(ev)
+check('ID not in the history yet → pending card (may take a minute) + 🔄 Check again, no credit',
+      'Not found yet' in ctext(card) and 'take a minute' in ctext(card) and any(x and x.startswith('bnchk:') for x in cbdata(card)) and not F.bal() and bn_calls(ev), ctext(card))
+c = claim(TX['late'])
+check('claim stored pending with a 30-min window', c and c['status'] == 'pending' and c['credited'] == 0 and 29 * 60000 < iso_ms(c['expires_at']) - iso_ms(c['created_at']) <= 30 * 60000, c)
+F.mid = card['mid'] if card else F.mid
+ev, ans = F.cb(f"bnchk:{c['id']}")
+check('🔄 Check again right away → rate-limit toast (1 check / 20 s), no Binance request, card kept', len(ans) == 1 and 'wait' in (ans[0]['body'].get('text') or '').lower() and not bn_calls(ev) and not tg(ev, 'sendMessage'), ans)
+fpost('/_bn/tx', bn_tx(TX['late'], '7'))
+time.sleep(1.1)
+ev = cron()
+ed = [e for e in tg(ev, 'editMessageText') if card and e['body']['message_id'] == card['mid'] and not e.get('error')]
+nt = [e for e in tg(ev, 'sendMessage') if e['body']['chat_id'] == F.uid]
+check('cron (every minute) finds it later → card edited to ✅, user told "+$7.00 added"',
+      ed and 'Binance Pay top-up received' in ed[-1]['body']['text'] and nt and nt[-1]['body']['text'].startswith('✅ Binance Pay top-up confirmed, +$7.00 added. New balance: $7.00'), ([e['body'].get('text') for e in ed], [e['body'].get('text') for e in nt]))
+check('balance $7.00 after the cron', abs(F.bal() - 7) < 1e-9, F.bal())
+ev = cron(); check('cron with nothing pending → no Binance request', not bn_calls(ev), bn_calls(ev))
+
+# rules: wrong currency, outgoing, unsupported type, receiver mismatch, above max
+for key, amt, cur, otype, payid in [('btc', '0.001', 'BTC', 'C2C', '290455535'), ('out', '-5', 'USDT', 'C2C', '290455535'), ('box', '3', 'USDT', 'CRYPTO_BOX', '290455535')]:
+    fpost('/_bn/tx', bn_tx(TX[key], amt, cur, otype, payid))
+for i, (key, want) in enumerate([('btc', 'This transfer was made in <b>BTC</b>. Only <b>USDT</b> can be credited'), ('out', 'not an incoming payment'), ('box', "can't be used for top-ups")]):
+    u = User(555023 + i, 'U%d' % i, 'u%d' % i); u.msg('/start'); time.sleep(1.1)
+    ev = u.msg(TX[key]); card = bn_card(ev); c = claim(TX[key])
+    check(f'{key} transaction → ❌ not credited ({want[:30]}…), status rejected, balance 0', '❌ <b>Binance Pay · not credited</b>' in ctext(card) and want in ctext(card) and c and c['status'] == 'rejected' and not u.bal(), ctext(card))
+fpost('/_bn/tx', bn_tx(TX['big'], '1500'))
+I = User(555030, 'Ines', 'ines'); I.msg('/start'); time.sleep(1.1)
+ev = I.msg(TX['big']); card = bn_card(ev); c = claim(TX['big'])
+check('1500 USDT > max $1000 → 🟠 under review, not credited, admin notified', 'under review' in ctext(card) and '1500 USDT' in ctext(card) and c['status'] == 'review' and not I.bal()
+      and any('needs review' in x['body']['text'] and TX['big'] in x['body']['text'] for x in admin_msgs(ev)), ctext(card))
+m = mark(); s_, body, _ = req('POST', f"/admin/api/payments/{c['id']}/approve", None, AH); ev = since(m)
+check('admin "Aprovar e creditar" → credits 1500, user notified', s_ == 200 and abs(I.bal() - 1500) < 1e-9 and any('+$1500.00 added' in e['body']['text'] for e in tg(ev, 'sendMessage') if e['body']['chat_id'] == I.uid), (s_, body[:200]))
+s_, body, _ = req('POST', f"/admin/api/payments/{c['id']}/approve", None, AH); check('second approve → 409, no double credit', s_ == 409 and abs(I.bal() - 1500) < 1e-9, (s_, body))
+fpost('/_bn/tx', bn_tx(TX['foreign'], '3', pay_id='123456789'))
+U = User(555031, 'Ugo', 'ugo'); U.msg('/start'); time.sleep(1.1)
+ev = U.msg(TX['foreign']); c = claim(TX['foreign'])
+check('receiver ≠ configured Pay ID → review (not auto-credited)', c and c['status'] == 'review' and c['last_status'] == 'receiver' and not U.bal(), c)
+
+# race: two accounts paste the same new ID at the same time
+fpost('/_bn/tx', bn_tx(TX['race'], '4'))
+J, K = User(555032, 'Joao', 'joao'), User(555033, 'Kati', 'kati'); J.msg('/start'); K.msg('/start'); time.sleep(1.1)
+with cf.ThreadPoolExecutor(2) as ex: list(ex.map(lambda u: u.msg(TX['race']), [J, K]))
+bals = sorted([J.bal() or 0, K.bal() or 0])
+check('same new ID pasted concurrently by two accounts → one claim, credited once', bals == [0, 4] and sql(f"SELECT COUNT(*) AS n FROM payments WHERE track_id='binance:{TX['race']}'")[0]['n'] == 1
+      and len(sql(f"SELECT t.id FROM topups t JOIN payments p ON p.id=t.ref WHERE p.track_id='binance:{TX['race']}'")) == 1, bals)
+
+# invalid ID, hourly limit
+N = User(555034, 'Nina', 'nina'); N.msg('/start'); ask_prompt(N)
+ev = prompt_reply(N, 'hello world!'); s_ = last_screen(ev)
+check('reply that is not a transaction ID → friendly "doesn\'t look like" screen, nothing stored', s_ and "doesn't look like a Binance Pay transaction ID" in s_['body']['text'] and not bn_calls(ev))
+L = User(555035, 'Lia', 'lia'); L.msg('/start'); t0 = now_ms()
+sql("INSERT INTO binance_checks (user_id, at) VALUES " + ",".join(f"({L.uid},{t0 - 60000 * (i + 1)})" for i in range(10)))
+ev = L.msg('/binance 381234567890123099'); s_ = last_screen(ev)
+check('11th check within an hour → "Too many checks", no claim, no Binance request', s_ and 'Too many checks' in s_['body']['text'] and not bn_calls(ev) and not claim('381234567890123099'), s_ and s_['body']['text'])
+
+# Binance errors: 451 (restricted region), 429 + Retry-After, 5xx → backoff, claim stays pending, retried later
+fpost('/_bn/mode/451'); fpost('/_bn/tx', bn_tx(TX['err'], '2'))
+Mm = User(555036, 'Mara', 'mara'); Mm.msg('/start'); time.sleep(1.1)
+ev = Mm.msg(TX['err']); card = bn_card(ev)
+check('Binance 451 → claim pending with "not reachable" note, no credit', 'Not found yet' in ctext(card) and 'not reachable' in ctext(card) and not Mm.bal() and [x for x in bn_calls(ev) if x['mode'] == 451], ctext(card))
+s_, body, _ = req('GET', '/admin/api/binance/status', None, AH); st = json.loads(body)
+check('451 → last_error region, backoff ~10 min (panel status)', st['last_error'] == 'region' and st['backoff_until'] and iso_ms(st['backoff_until']) - now_ms() > 8 * 60000, st)
+ev = cron(); check('during backoff → cron makes no Binance request', not bn_calls(ev))
+sql("DELETE FROM binance_state"); fpost('/_bn/mode/429/7')
+s_, body, _ = req('POST', '/admin/api/binance/test', None, AH); d = json.loads(body)
+check('429 with Retry-After: 7 → reason rate, backoff ≈ 7 s', d['ok'] is False and d['reason'] == 'rate' and 0 < iso_ms(d['status']['backoff_until']) - now_ms() <= 7000, d)
+sql("DELETE FROM binance_state"); fpost('/_bn/mode/503')
+s_, body, _ = req('POST', '/admin/api/binance/test', None, AH); d = json.loads(body)
+check('503 → reason unavailable, short backoff (≤ 30 s)', d['ok'] is False and d['reason'] == 'unavailable' and 0 < iso_ms(d['status']['backoff_until']) - now_ms() <= 30000, d)
+sql("DELETE FROM binance_state"); fpost('/_bn/mode/200')
+ev = cron()
+check('Binance back → cron credits the pending claim ($2.00) and tells the user', abs(Mm.bal() - 2) < 1e-9 and any(e['body']['text'].startswith('✅ Binance Pay top-up confirmed, +$2.00') for e in tg(ev, 'sendMessage') if e['body']['chat_id'] == Mm.uid), Mm.bal())
+time.sleep(1.1)
+with cf.ThreadPoolExecutor(4) as ex: rs = list(ex.map(lambda _: req('POST', '/admin/api/binance/test', None, AH), range(4)))
+check('concurrent refreshes → at most one Binance request per cache TTL', sum(1 for r in rs if json.loads(r[1]).get('fresh')) == 1, [json.loads(r[1]).get('fresh') for r in rs])
+
+# admin settings + panel
+for bad in [{'binance_pay_id': '12ab'}, {'binance_max': '0'}, {'binance_currencies': 'US$'}]:
+    s_, body, _ = req('PUT', '/admin/api/settings', bad, AH); check(f'settings invalid {bad} → 400', s_ == 400, (s_, body))
+s_, body, _ = req('PUT', '/admin/api/settings', {'binance_currencies': ' usdt, usdc '}, AH)
+check('binance_currencies normalized → USDT,USDC', s_ == 200 and sql("SELECT value FROM settings WHERE key='binance_currencies'")[0]['value'] == 'USDT,USDC', body)
+req('PUT', '/admin/api/settings', {'binance_currencies': 'USDT'}, AH)
+s_, body, _ = req('GET', '/admin/api/settings', None, AH); d = json.loads(body)
+check('settings API: Binance keys editable, secrets reported only as configured=true', d['settings']['binance_pay_id'] == '290455535' and d['settings']['binance_enabled'] == '1' and d['settings']['binance_max'] == '1000' and d['info']['binance_configured'] is True and 'bn_test' not in body, d['settings'])
+s_, body, _ = req('PUT', '/admin/api/settings', {'binance_enabled': '0'}, AH)
+s_ = last_screen(D.msg('/topup')); check('binance_enabled=0 → no 🟡 Binance Pay in top-up', s_ and 'bn' not in cbdata(s_) and 'Binance' not in s_['body']['text'])
+s_ = last_screen(D.msg('/binance')); check('binance_enabled=0 → /binance says unavailable', s_ and 'currently unavailable' in s_['body']['text'])
+req('PUT', '/admin/api/settings', {'binance_enabled': '1'}, AH)
+s_, body, _ = req('GET', '/admin/api/payments?q=' + TX['ok'], None, AH); d = json.loads(body)
+check('admin payments: search by Binance ID, provider shown', s_ == 200 and d['total'] == 1 and d['payments'][0]['provider'] == 'binance', body[:300])
+s_, body, _ = req('GET', '/admin/api/payments?status=review', None, AH); check('admin payments filter "review"', s_ == 200 and json.loads(body)['total'] >= 1)
+s_, body, _ = req('GET', '/admin/app.js', None); check('admin app.js: Binance Pay settings card + approve button', 'Recarga via Binance Pay' in body and 'Aprovar e creditar' in body and 'cripto' not in body.lower())
+
+# second Worker instance WITHOUT BINANCE_API_KEY / BINANCE_API_SECRET → option hidden, nothing happens
+BASE2 = 'http://127.0.0.1:8798'
+class User2(User):
+    base = BASE2
+    def bal(self):
+        r = sql(f'SELECT balance FROM users WHERE user_id={self.uid}', state='/tmp/lvtest/state2'); return r[0]['balance'] if r else None
+P = User2(555040, 'Pia', 'pia')
+ev = P.msg('/start'); P.mid = last_screen(ev)['mid'] if last_screen(ev) else None
+ev, _, scr = nav(P, 'topup', 'no Binance secrets: top-up menu', ['💰 <b>Top up balance</b>'], ['kp:'])
+check('no Binance secrets → no 🟡 Binance Pay button or text', 'bn' not in cbdata(scr) and 'Binance' not in scr['body']['text'], scr['body']['text'])
+ev = P.msg(f"/binance {TX['ok']}"); s_ = last_screen(ev)
+check('no Binance secrets → /binance <id> "currently unavailable", no Binance request', s_ and 'Binance Pay top-ups are currently unavailable' in s_['body']['text'] and not bn_calls(ev), s_ and s_['body']['text'])
+ev = P.msg(TX['ok']); s_ = last_screen(ev)
+check('no Binance secrets → a pasted long number is not a claim (home card)', s_ and s_['body']['text'].startswith('👋 Hi') and not bn_calls(ev))
+check('no Binance secrets → no binance rows stored', not sql("SELECT id FROM payments WHERE provider='binance'", state='/tmp/lvtest/state2'))
+ev = cron(BASE2); check('no Binance secrets → cron does nothing', not bn_calls(ev))
+s_, body, h = req('POST', '/admin/api/login', {'password': 'pw_local'}, {'X-Requested-With': 'liveira-admin'}, base=BASE2)
+AH2 = {'Cookie': h.get('Set-Cookie').split(';')[0], 'X-Requested-With': 'liveira-admin'}
+s_, body, _ = req('GET', '/admin/api/settings', None, AH2, base=BASE2); check('panel (no secrets): binance_configured=false', json.loads(body)['info']['binance_configured'] is False)
+s_, body, _ = req('POST', '/admin/api/binance/test', None, AH2, base=BASE2); check('panel (no secrets): test → unconfigured, no request', json.loads(body)['reason'] == 'unconfigured')
+
 ans_all = [e for e in logs() if e.get('tg') == 'answerCallbackQuery']
 ids = [e['body']['callback_query_id'] for e in ans_all]
 check('every callback query answered exactly once (whole run)', len(ids) == len(set(ids)) and len(ids) == next(qid) - 1, (len(ids), len(set(ids))))

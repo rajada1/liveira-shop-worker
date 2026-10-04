@@ -22,6 +22,7 @@ import {
 } from "./util.js";
 import { topupConfig, syncPayment, expireStale, callbackUrl, round2, oxapayAcceptedCoins } from "./oxapay.js";
 import { noteMessages } from "./chatnav.js";
+import { binanceConfigured, binanceStatus, refreshHistory, verifyClaim, approveClaim, notifyClaim } from "./binance.js";
 
 const COOKIE = "__Host-lv_admin";
 const SESSION_TTL = 12 * 3600; // seconds
@@ -376,6 +377,11 @@ async function route(ctx, method, api) {
   // Crypto payments (OxaPay)
   if (api === "/payments" && method === "GET") return listPayments(ctx);
   if ((m = api.match(/^\/payments\/([A-Za-z0-9_-]{1,64})\/sync$/)) && method === "POST") return syncPaymentApi(ctx, m[1]);
+  if ((m = api.match(/^\/payments\/([A-Za-z0-9_-]{1,64})\/approve$/)) && method === "POST") return approveBinanceApi(ctx, m[1]);
+
+  // Binance Pay (status / connection test; secrets are never returned)
+  if (api === "/binance/status" && method === "GET") return aj(await binanceStatus(env, ctx.settings));
+  if (api === "/binance/test" && method === "POST") return binanceTest(ctx);
 
   // Tokens
   if (api === "/tokens" && method === "GET") return listTokens(ctx);
@@ -727,7 +733,7 @@ async function listOrders({ env, url }) {
 
 /* ─── crypto payments (OxaPay) ─── */
 
-const PAYMENT_STATUSES = ["creating", "pending", "paying", "paid", "underpaid", "expired", "canceled", "refunding", "refunded", "error"];
+const PAYMENT_STATUSES = ["creating", "pending", "paying", "paid", "underpaid", "expired", "canceled", "refunding", "refunded", "error", "review", "rejected"];
 
 async function listPayments({ env, url }) {
   await expireStale(env);
@@ -743,14 +749,14 @@ async function listPayments({ env, url }) {
   let q = (url.searchParams.get("q") || "").trim().slice(0, 64);
   if (q) {
     if (/^\d+$/.test(q)) {
-      conds.push("(p.telegram_user_id = ? OR p.track_id = ?)");
-      binds.push(Number(q), q);
+      conds.push("(p.telegram_user_id = ? OR p.track_id = ? OR p.track_id = ?)");
+      binds.push(Number(q), q, `binance:${q}`);
     } else if (q.startsWith("@")) {
       conds.push("lower(u.username) = lower(?)");
       binds.push(q.slice(1));
     } else {
-      conds.push("(p.id = ? OR p.track_id = ? OR lower(COALESCE(u.username,'')) = lower(?))");
-      binds.push(q, q, q);
+      conds.push("(p.id = ? OR p.track_id = ? OR p.track_id = ? OR lower(COALESCE(u.username,'')) = lower(?))");
+      binds.push(q, q, `binance:${q}`, q);
     }
   }
   const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
@@ -761,7 +767,7 @@ async function listPayments({ env, url }) {
     .bind(...binds)
     .first();
   const { results } = await env.DB.prepare(
-    `SELECT p.id, p.telegram_user_id, u.username, p.amount_usd, p.track_id, p.status, p.last_status, p.pay_link,
+    `SELECT p.id, p.provider, p.telegram_user_id, u.username, p.amount_usd, p.track_id, p.status, p.last_status, p.pay_link,
             p.created_at, p.updated_at, p.expires_at, p.paid_at, p.credited ${base}
       ORDER BY p.created_at DESC LIMIT ${limit} OFFSET ${offset}`
   )
@@ -770,14 +776,54 @@ async function listPayments({ env, url }) {
   return aj({ payments: results || [], total: agg?.n || 0, credited_sum: agg?.credited_sum || 0, page, page_size: limit });
 }
 
-async function syncPaymentApi({ env, actor }, id) {
+async function syncPaymentApi({ env, actor, settings }, id) {
   const pay = await env.DB.prepare("SELECT * FROM payments WHERE id=?").bind(id).first();
   if (!pay) throw new HttpError(404, "Pagamento não encontrado");
+  if (pay.provider === "binance") {
+    if (!binanceConfigured(env)) throw new HttpError(503, "BINANCE_API_KEY / BINANCE_API_SECRET não configuradas");
+    let p = pay;
+    if (!p.credited && ["expired", "canceled"].includes(p.status)) {
+      await env.DB.prepare("UPDATE payments SET status='pending', updated_at=? WHERE id=? AND credited=0 AND status IN ('expired','canceled')").bind(nowIso(), id).run();
+      p = await env.DB.prepare("SELECT * FROM payments WHERE id=?").bind(id).first();
+    }
+    const r = await verifyClaim(env, settings, p, "panel_sync");
+    if (["credited", "rejected", "review"].includes(r.action)) await notifyClaim(env, settings, r.payment, r);
+    await audit(env, actor, "payment_sync", { payment_id: id, track_id: pay.track_id, result: r.action, api_error: r.apiError || null });
+    const upd = await env.DB.prepare("SELECT * FROM payments WHERE id=?").bind(id).first();
+    return aj({ ok: true, result: r.action, remote_status: r.apiError ? `erro Binance: ${r.apiError}` : r.reason || r.action, payment: upd });
+  }
   if (!env.OXAPAY_MERCHANT_KEY) throw new HttpError(503, "OXAPAY_MERCHANT_KEY não configurada");
   const r = await syncPayment(env, pay, "panel_sync");
   await audit(env, actor, "payment_sync", { payment_id: id, track_id: pay.track_id, result: r.action, remote_status: r.remoteStatus || null });
   const upd = await env.DB.prepare("SELECT * FROM payments WHERE id=?").bind(id).first();
   return aj({ ok: true, result: r.action, remote_status: r.remoteStatus || null, payment: upd });
+}
+
+const APPROVE_ERRORS = {
+  not_binance: "Só pagamentos Binance Pay podem ser aprovados aqui",
+  already: "Já creditado",
+  not_review: "Este pagamento não está em revisão",
+  tx_missing: "Transação não está no cache — clique em Sincronizar primeiro",
+  outgoing: "A transação não é uma entrada",
+  currency: "Moeda não aceita",
+  type: "Tipo de transação não aceito",
+  too_small: "Valor pequeno demais",
+};
+
+async function approveBinanceApi({ env, actor, settings }, id) {
+  const pay = await env.DB.prepare("SELECT * FROM payments WHERE id=?").bind(id).first();
+  if (!pay) throw new HttpError(404, "Pagamento não encontrado");
+  const r = await approveClaim(env, settings, pay, actor);
+  if (!r.ok) throw new HttpError(409, APPROVE_ERRORS[r.error] || r.error);
+  await notifyClaim(env, settings, r.payment, { action: "credited", newBalance: r.newBalance });
+  return aj({ ok: true, amount: r.amount, new_balance: r.newBalance, payment: r.payment });
+}
+
+async function binanceTest({ env, actor, settings }) {
+  if (!binanceConfigured(env)) return aj({ ok: false, reason: "unconfigured", status: await binanceStatus(env, settings) });
+  const r = await refreshHistory(env);
+  await audit(env, actor, "binance_test", { result: r.ok ? (r.fresh ? "fetched" : "cached") : r.reason });
+  return aj({ ok: r.ok, reason: r.reason || null, fresh: !!r.fresh, count: r.count ?? null, status: await binanceStatus(env, settings) });
 }
 
 /* ─── tokens ─── */
@@ -904,6 +950,7 @@ function publicInfo(ctx) {
     webhook_secret_configured: !!ctx.env.WEBHOOK_SECRET,
     oxapay_configured: !!ctx.env.OXAPAY_MERCHANT_KEY,
     oxapay_callback_url: callbackUrl(ctx.env),
+    binance_configured: binanceConfigured(ctx.env),
   };
 }
 
@@ -954,7 +1001,20 @@ async function putSettings({ request, env, settings, actor }) {
       if (!list.length) throw new HttpError(400, "Moedas aceitas: informe pelo menos uma moeda (ex.: USDT)");
       if (list.length > 12) throw new HttpError(400, "Moedas aceitas: máximo de 12 moedas");
       v = list.join(",");
-    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled") {
+    } else if (k === "binance_currencies") {
+      const raw = String(b[k]).trim();
+      const bad = raw.toUpperCase().split(/[\s,;/|]+/).filter((x) => x && !/^[A-Z0-9]{2,10}$/.test(x));
+      if (bad.length) throw new HttpError(400, `Moedas Binance: símbolo inválido "${bad[0].slice(0, 20)}"`);
+      const list = parseCoinList(raw);
+      if (!list.length) throw new HttpError(400, "Moedas Binance: informe pelo menos uma moeda (ex.: USDT)");
+      if (list.length > 6) throw new HttpError(400, "Moedas Binance: máximo de 6 moedas");
+      v = list.join(",");
+    } else if (k === "binance_pay_id") {
+      v = String(b[k]).trim();
+      if (v && !/^\d{4,20}$/.test(v)) throw new HttpError(400, "Pay ID da Binance: use apenas números (4 a 20 dígitos)");
+    } else if (k === "binance_max") {
+      v = String(round2(num(String(b[k]).replace(",", "."), "Limite por transação Binance", { min: 1, max: 100000 })));
+    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled" || k === "binance_enabled") {
       v = b[k] === true || b[k] === "1" || b[k] === 1 ? "1" : "0";
     } else {
       v = String(b[k]).replace(/\r\n/g, "\n");

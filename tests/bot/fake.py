@@ -1,8 +1,8 @@
-"""Fake OxaPay + fake Telegram Bot API (port 9911) with Bot API validation.
+"""Fake OxaPay + fake Binance Pay history API + fake Telegram Bot API (port 9911) with Bot API validation.
 Telegram: stores messages per chat, returns real-looking message ids, and answers
 'message is not modified' / 'message to edit not found' like the real API.
 Every request is logged to /tmp/lvtest/fake.log; spec violations go to 'violation' entries."""
-import json, time, itertools, re, threading
+import json, time, itertools, re, threading, hmac, hashlib, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LOG = open('/tmp/lvtest/fake.log', 'a'); LOCK = threading.Lock()
 tid_counter = itertools.count(1000); mid_counter = itertools.count(100)
@@ -10,6 +10,9 @@ INVOICES, STATUS, MSGS = {}, {}, {}
 FAIL_DELETE = set()  # (chat, mid) whose deleteMessage fails like a >48h-old message
 SLOW_SEND = {}  # chat -> seconds to wait before answering sendMessage
 ACCEPTED = ['USDT']
+# Binance: GET /sapi/v1/pay/transactions (USER_DATA, HMAC-SHA256 over the query string, header X-MBX-APIKEY)
+BN_KEY, BN_SECRET = 'bn_test_key', b'bn_test_secret'
+BN_TXS = []; BN_MODE = {'status': 200, 'retry_after': None}
 ALLOWED_TAGS = {'b','strong','i','em','u','ins','s','strike','del','span','tg-spoiler','a','tg-emoji','tg-time','code','pre','blockquote'}
 BTN_ACTIONS = {'url','callback_data','web_app','login_url','switch_inline_query','switch_inline_query_current_chat','switch_inline_query_chosen_chat','copy_text','callback_game','pay','disabled'}
 
@@ -71,7 +74,30 @@ class H(BaseHTTPRequestHandler):
     def _send(self, obj, code=200):
         b = json.dumps(obj).encode(); self.send_response(code)
         self.send_header('Content-Type', 'application/json'); self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
+    def binance(self):
+        qs = self.path.split('?', 1)[1] if '?' in self.path else ''
+        payload, _, sig = qs.rpartition('&signature=')
+        params = dict(urllib.parse.parse_qsl(payload))
+        want = hmac.new(BN_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+        ts = int(params.get('timestamp', '0') or 0)
+        entry = {'binance': 'GET', 'params': params, 'sig': sig, 'sig_ok': bool(payload) and hmac.compare_digest(want, sig),
+                 'sig_last': qs.rfind('signature=') > qs.rfind('timestamp='), 'key_ok': self.headers.get('X-MBX-APIKEY') == BN_KEY,
+                 'ts_ok': abs(ts - time.time() * 1000) < 60000, 'mode': BN_MODE['status']}
+        log(entry)
+        st = BN_MODE['status']
+        if st != 200:
+            body = json.dumps({'code': -1003 if st in (418, 429) else 0, 'msg': 'fake error %d' % st}).encode()
+            self.send_response(st); self.send_header('Content-Type', 'application/json')
+            if BN_MODE.get('retry_after'): self.send_header('Retry-After', str(BN_MODE['retry_after']))
+            self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body); return
+        if not entry['key_ok']: return self._send({'code': -2015, 'msg': 'Invalid API-key, IP, or permissions for action.'}, 401)
+        if not entry['sig_ok']: return self._send({'code': -1022, 'msg': 'Signature for this request is not valid.'}, 400)
+        if not entry['ts_ok']: return self._send({'code': -1021, 'msg': 'Timestamp for this request is outside of the recvWindow.'}, 400)
+        lo, hi = int(params.get('startTime', 0)), int(params.get('endTime', 10**15)); lim = min(int(params.get('limit', 100)), 100)
+        data = sorted([t for t in BN_TXS if lo <= t['transactionTime'] <= hi], key=lambda t: -t['transactionTime'])[:lim]
+        return self._send({'code': '000000', 'message': 'success', 'data': data, 'success': True})
     def do_GET(self):
+        if self.path.startswith('/sapi/v1/pay/transactions'): return self.binance()
         if self.path == '/v1/payment/accepted-currencies':
             log({'oxapay': 'accepted', 'key': self.headers.get('merchant_api_key')})
             return self._send({'data': {'list': ACCEPTED}, 'message': 'Operation completed successfully!', 'error': {}, 'status': 200, 'version': '1.0.0'})
@@ -110,6 +136,11 @@ class H(BaseHTTPRequestHandler):
             _, _, chat, mid = self.path.split('/'); FAIL_DELETE.add((chat, int(mid))); return self._send({'ok': True})
         if self.path.startswith('/_accepted/'):
             ACCEPTED[:] = [x for x in self.path.split('/')[2].split(',') if x]; return self._send({'ok': True})
+        if self.path == '/_bn/tx':
+            BN_TXS.append(json.loads(body)); return self._send({'ok': True})
+        if self.path.startswith('/_bn/mode/'):
+            parts = self.path.split('/'); BN_MODE['status'] = int(parts[3]); BN_MODE['retry_after'] = int(parts[4]) if len(parts) > 4 else None
+            return self._send({'ok': True})
         if self.path.startswith('/_status/'):
             _, _, tid, st = self.path.split('/'); STATUS[tid] = st; return self._send({'ok': True})
         if self.path.startswith('/bot'):

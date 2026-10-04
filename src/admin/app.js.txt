@@ -473,12 +473,13 @@
     });
   };
 
-  /* ───────── Pagamentos (OxaPay) ───────── */
+  /* ───────── Pagamentos (OxaPay · Binance Pay) ───────── */
   var PAY_STATUS = {
     creating: ["", "criando"], pending: ["", "aguardando"], paying: ["warn", "pagando"], paid: ["ok", "pago"],
     underpaid: ["warn", "pago a menor"], expired: ["", "expirado"], canceled: ["", "cancelado"], refunding: ["warn", "reembolsando"],
-    refunded: ["bad", "reembolsado"], error: ["bad", "erro"],
+    refunded: ["bad", "reembolsado"], error: ["bad", "erro"], review: ["warn", "em revisão"], rejected: ["bad", "recusado"],
   };
+  var BN_REASON = { outgoing: "não é entrada", currency: "moeda não aceita", type: "tipo não aceito", too_small: "valor pequeno", over_max: "acima do limite", receiver: "destinatário diferente do Pay ID", submitted: "aguardando", credited: "creditado" };
   function payBadge(st) { var m = PAY_STATUS[st] || ["", st]; return el("span", { class: "badge " + m[0] }, m[1]); }
   var pState = { q: "", status: "", page: 1 };
   VIEWS.pagamentos = function (main) {
@@ -493,31 +494,42 @@
       form.addEventListener("submit", function (e) { e.preventDefault(); pState = { q: q.value.trim(), status: st.value, page: 1 }; router(); });
       var rows = d.payments.map(function (p) {
         var acts = el("div", { class: "row" });
+        var bn = p.provider === "binance";
+        if (bn && !p.credited && p.status === "review") {
+          acts.appendChild(el("button", { class: "btn s p", title: "Creditar o valor recebido na Binance", onclick: function (ev) {
+            var b = ev.currentTarget;
+            confirmDlg("Aprovar e creditar o valor recebido para " + userLabel(p.telegram_user_id, p.username) + "? O cliente será avisado no bot.").then(function (ok) {
+              if (!ok) return; b.disabled = true;
+              api("POST", "/payments/" + encodeURIComponent(p.id) + "/approve").then(function (r) { toast("Creditado " + money(r.amount), "ok"); router(); },
+                function (e2) { b.disabled = false; toast(e2.message, "bad"); });
+            });
+          } }, "Aprovar e creditar"));
+        }
         if (p.track_id && !p.credited && ["pending", "paying", "expired", "underpaid", "canceled"].indexOf(p.status) >= 0) {
-          acts.appendChild(el("button", { class: "btn s", title: "Consultar status na OxaPay", onclick: function (ev) {
+          acts.appendChild(el("button", { class: "btn s", title: bn ? "Procurar a transação no histórico do Binance Pay" : "Consultar status na OxaPay", onclick: function (ev) {
             var b = ev.currentTarget; b.disabled = true;
             api("POST", "/payments/" + encodeURIComponent(p.id) + "/sync").then(function (r) {
-              toast(r.result === "credited" ? "Pago — saldo creditado" : "Status OxaPay: " + (r.remote_status || r.result), r.result === "credited" ? "ok" : "");
+              toast(r.result === "credited" ? "Pago — saldo creditado" : (bn ? "Binance: " : "Status OxaPay: ") + (r.remote_status || r.result), r.result === "credited" ? "ok" : "");
               router();
             }, function (e2) { b.disabled = false; toast(e2.message, "bad"); });
           } }, "Sincronizar"));
         }
-        if (p.track_id) acts.appendChild(el("button", { class: "btn s", onclick: function () { copy(p.track_id); } }, "Copiar track"));
+        if (p.track_id) acts.appendChild(el("button", { class: "btn s", onclick: function () { copy(bn ? p.track_id.replace(/^binance:/, "") : p.track_id); } }, bn ? "Copiar ID" : "Copiar track"));
         return el("tr", null,
           el("td", null, fmtDate(p.created_at)),
           el("td", null, el("a", { href: "#/usuarios/" + encodeURIComponent(p.telegram_user_id) }, userLabel(p.telegram_user_id, p.username))),
           el("td", null, money(p.amount_usd)),
-          el("td", null, payBadge(p.status), p.last_status && p.last_status.length < 40 ? el("div", { class: "muted small" }, "OxaPay: " + p.last_status) : null),
-          el("td", { class: "mono" }, p.track_id || "—"),
+          el("td", null, payBadge(p.status), p.last_status && p.last_status.length < 40 ? el("div", { class: "muted small" }, (bn ? "Binance: " + (BN_REASON[p.last_status] || p.last_status) : "OxaPay: " + p.last_status)) : null),
+          el("td", { class: "mono" }, bn ? el("span", null, el("span", { class: "badge" }, "Binance"), " ", p.track_id.replace(/^binance:/, "")) : (p.track_id || "—")),
           el("td", { class: "hide-m" }, fmtDate(p.paid_at)),
           el("td", { class: "mono hide-m small" }, p.id),
           el("td", null, acts));
       });
-      clear(main).append(el("h1", null, "Pagamentos (OxaPay)"), form, el("div", { class: "card" },
+      clear(main).append(el("h1", null, "Pagamentos (OxaPay · Binance Pay)"), form, el("div", { class: "card" },
         el("div", { class: "row f" }, el("span", { class: "badge" }, d.total + " pagamento(s)"), el("span", { class: "badge ok" }, "Creditado " + money(d.credited_sum))),
-        table(["Data", "Usuário", "Valor", "Status", "Track ID", { t: "Pago em", cls: "hide-m" }, { t: "Referência", cls: "hide-m" }, "Ações"], rows, "Nenhum pagamento ainda."),
+        table(["Data", "Usuário", "Valor", "Status", "Track ID / ID Binance", { t: "Pago em", cls: "hide-m" }, { t: "Referência", cls: "hide-m" }, "Ações"], rows, "Nenhum pagamento ainda."),
         pager(d.total, d.page, d.page_size, function (pg) { pState.page = pg; router(); })),
-        el("div", { class: "muted small" }, "Faturas não pagas são marcadas como expiradas ~10 min após o vencimento. Horários em BRT."));
+        el("div", { class: "muted small" }, "Faturas não pagas são marcadas como expiradas ~10 min após o vencimento. Binance Pay: o bot procura o ID por 30 min; acima do limite por transação fica \"em revisão\" até você aprovar. Horários em BRT."));
     });
   };
 
@@ -653,6 +665,45 @@
           .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); cSave.disabled = false; router(); },
             function (e2) { toast(e2.message, "bad"); cSave.disabled = false; });
       });
+      var bEnabled = el("input", { type: "checkbox", checked: s.binance_enabled === "1" });
+      var bPayId = el("input", { value: s.binance_pay_id, maxlength: 20, inputmode: "numeric", placeholder: "290455535" });
+      var bCoins = el("input", { value: s.binance_currencies, maxlength: 60, placeholder: "USDT", autocapitalize: "characters" });
+      var bMax = el("input", { type: "number", min: 1, step: "0.01", value: s.binance_max, inputmode: "decimal" });
+      var bBox = el("div", { class: "f" });
+      function showBn(st) {
+        clear(bBox).appendChild(el("div", { class: "kv" },
+          el("div", null, "Situação no bot"), el("div", null, st.available ? el("span", { class: "badge ok" }, "visível para os clientes") : el("span", { class: "badge warn" }, "oculta")),
+          el("div", null, "Última consulta OK"), el("div", null, st.last_ok_at ? fmtDate(st.last_ok_at) : "—"),
+          el("div", null, "Último erro"), el("div", null, st.last_error ? el("span", { class: "badge bad" }, st.last_error) : "nenhum"),
+          el("div", null, "Pausa até"), el("div", null, st.backoff_until ? fmtDate(st.backoff_until) : "—"),
+          el("div", null, "Transações no cache"), el("div", null, String(st.cached_transactions == null ? "—" : st.cached_transactions)),
+          el("div", null, "Pendentes / em revisão"), el("div", null, String(st.open_claims == null ? "—" : st.open_claims))));
+      }
+      var bTest = el("button", { class: "btn", type: "button" }, "Testar conexão com a Binance");
+      bTest.addEventListener("click", function () {
+        bTest.disabled = true;
+        api("POST", "/binance/test").then(function (r) {
+          bTest.disabled = false; showBn(r.status || {});
+          toast(r.ok ? (r.fresh ? "Conectado — " + r.count + " transação(ões) lidas" : "OK (consulta recente em cache)") : (r.reason === "unconfigured" ? "Chaves da Binance ausentes" : "Falhou: " + r.reason), r.ok ? "ok" : "bad");
+        }, function (e2) { bTest.disabled = false; toast(e2.message, "bad"); });
+      });
+      var bSave = el("button", { class: "btn p", type: "submit" }, "Salvar");
+      var bform = el("form", { class: "card" }, el("h2", null, "Recarga via Binance Pay (verificação automática)"),
+        el("div", { class: "kv f" },
+          el("div", null, "Chaves BINANCE_API_KEY / SECRET"), el("div", null, info.binance_configured ? el("span", { class: "badge ok" }, "configuradas") : el("span", { class: "badge bad" }, "ausentes — opção oculta no bot"))),
+        el("label", { class: "chk" }, bEnabled, "Mostrar \"🟡 Binance Pay\" na recarga do bot"),
+        field("Pay ID da Binance (aparece para o cliente)", bPayId),
+        field("Moedas aceitas (crédito 1:1 em USD, ex.: USDT ou USDT, USDC)", bCoins),
+        field("Limite por transação (USD) — acima disso fica em revisão para você aprovar", bMax),
+        el("div", { class: "muted small f" }, "O cliente envia pelo Binance Pay e cola o ID da transação. O bot confere no seu histórico do Binance Pay (chave só de leitura) se a transação existe, é uma entrada, está na moeda aceita e foi para o seu Pay ID, e credita o valor recebido. Cada ID só pode ser usado uma vez."),
+        el("div", { class: "row f" }, bTest), bBox, bSave);
+      bform.addEventListener("submit", function (e) {
+        e.preventDefault(); bSave.disabled = true;
+        api("PUT", "/settings", { binance_enabled: bEnabled.checked ? "1" : "0", binance_pay_id: bPayId.value, binance_currencies: bCoins.value, binance_max: bMax.value })
+          .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); bSave.disabled = false; router(); },
+            function (e2) { toast(e2.message, "bad"); bSave.disabled = false; });
+      });
+      api("GET", "/binance/status").then(showBn, function () {});
       var whBox = el("div", { class: "f" });
       function showWh(wi) {
         clear(whBox).appendChild(el("div", { class: "kv" },
@@ -693,7 +744,7 @@
             if (ok) api("POST", "/sessions/revoke-all").then(function () { ME = null; renderLogin("Todas as sessões foram encerradas."); }, function (e) { toast(e.message, "bad"); });
           });
         } }, "Encerrar todas as sessões"));
-      clear(main).append(el("h1", null, "Configurações"), form, cform, wh, apiCard, sys);
+      clear(main).append(el("h1", null, "Configurações"), form, cform, bform, wh, apiCard, sys);
     });
   };
 

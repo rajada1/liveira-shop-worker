@@ -55,6 +55,21 @@ import {
   REPLY_KB_TEXT,
 } from "./ui.js";
 import { getNav, claimMenu, setKeyboardMessage, noteMessage } from "./chatnav.js";
+import {
+  binanceConfig,
+  binanceConfigured,
+  binanceScreen,
+  binanceUnavailable,
+  binanceNotice,
+  claimCard,
+  getClaim,
+  normalizeTxId,
+  openClaim,
+  rateLimit,
+  reopenClaim,
+  verifyClaim,
+  BINANCE_PROMPT,
+} from "./binance.js";
 
 const TG_UPLOAD_LIMIT = 50 * 1024 * 1024; // Bot API sendDocument upload limit
 const TOPUP_PROMPT = "Enter the top-up amount in USD"; // legacy ForceReply prompt (old messages)
@@ -394,6 +409,7 @@ async function screenDownloads(env, s, user) {
 
 const METHOD_LABEL = {
   oxapay: "OxaPay top-up",
+  binance: "Binance Pay top-up",
   admin_add: "credit",
   panel_add: "credit",
   admin_sub: "adjustment",
@@ -466,18 +482,33 @@ function unavailableTopup(s) {
 
 async function screenTopup(env, s, user) {
   const tc = topupConfig(s, env);
-  if (!tc.available) return unavailableTopup(s);
+  const bc = binanceConfig(s, env);
+  if (!tc.available && !bc.available) return unavailableTopup(s);
   const cur = s.currency_symbol;
   const bal = await getBalance(env, user.id);
+  const binanceLine = "🟡 Have Binance? Tap <b>Binance Pay</b>: send USDT to our Pay ID and paste the transaction ID — no invoice needed.";
+  if (!tc.available) {
+    return {
+      text:
+        "💰 <b>Top up balance</b>\n\n" +
+        `Current balance: <b>${e(money(bal, cur))}</b>\n\n` +
+        "OxaPay invoices are currently unavailable.\n\n" +
+        binanceLine,
+      reply_markup: kb([[btn("🟡 Binance Pay", "bn", "primary")], navRow("home")]),
+    };
+  }
   const presetBtns = tc.presets.map((a) => btn(money(a, cur).replace(/\.00$/, ""), `tuc:${a}`, "primary"));
+  const otherRow = [btn("✏️ Other amount", "kp:")];
+  if (bc.available) otherRow.push(btn("🟡 Binance Pay", "bn"));
   return {
     text:
       "💰 <b>Top up balance</b>\n\n" +
       `Current balance: <b>${e(money(bal, cur))}</b>\n\n` +
       `Choose an amount (min ${e(money(tc.min, cur))}, max ${e(money(tc.max, cur))}):\n\n` +
       `💳 We accept: ${coinsLabel(s, { bold: true })}\n\n` +
-      howItWorks(s, { pickAmount: true }),
-    reply_markup: kb([...grid(presetBtns, presetBtns.length === 4 ? 2 : 3), [btn("✏️ Other amount", "kp:")], navRow("home")]),
+      howItWorks(s, { pickAmount: true }) +
+      (bc.available ? `\n${binanceLine}` : ""),
+    reply_markup: kb([...grid(presetBtns, presetBtns.length === 4 ? 2 : 3), otherRow, navRow("home")]),
   };
 }
 
@@ -573,6 +604,7 @@ async function createInvoiceFlow(env, s, user, nav, amount, resume) {
 async function checkStatusFlow(env, s, user, nav, id) {
   const pay = await env.DB.prepare("SELECT * FROM payments WHERE id=? AND telegram_user_id=?").bind(id, user.id).first();
   if (!pay) return show(env, nav, { text: "😕 Payment not found.", reply_markup: kb([navRow("home")]) });
+  if (pay.provider === "binance") return binanceRecheckFlow(env, s, user, nav, id);
   if (nav.messageId && pay.message_id !== nav.messageId) await setPaymentMessage(env, pay.id, nav.chatId, nav.messageId);
   if (pay.credited) {
     const bal = await getBalance(env, user.id);
@@ -596,6 +628,75 @@ async function checkStatusFlow(env, s, user, nav, id) {
     underpaid: "🟠 Underpaid — please contact support",
   };
   return { toast: toast || labels[fresh.status] || `Status: ${fresh.status}` };
+}
+
+/* ─── Binance Pay (paste the transaction ID; verified in the shop's Binance Pay history) ─── */
+
+async function screenBinance(env, s) {
+  const bc = binanceConfig(s, env);
+  return bc.available ? binanceScreen(s, bc) : binanceUnavailable(s);
+}
+
+const BINANCE_TOASTS = {
+  credited: "✅ Credited!",
+  already: "✅ Already credited",
+  pending: "⏳ Not found yet — we'll keep checking",
+  rejected: "❌ Not credited",
+  review: "🟠 Under review by the shop",
+};
+
+function claimToast(pay) {
+  if (pay.credited) return BINANCE_TOASTS.already;
+  return { pending: BINANCE_TOASTS.pending, review: BINANCE_TOASTS.review, rejected: BINANCE_TOASTS.rejected, expired: "⌛ Not found" }[pay.status] || null;
+}
+
+async function binanceClaimFlow(env, s, user, nav, raw) {
+  const bc = binanceConfig(s, env);
+  if (!bc.available) return show(env, nav, binanceUnavailable(s));
+  const txid = normalizeTxId(raw);
+  if (!txid) return show(env, nav, binanceNotice(s, "invalid"));
+  const o = await openClaim(env, { userId: user.id, chatId: nav.chatId, txid });
+  if (o.kind !== "new" && o.kind !== "own") return show(env, nav, binanceNotice(s, o.kind, o));
+  let pay = o.payment;
+  let r = { action: o.kind === "own" ? "show" : "pending", payment: pay };
+  if (o.kind === "new") {
+    r = await verifyClaim(env, s, pay, "user_submit");
+  } else if (!pay.credited && ["pending", "expired", "canceled"].includes(pay.status)) {
+    // Pasted again: check again (rate limited), re-opening an expired claim for another window.
+    if ((await rateLimit(env, user.id)).ok) {
+      pay = await reopenClaim(env, pay);
+      r = await verifyClaim(env, s, pay, "user_resubmit");
+    }
+  }
+  pay = r.payment || pay;
+  const card = claimCard(pay, s, { apiError: r.apiError || null, newBalance: r.action === "credited" ? r.newBalance : null });
+  const res = await show(env, nav, { ...card, record: true });
+  if (res?.message_id) await setPaymentMessage(env, pay.id, nav.chatId, res.message_id);
+  return res;
+}
+
+async function binanceRecheckFlow(env, s, user, nav, id) {
+  nav.inPlace = true; // actions on the claim card (a record) update that card itself
+  let pay = await getClaim(env, id);
+  if (!pay || Number(pay.telegram_user_id) !== Number(user.id)) return { toast: "Transaction not found." };
+  if (nav.messageId && pay.message_id !== nav.messageId) await setPaymentMessage(env, pay.id, nav.chatId, nav.messageId);
+  let r = { action: "show", payment: pay };
+  let toast = null;
+  if (!pay.credited && ["pending", "expired", "canceled"].includes(pay.status)) {
+    if (!binanceConfigured(env)) {
+      toast = "Binance Pay is currently unavailable.";
+    } else {
+      const rl = await rateLimit(env, user.id);
+      if (!rl.ok) toast = rl.hourly ? "⏳ Too many checks — please try again later." : `⏳ Please wait ${rl.wait} s before checking again.`;
+      else {
+        pay = await reopenClaim(env, pay);
+        r = await verifyClaim(env, s, pay, "user_check");
+        pay = r.payment || pay;
+      }
+    }
+  }
+  await show(env, nav, claimCard(pay, s, { apiError: r.apiError || null, newBalance: r.action === "credited" ? r.newBalance : null }));
+  return { toast: toast || BINANCE_TOASTS[r.action] || claimToast(pay) };
 }
 
 /* ─── routing helpers ─── */
@@ -726,6 +827,13 @@ async function route(env, s, user, nav, data) {
   if (data === "profile" || data === "balance") return show(env, nav, await screenProfile(env, s, user));
   if (data === "support" || data === "help") return show(env, nav, await screenSupport(env, s));
   if (data === "topup") return show(env, nav, await screenTopup(env, s, user));
+  if (data === "bn" || data === "binance") return show(env, nav, await screenBinance(env, s));
+  if (data === "bnp") {
+    if (!binanceConfig(s, env).available) return show(env, nav, binanceUnavailable(s));
+    await sendMessage(env, nav.chatId, e(BINANCE_PROMPT), { reply_markup: { force_reply: true, input_field_placeholder: "Transaction ID" } });
+    return { toast: "Paste the transaction ID below 👇" };
+  }
+  if (data.startsWith("bnchk:")) return binanceRecheckFlow(env, s, user, nav, data.slice(6));
 
   if (data.startsWith("buy:")) return show(env, nav, await screenProduct(env, s, user, data.slice(4)));
 
@@ -822,7 +930,7 @@ async function handleCallback(env, query, s) {
   }
 }
 
-const DEEP_LINKS = new Set(["shop", "topup", "licenses", "downloads", "profile", "support", "help", "home", "menu"]);
+const DEEP_LINKS = new Set(["shop", "topup", "binance", "licenses", "downloads", "profile", "support", "help", "home", "menu"]);
 
 async function handleCommand(env, message, s) {
   const text = message.text || "";
@@ -889,6 +997,15 @@ async function handleCommand(env, message, s) {
       return show(env, nav, screenConfirmTopup(s, env, amount, null));
     }
     await show(env, nav, await screenTopup(env, s, user));
+    return;
+  }
+
+  if (cmd === "/binance") {
+    await ensureUser(env, user.id, user.username);
+    await ensureKeyboard(env, nav);
+    const args = parseArgs(text);
+    if (args.length) return binanceClaimFlow(env, s, user, nav, args.join(""));
+    await show(env, nav, await screenBinance(env, s));
     return;
   }
 
@@ -983,6 +1100,19 @@ async function handleCommand(env, message, s) {
     }
   }
 
+  // Binance Pay transaction ID: a reply to the ID prompt, or a pasted long number (Binance Pay IDs are 12+ digits,
+  // amounts are at most 7 digits, so the two never overlap).
+  if (!cmd.startsWith("/") && message.chat?.type === "private") {
+    const looksLikeTx = /^\d{12,32}$/.test(text.trim()) && binanceConfig(s, env).available;
+    if (message._binanceReply || looksLikeTx) {
+      await ensureUser(env, user.id, user.username);
+      await ensureKeyboard(env, nav);
+      await binanceClaimFlow(env, s, user, nav, text);
+      if (message._binancePromptId) await deleteMessageQuiet(env, chatId, message._binancePromptId);
+      return;
+    }
+  }
+
   // Any other text: a typed number is a top-up amount; everything else shows the home card.
   if (!cmd.startsWith("/") && message.chat?.type === "private") {
     await ensureUser(env, user.id, user.username);
@@ -1017,6 +1147,11 @@ export async function handleTelegramUpdate(env, update) {
       // Legacy ForceReply prompt from older messages
       if (!m.text.startsWith("/") && replyTo?.from?.is_bot && String(replyTo.text || "").startsWith(TOPUP_PROMPT)) {
         m.reply_to_message = undefined;
+      }
+      // Reply to the Binance Pay "paste your transaction ID" prompt (ForceReply)
+      if (!m.text.startsWith("/") && replyTo?.from?.is_bot && String(replyTo.text || "").startsWith(BINANCE_PROMPT)) {
+        m._binanceReply = true;
+        m._binancePromptId = replyTo.message_id;
       }
       await handleCommand(env, m, s);
     }

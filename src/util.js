@@ -72,6 +72,11 @@ export const SETTING_DEFAULTS = {
   topup_min: "1",
   topup_max: "1000",
   accepted_currencies: "USDT",
+  // Binance Pay top-ups (src/binance.js): shown only when BINANCE_API_KEY/BINANCE_API_SECRET are set
+  binance_enabled: "1",
+  binance_pay_id: "",
+  binance_currencies: "USDT",
+  binance_max: "1000",
 };
 
 export const EDITABLE_SETTINGS = [
@@ -86,6 +91,10 @@ export const EDITABLE_SETTINGS = [
   "topup_min",
   "topup_max",
   "accepted_currencies",
+  "binance_enabled",
+  "binance_pay_id",
+  "binance_currencies",
+  "binance_max",
 ];
 
 /* ─── Accepted payment coins (setting "accepted_currencies", e.g. "USDT" or "USDT,BTC") ───

@@ -1,10 +1,8 @@
-name = "liveira-shop"
-main = "src/index.js"
+# Test-only config: same Worker, run by tests/bot/run.sh on :8798 WITHOUT the Binance secrets
+# (its .dev.vars is generated next to this file from ../../../.dev.vars minus BINANCE_API_KEY/SECRET). Never deployed.
+name = "liveira-shop-nosecrets-test"
+main = "../../../src/index.js"
 compatibility_date = "2024-09-23"
-
-# Every minute: re-check pending Binance Pay claims (no Binance request when nothing is pending).
-[triggers]
-crons = ["* * * * *"]
 
 [[d1_databases]]
 binding = "DB"
@@ -14,10 +12,6 @@ database_id = "b4c7c78f-4e79-4587-a559-6f794c607bfc"
 [[r2_buckets]]
 binding = "FILES"
 bucket_name = "liveira-shop-files"
-
-[[r2_buckets]]
-binding = "CHASE_FILES"
-bucket_name = "cf-chase-files"
 
 [[rules]]
 type = "Text"

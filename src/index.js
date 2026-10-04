@@ -4,11 +4,13 @@
  * - Telegram bot webhook (POST /telegram, /webhook)
  * - Admin panel (/admin, /admin/api/*)
  * - OxaPay payment callback (POST /oxapay/callback)
+ * - Cron (every minute): re-check pending Binance Pay claims (src/binance.js)
  */
 import { CORS_HEADERS, json } from "./util.js";
 import { handleTelegramUpdate } from "./bot.js";
 import { handleAdmin } from "./admin.js";
 import { handleOxapayCallback } from "./oxapay.js";
+import { binanceCron } from "./binance.js";
 
 function unauthorized() {
   return json({ error: "Unauthorized" }, 401);
@@ -129,6 +131,14 @@ function webhookSecretOk(request, env) {
 }
 
 export default {
+  async scheduled(event, env, ctx) {
+    try {
+      await binanceCron(env);
+    } catch (err) {
+      console.error("binance cron error", err && err.stack ? err.stack : err);
+    }
+  },
+
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";

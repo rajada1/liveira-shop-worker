@@ -375,7 +375,7 @@ export async function setPaymentMessage(env, id, chatId, messageId) {
 /** User cancels an unpaid invoice (local only: a late payment is still credited). */
 export async function cancelPayment(env, id, userId) {
   const r = await env.DB.prepare(
-    "UPDATE payments SET status='canceled', updated_at=? WHERE id=? AND telegram_user_id=? AND credited=0 AND status='pending'"
+    "UPDATE payments SET status='canceled', updated_at=? WHERE id=? AND telegram_user_id=? AND credited=0 AND status='pending' AND provider='oxapay'"
   )
     .bind(nowIso(), id, userId)
     .run();
