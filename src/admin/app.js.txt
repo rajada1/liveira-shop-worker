@@ -473,12 +473,14 @@
     });
   };
 
-  /* ───────── Pagamentos (OxaPay · Binance Pay) ───────── */
+  /* ───────── Pagamentos (OxaPay · Binance Pay · NOWPayments) ───────── */
   var PAY_STATUS = {
     creating: ["", "criando"], pending: ["", "aguardando"], paying: ["warn", "pagando"], paid: ["ok", "pago"],
     underpaid: ["warn", "pago a menor"], expired: ["", "expirado"], canceled: ["", "cancelado"], refunding: ["warn", "reembolsando"],
-    refunded: ["bad", "reembolsado"], error: ["bad", "erro"], review: ["warn", "em revisão"], rejected: ["bad", "recusado"],
+    refunded: ["bad", "reembolsado"], error: ["bad", "erro"], review: ["warn", "em revisão"], rejected: ["bad", "recusado"], failed: ["bad", "falhou"],
   };
+  var NP_REASON = { invoice: "fatura criada", waiting: "aguardando pagamento", confirming: "confirmando", confirmed: "confirmado", sending: "enviando", partially_paid: "pago parcialmente", finished: "concluído", failed: "falhou", refunded: "reembolsado", expired: "expirado", price_mismatch: "preço diferente da fatura", underpaid_finished: "concluído, mas valor recebido menor" };
+  var PROV = { oxapay: "OxaPay", binance: "Binance", nowpayments: "NOWPayments" };
   var BN_REASON = { outgoing: "não é entrada", currency: "moeda não aceita", type: "tipo não aceito", too_small: "valor pequeno", over_max: "acima do limite", receiver: "destinatário diferente do Pay ID", submitted: "aguardando", credited: "creditado" };
   function payBadge(st) { var m = PAY_STATUS[st] || ["", st]; return el("span", { class: "badge " + m[0] }, m[1]); }
   var pState = { q: "", status: "", page: 1 };
@@ -495,6 +497,7 @@
       var rows = d.payments.map(function (p) {
         var acts = el("div", { class: "row" });
         var bn = p.provider === "binance";
+        var np = p.provider === "nowpayments";
         if (bn && !p.credited && p.status === "review") {
           acts.appendChild(el("button", { class: "btn s p", title: "Creditar o valor recebido na Binance", onclick: function (ev) {
             var b = ev.currentTarget;
@@ -506,30 +509,32 @@
           } }, "Aprovar e creditar"));
         }
         if (p.track_id && !p.credited && ["pending", "paying", "expired", "underpaid", "canceled"].indexOf(p.status) >= 0) {
-          acts.appendChild(el("button", { class: "btn s", title: bn ? "Procurar a transação no histórico do Binance Pay" : "Consultar status na OxaPay", onclick: function (ev) {
+          acts.appendChild(el("button", { class: "btn s", title: bn ? "Procurar a transação no histórico do Binance Pay" : np ? "Consultar status na NOWPayments" : "Consultar status na OxaPay", onclick: function (ev) {
             var b = ev.currentTarget; b.disabled = true;
             api("POST", "/payments/" + encodeURIComponent(p.id) + "/sync").then(function (r) {
-              toast(r.result === "credited" ? "Pago — saldo creditado" : (bn ? "Binance: " : "Status OxaPay: ") + (r.remote_status || r.result), r.result === "credited" ? "ok" : "");
+              toast(r.result === "credited" ? "Pago — saldo creditado" : (bn ? "Binance: " : np ? "NOWPayments: " : "Status OxaPay: ") + (np ? (NP_REASON[r.remote_status] || r.remote_status || r.result) : (r.remote_status || r.result)), r.result === "credited" ? "ok" : "");
               router();
             }, function (e2) { b.disabled = false; toast(e2.message, "bad"); });
           } }, "Sincronizar"));
         }
-        if (p.track_id) acts.appendChild(el("button", { class: "btn s", onclick: function () { copy(bn ? p.track_id.replace(/^binance:/, "") : p.track_id); } }, bn ? "Copiar ID" : "Copiar track"));
+        if (p.track_id) acts.appendChild(el("button", { class: "btn s", onclick: function () { copy(p.track_id.replace(/^(binance|np):/, "")); } }, bn ? "Copiar ID" : np ? "Copiar fatura" : "Copiar track"));
+        if (np && p.pay_link && !p.credited) acts.appendChild(el("a", { class: "btn s", href: p.pay_link, target: "_blank", rel: "noopener noreferrer" }, "Abrir fatura"));
         return el("tr", null,
           el("td", null, fmtDate(p.created_at)),
           el("td", null, el("a", { href: "#/usuarios/" + encodeURIComponent(p.telegram_user_id) }, userLabel(p.telegram_user_id, p.username))),
           el("td", null, money(p.amount_usd)),
-          el("td", null, payBadge(p.status), p.last_status && p.last_status.length < 40 ? el("div", { class: "muted small" }, (bn ? "Binance: " + (BN_REASON[p.last_status] || p.last_status) : "OxaPay: " + p.last_status)) : null),
-          el("td", { class: "mono" }, bn ? el("span", null, el("span", { class: "badge" }, "Binance"), " ", p.track_id.replace(/^binance:/, "")) : (p.track_id || "—")),
+          el("td", null, payBadge(p.status), p.last_status && p.last_status.length < 40 ? el("div", { class: "muted small" }, (bn ? "Binance: " + (BN_REASON[p.last_status] || p.last_status) : np ? "NOWPayments: " + (NP_REASON[p.last_status] || p.last_status) : "OxaPay: " + p.last_status)) : null),
+          el("td", { class: "mono" }, p.provider !== "oxapay" && p.track_id ? el("span", null, el("span", { class: "badge" }, PROV[p.provider] || p.provider), " ", p.track_id.replace(/^(binance|np):/, ""),
+            np && p.np_info ? el("div", { class: "muted small" }, "pagamento " + p.np_info) : null) : (p.track_id || "—")),
           el("td", { class: "hide-m" }, fmtDate(p.paid_at)),
           el("td", { class: "mono hide-m small" }, p.id),
           el("td", null, acts));
       });
-      clear(main).append(el("h1", null, "Pagamentos (OxaPay · Binance Pay)"), form, el("div", { class: "card" },
+      clear(main).append(el("h1", null, "Pagamentos (OxaPay · Binance Pay · NOWPayments)"), form, el("div", { class: "card" },
         el("div", { class: "row f" }, el("span", { class: "badge" }, d.total + " pagamento(s)"), el("span", { class: "badge ok" }, "Creditado " + money(d.credited_sum))),
-        table(["Data", "Usuário", "Valor", "Status", "Track ID / ID Binance", { t: "Pago em", cls: "hide-m" }, { t: "Referência", cls: "hide-m" }, "Ações"], rows, "Nenhum pagamento ainda."),
+        table(["Data", "Usuário", "Valor", "Status", "Track ID / ID Binance / fatura NOWPayments", { t: "Pago em", cls: "hide-m" }, { t: "Referência", cls: "hide-m" }, "Ações"], rows, "Nenhum pagamento ainda."),
         pager(d.total, d.page, d.page_size, function (pg) { pState.page = pg; router(); })),
-        el("div", { class: "muted small" }, "Faturas não pagas são marcadas como expiradas ~10 min após o vencimento. Binance Pay: o bot procura o ID por 30 min; acima do limite por transação fica \"em revisão\" até você aprovar. Horários em BRT."));
+        el("div", { class: "muted small" }, "Faturas não pagas são marcadas como expiradas ~10 min após o vencimento. Binance Pay: o bot procura o ID por 30 min; acima do limite por transação fica \"em revisão\" até você aprovar. NOWPayments: crédito automático só com status \"finished\" (pago parcialmente / falhou / revisão → aviso no Telegram, ajuste o saldo manualmente se for o caso); faturas sem pagamento fecham após 24 h. Horários em BRT."));
     });
   };
 
@@ -704,6 +709,52 @@
             function (e2) { toast(e2.message, "bad"); bSave.disabled = false; });
       });
       api("GET", "/binance/status").then(showBn, function () {});
+      var nEnabled = el("input", { type: "checkbox", checked: s.nowpayments_enabled === "1" });
+      var nMin = el("input", { type: "number", min: 0, step: "0.01", value: s.nowpayments_min, inputmode: "decimal", placeholder: "automático" });
+      var nBox = el("div", { class: "f" });
+      var nLink = el("div", { class: "f" });
+      var SRC = { manual: "manual", auto: "automático (NOWPayments)", fallback: "padrão (ainda sem consulta)" };
+      function showNp(st) {
+        clear(nBox).appendChild(el("div", { class: "kv" },
+          el("div", null, "Situação no bot"), el("div", null, st.available ? el("span", { class: "badge ok" }, "visível para os clientes") : el("span", { class: "badge warn" }, "oculta")),
+          el("div", null, "Mínimo mostrado ao cliente"), el("div", null, money(st.min) + " — " + (SRC[st.min_source] || st.min_source)),
+          el("div", null, "Mínimo automático"), el("div", null, st.auto_min ? money(st.auto_min) + (st.auto_min_at ? " (consultado " + fmtDate(st.auto_min_at) + ")" : "") : "—"),
+          el("div", null, "Em aberto / revisão"), el("div", null, String(st.open == null ? "—" : st.open))));
+      }
+      var nTest = el("button", { class: "btn", type: "button" }, "Testar conexão com a NOWPayments");
+      nTest.addEventListener("click", function () {
+        nTest.disabled = true;
+        api("POST", "/nowpayments/test").then(function (r) {
+          nTest.disabled = false; showNp(r.status || {});
+          toast(r.ok ? "Conectado" + (r.min ? " — mínimo atual " + money(r.min.usd) : "") : (r.reason === "unconfigured" ? "Chaves da NOWPayments ausentes" : "Falhou (HTTP " + r.http + ")"), r.ok ? "ok" : "bad");
+        }, function (e2) { nTest.disabled = false; toast(e2.message, "bad"); });
+      });
+      var nInv = el("button", { class: "btn", type: "button" }, "Criar fatura de teste (valor mínimo)");
+      nInv.addEventListener("click", function () {
+        confirmDlg("Criar uma fatura real na NOWPayments no valor mínimo, em seu nome (não é enviada a ninguém)? Se você pagar, o valor entra no seu saldo.").then(function (ok) {
+          if (!ok) return; nInv.disabled = true;
+          api("POST", "/nowpayments/test-invoice").then(function (r) {
+            nInv.disabled = false; toast("Fatura criada: " + money(r.amount), "ok");
+            clear(nLink).appendChild(el("a", { href: r.invoice_url, target: "_blank", rel: "noopener noreferrer" }, "Abrir fatura de teste (" + money(r.amount) + ")"));
+          }, function (e2) { nInv.disabled = false; toast(e2.message, "bad"); });
+        });
+      });
+      var nSave = el("button", { class: "btn p", type: "submit" }, "Salvar");
+      var nform = el("form", { class: "card" }, el("h2", null, "Recarga via NOWPayments (300+ moedas, qualquer rede)"),
+        el("div", { class: "kv f" },
+          el("div", null, "Chaves NOWPAYMENTS_API_KEY / IPN_SECRET"), el("div", null, info.nowpayments_configured ? el("span", { class: "badge ok" }, "configuradas") : el("span", { class: "badge bad" }, "ausentes — opção oculta no bot")),
+          el("div", null, "IPN URL"), el("div", { class: "mono" }, info.nowpayments_ipn_url)),
+        el("label", { class: "chk" }, nEnabled, "Mostrar \"🪙 Pay with crypto (NOWPayments)\" na recarga do bot"),
+        field("Valor mínimo (USD) — vazio = automático (mínimo da NOWPayments + 10 %, atualizado a cada 6 h)", nMin),
+        el("div", { class: "muted small f" }, "O cliente escolhe o valor em USD; o bot cria uma fatura na NOWPayments e o cliente escolhe moeda e rede na página. O saldo é creditado automaticamente (valor da fatura) quando a NOWPayments informa \"finished\" e a consulta com a chave da API confirma. Pago parcialmente / falhou → aviso para você no Telegram. Se um IPN se perder, o cron consulta os pagamentos a cada ~3 min."),
+        el("div", { class: "row f" }, nTest, nInv), nLink, nBox, nSave);
+      nform.addEventListener("submit", function (e) {
+        e.preventDefault(); nSave.disabled = true;
+        api("PUT", "/settings", { nowpayments_enabled: nEnabled.checked ? "1" : "0", nowpayments_min: nMin.value })
+          .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); nSave.disabled = false; router(); },
+            function (e2) { toast(e2.message, "bad"); nSave.disabled = false; });
+      });
+      api("GET", "/nowpayments/status").then(showNp, function () {});
       var whBox = el("div", { class: "f" });
       function showWh(wi) {
         clear(whBox).appendChild(el("div", { class: "kv" },
@@ -744,7 +795,7 @@
             if (ok) api("POST", "/sessions/revoke-all").then(function () { ME = null; renderLogin("Todas as sessões foram encerradas."); }, function (e) { toast(e.message, "bad"); });
           });
         } }, "Encerrar todas as sessões"));
-      clear(main).append(el("h1", null, "Configurações"), form, cform, bform, wh, apiCard, sys);
+      clear(main).append(el("h1", null, "Configurações"), form, cform, bform, nform, wh, apiCard, sys);
     });
   };
 

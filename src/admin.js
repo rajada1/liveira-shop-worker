@@ -23,6 +23,7 @@ import {
 import { topupConfig, syncPayment, expireStale, callbackUrl, round2, oxapayAcceptedCoins } from "./oxapay.js";
 import { noteMessages } from "./chatnav.js";
 import { binanceConfigured, binanceStatus, binanceDiag, refreshHistory, verifyClaim, approveClaim, notifyClaim } from "./binance.js";
+import { npConfig, npConfigured, npStatus, npCheck, npApiStatus, refreshNpMin, createNpInvoice, ipnUrl } from "./nowpayments.js";
 
 const COOKIE = "__Host-lv_admin";
 const SESSION_TTL = 12 * 3600; // seconds
@@ -388,6 +389,11 @@ async function route(ctx, method, api) {
     return aj(d);
   }
 
+  // NOWPayments (status / connection test / test invoice; secrets are never returned)
+  if (api === "/nowpayments/status" && method === "GET") return aj(await npStatus(env, ctx.settings));
+  if (api === "/nowpayments/test" && method === "POST") return npTestApi(ctx);
+  if (api === "/nowpayments/test-invoice" && method === "POST") return npTestInvoiceApi(ctx);
+
   // Tokens
   if (api === "/tokens" && method === "GET") return listTokens(ctx);
   if (api === "/tokens" && method === "POST") return createTokenAdmin(ctx);
@@ -738,7 +744,7 @@ async function listOrders({ env, url }) {
 
 /* ─── crypto payments (OxaPay) ─── */
 
-const PAYMENT_STATUSES = ["creating", "pending", "paying", "paid", "underpaid", "expired", "canceled", "refunding", "refunded", "error", "review", "rejected"];
+const PAYMENT_STATUSES = ["creating", "pending", "paying", "paid", "underpaid", "expired", "canceled", "refunding", "refunded", "error", "review", "rejected", "failed"];
 
 async function listPayments({ env, url }) {
   await expireStale(env);
@@ -754,8 +760,8 @@ async function listPayments({ env, url }) {
   let q = (url.searchParams.get("q") || "").trim().slice(0, 64);
   if (q) {
     if (/^\d+$/.test(q)) {
-      conds.push("(p.telegram_user_id = ? OR p.track_id = ? OR p.track_id = ?)");
-      binds.push(Number(q), q, `binance:${q}`);
+      conds.push("(p.telegram_user_id = ? OR p.track_id = ? OR p.track_id = ? OR p.track_id = ? OR EXISTS (SELECT 1 FROM np_payments n WHERE n.order_id=p.id AND n.payment_id=?))");
+      binds.push(Number(q), q, `binance:${q}`, `np:${q}`, q);
     } else if (q.startsWith("@")) {
       conds.push("lower(u.username) = lower(?)");
       binds.push(q.slice(1));
@@ -773,7 +779,9 @@ async function listPayments({ env, url }) {
     .first();
   const { results } = await env.DB.prepare(
     `SELECT p.id, p.provider, p.telegram_user_id, u.username, p.amount_usd, p.track_id, p.status, p.last_status, p.pay_link,
-            p.created_at, p.updated_at, p.expires_at, p.paid_at, p.credited ${base}
+            p.created_at, p.updated_at, p.expires_at, p.paid_at, p.credited,
+            (SELECT n.payment_id || ' · ' || n.status || COALESCE(' · ' || n.actually_paid || '/' || n.pay_amount || ' ' || upper(n.pay_currency), '')
+               FROM np_payments n WHERE n.order_id=p.id ORDER BY n.updated_at DESC LIMIT 1) AS np_info ${base}
       ORDER BY p.created_at DESC LIMIT ${limit} OFFSET ${offset}`
   )
     .bind(...binds)
@@ -796,6 +804,14 @@ async function syncPaymentApi({ env, actor, settings }, id) {
     await audit(env, actor, "payment_sync", { payment_id: id, track_id: pay.track_id, result: r.action, api_error: r.apiError || null });
     const upd = await env.DB.prepare("SELECT * FROM payments WHERE id=?").bind(id).first();
     return aj({ ok: true, result: r.action, remote_status: r.apiError ? `erro Binance: ${r.apiError}` : r.reason || r.action, payment: upd });
+  }
+  if (pay.provider === "nowpayments") {
+    if (!npConfigured(env)) throw new HttpError(503, "NOWPAYMENTS_API_KEY / NOWPAYMENTS_IPN_SECRET não configuradas");
+    const r = await npCheck(env, settings, pay, "panel_sync", { force: true });
+    await audit(env, actor, "payment_sync", { payment_id: id, track_id: pay.track_id, result: r.action });
+    const upd = await env.DB.prepare("SELECT * FROM payments WHERE id=?").bind(id).first();
+    const label = { no_payment: "nenhum pagamento iniciado na página da NOWPayments ainda", api_error: "erro ao consultar a NOWPayments" }[r.action];
+    return aj({ ok: true, result: r.action, remote_status: label || upd?.last_status || r.action, payment: upd });
   }
   if (!env.OXAPAY_MERCHANT_KEY) throw new HttpError(503, "OXAPAY_MERCHANT_KEY não configurada");
   const r = await syncPayment(env, pay, "panel_sync");
@@ -829,6 +845,27 @@ async function binanceTest({ env, actor, settings }) {
   const r = await refreshHistory(env, { force: true }); // a manual test ignores an earlier backoff
   await audit(env, actor, "binance_test", { result: r.ok ? (r.fresh ? "fetched" : "cached") : r.reason });
   return aj({ ok: r.ok, reason: r.reason || null, fresh: !!r.fresh, count: r.count ?? null, status: await binanceStatus(env, settings) });
+}
+
+async function npTestApi({ env, actor, settings }) {
+  if (!npConfigured(env)) return aj({ ok: false, reason: "unconfigured", status: await npStatus(env, settings) });
+  const st = await npApiStatus(env);
+  const m = st.ok ? await refreshNpMin(env, settings, { force: true }) : { ok: false };
+  await audit(env, actor, "nowpayments_test", { api: st.ok, http: st.http, min: m.min ?? null });
+  return aj({ ok: st.ok, http: st.http, min: m.ok ? { usd: m.min, raw: m.raw, per_coin: m.per } : null, status: await npStatus(env, await getSettings(env)) });
+}
+
+/** Real invoice for the minimum amount, owned by the first ADMIN_IDS account (no Telegram message is sent). */
+async function npTestInvoiceApi({ env, actor, settings }) {
+  if (!npConfigured(env)) throw new HttpError(503, "NOWPAYMENTS_API_KEY / NOWPAYMENTS_IPN_SECRET não configuradas");
+  const owner = String(env.ADMIN_IDS || "").split(",").map((x) => x.trim()).find((x) => /^\d+$/.test(x));
+  if (!owner) throw new HttpError(503, "ADMIN_IDS não configurado");
+  const s = { ...settings, nowpayments_enabled: "1" };
+  const min = npConfig(s, env).min;
+  const r = await createNpInvoice(env, s, { userId: Number(owner), chatId: null, amount: min, resume: null });
+  await audit(env, actor, "nowpayments_test_invoice", { ok: r.ok, reason: r.reason || null, payment_id: r.payment?.id || null, amount: min });
+  if (!r.ok) throw new HttpError(502, `Falha ao criar a fatura: ${r.reason}`);
+  return aj({ ok: true, amount: min, payment_id: r.payment.id, invoice_url: r.payment.pay_link, track_id: r.payment.track_id });
 }
 
 /* ─── tokens ─── */
@@ -956,6 +993,8 @@ function publicInfo(ctx) {
     oxapay_configured: !!ctx.env.OXAPAY_MERCHANT_KEY,
     oxapay_callback_url: callbackUrl(ctx.env),
     binance_configured: binanceConfigured(ctx.env),
+    nowpayments_configured: npConfigured(ctx.env),
+    nowpayments_ipn_url: ipnUrl(ctx.env),
   };
 }
 
@@ -1019,7 +1058,10 @@ async function putSettings({ request, env, settings, actor }) {
       if (v && !/^\d{4,20}$/.test(v)) throw new HttpError(400, "Pay ID da Binance: use apenas números (4 a 20 dígitos)");
     } else if (k === "binance_max") {
       v = String(round2(num(String(b[k]).replace(",", "."), "Limite por transação Binance", { min: 1, max: 100000 })));
-    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled" || k === "binance_enabled") {
+    } else if (k === "nowpayments_min") {
+      const raw = String(b[k]).trim().replace(",", ".");
+      v = raw === "" || raw === "0" ? "" : String(round2(num(raw, "Mínimo NOWPayments", { min: 1, max: 100000 })));
+    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled" || k === "binance_enabled" || k === "nowpayments_enabled") {
       v = b[k] === true || b[k] === "1" || b[k] === 1 ? "1" : "0";
     } else {
       v = String(b[k]).replace(/\r\n/g, "\n");

@@ -1,4 +1,4 @@
-"""Local integration tests: bot UX + OxaPay security + Binance Pay + token API + admin. Run against wrangler dev on :8799
+"""Local integration tests: bot UX + OxaPay security + Binance Pay + NOWPayments + token API + admin. Run against wrangler dev on :8799
 (and :8798 = same Worker without the Binance secrets)."""
 import json, hmac, hashlib, subprocess, time, urllib.request, urllib.error, concurrent.futures as cf, itertools, re
 BASE = 'http://127.0.0.1:8799'; KEY = b'local_test_merchant_key'; FAKE = 'http://127.0.0.1:9911'
@@ -233,10 +233,10 @@ s = last_screen(ADM.msg('/start')); check('maintenance: admin still gets home', 
 sql("UPDATE settings SET value='0' WHERE key='maintenance_mode'")
 
 # ───── toggle off
-sql("UPDATE settings SET value='0' WHERE key='crypto_topup_enabled'")
+sql("UPDATE settings SET value='0' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled')")
 ev, _, scr = nav(A, 'topup', 'top-up disabled → unavailable (menu not latest)', ['unavailable'], move=True)
 ev, ans = A.cb('tun:10'); check('disabled → no invoice', not [e for e in ev if e.get('oxapay')])
-sql("UPDATE settings SET value='1' WHERE key='crypto_topup_enabled'")
+sql("UPDATE settings SET value='1' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled')")
 
 # ───── OxaPay security (unchanged behaviour)
 ev, _, _ = nav(A, 'tun:25', 'invoice $25'); inv = [e for e in ev if e.get('oxapay') == 'invoice'][0]; T4, P4 = inv['track_id'], inv['body']['order_id']
@@ -617,6 +617,214 @@ check('admin payments: search by Binance ID, provider shown', s_ == 200 and d['t
 s_, body, _ = req('GET', '/admin/api/payments?status=review', None, AH); check('admin payments filter "review"', s_ == 200 and json.loads(body)['total'] >= 1)
 s_, body, _ = req('GET', '/admin/app.js', None); check('admin app.js: Binance Pay settings card + approve button', 'Recarga via Binance Pay' in body and 'Aprovar e creditar' in body and 'cripto' not in body.lower())
 
+# ───── NOWPayments (fake API on :9911/np/v1, IPN secret np_test_ipn_secret_0123456789abcd)
+NPS = b'np_test_ipn_secret_0123456789abcd'
+def np_js(o):
+    """Recursively key-sorted, JSON.stringify-compatible (integral floats print as ints)."""
+    if isinstance(o, dict): return {k: np_js(o[k]) for k in sorted(o)}
+    if isinstance(o, list): return [np_js(x) for x in o]
+    if isinstance(o, float) and o.is_integer(): return int(o)
+    return o
+def np_canon(o): return json.dumps(np_js(o), separators=(',', ':'), ensure_ascii=False)
+def np_sig(o, secret=NPS): return hmac.new(secret, np_canon(o).encode(), hashlib.sha512).hexdigest()
+def np_legacy_canon(o):
+    keys = sorted(o)  # JSON.stringify(params, Object.keys(params).sort()): the key list applies at every level
+    def f(v):
+        if isinstance(v, dict): return {k: f(v[k]) for k in keys if k in v}
+        if isinstance(v, list): return [f(x) for x in v]
+        if isinstance(v, float) and v.is_integer(): return int(v)
+        return v
+    return json.dumps(f(o), separators=(',', ':'), ensure_ascii=False)
+def ipn(o, sig=None, raw=None, base=None):
+    raw = raw if raw is not None else json.dumps(o, indent=1).encode()  # unsorted + pretty: the signature covers the sorted form
+    return req('POST', '/nowpayments/ipn', raw=raw, headers={'x-nowpayments-sig': np_sig(o) if sig is None else sig}, base=base)
+np_pid = itertools.count(6100000001)
+def np_obj(pay, status, pid=None, actually=None, due=13.95, cur='usdttrc20', price=None, **kw):
+    o = {'payment_id': pid or next(np_pid), 'parent_payment_id': None, 'invoice_id': int(pay['track_id'].split(':')[1]), 'payment_status': status,
+         'pay_address': 'TXfakeAddress', 'payin_extra_id': None, 'price_amount': pay['amount_usd'] if price is None else price, 'price_currency': 'usd',
+         'pay_amount': due, 'actually_paid': (due if status == 'finished' else 0) if actually is None else actually, 'actually_paid_at_fiat': 0,
+         'pay_currency': cur, 'order_id': pay['id'], 'order_description': 'Liveira Shop balance top-up', 'purchase_id': '5312822613',
+         'outcome_amount': 13.7, 'outcome_currency': cur, 'payment_extra_ids': None,
+         'fee': {'currency': cur, 'withdrawalFee': 0, 'depositFee': 0.1, 'serviceFee': 0.07}}
+    o.update(kw); return o
+def np_set(o): fpost('/_np/pay', o)
+def np_pay(pid): r = sql(f"SELECT * FROM payments WHERE id='{pid}'"); return r[0] if r else None
+def np_rows(oid): return sql(f"SELECT * FROM np_payments WHERE order_id='{oid}' ORDER BY created_at")
+def np_calls(ev, kind=None): return [x for x in ev if x.get('np') and (kind is None or x['np'] == kind)]
+def np_topups(oid): return len(sql(f"SELECT id FROM topups WHERE ref='{oid}' AND method='nowpayments'"))
+def user_msgs(ev, u): return [x for x in tg(ev, 'sendMessage') if x['body']['chat_id'] == u.uid]
+def np_new_invoice(u, amount):
+    ev, ans = u.cb(f'npn:{amount}'); c = [x for x in np_calls(ev, 'invoice')]
+    p = sql(f"SELECT * FROM payments WHERE provider='nowpayments' AND telegram_user_id={u.uid} ORDER BY created_at DESC LIMIT 1")
+    return ev, ans, c, (p[0] if p else None)
+
+sql("UPDATE settings SET value='' WHERE key IN ('nowpayments_min_auto','nowpayments_min_auto_at')")
+ev = cron()
+check('cron refreshes the NOWPayments minimum: max(fiat_equivalent of usdttrc20/usdtbsc/ltc/trx) +10 %, rounded up → 14',
+      sql("SELECT value FROM settings WHERE key='nowpayments_min_auto'")[0]['value'] == '14'
+      and sorted(x['params'].get('currency_from') for x in np_calls(ev, 'GET') if x['path'] == '/np/v1/min-amount') == ['ltc', 'trx', 'usdtbsc', 'usdttrc20']
+      and all(x['key_ok'] and x['params'].get('fiat_equivalent') == 'usd' and x['params'].get('currency_to') == 'usdttrc20' for x in np_calls(ev, 'GET') if x['path'] == '/np/v1/min-amount'), np_calls(ev))
+ev = cron(); check('minimum is cached (no min-amount request on the next cron)', not [x for x in np_calls(ev, 'GET') if x['path'] == '/np/v1/min-amount'])
+NA = User(555060, 'Nora', 'nora'); ev = NA.msg('/start'); NA.mid = last_screen(ev)['mid']
+ev, _, scr = nav(NA, 'topup', 'top-up menu offers 🪙 NOWPayments', ['Pay with crypto (NOWPayments)', 'min $14.00'], ['np', 'kp:', 'bn'])
+check('🪙 Pay with crypto (NOWPayments) is its own row', any([b.get('callback_data') for b in r] == ['np'] for r in scr['body']['reply_markup']['inline_keyboard']))
+ev, _, scr = nav(NA, 'np', 'NOWPayments screen', ['🪙 <b>Pay with crypto (NOWPayments)</b>', '300+ cryptocurrencies', 'Minimum: <b>$14.00</b>', "can't process smaller payments"], ['npc:14', 'npc:25', 'npc:50', 'nk:', 'topup'])
+check('NOWPayments presets: minimum first, OxaPay presets below the minimum dropped', [c for c in cbdata(scr) if c.startswith('npc:')] == ['npc:14', 'npc:25', 'npc:50'], cbdata(scr))
+ev, _, scr = nav(NA, 'nk:', 'NOWPayments keypad', ['Other amount · NOWPayments', 'Min $14.00'], ['nk:1', 'nkok:', 'np'])
+ev, ans = NA.cb('nkok:5')
+check('keypad 5 → toast explains the NOWPayments minimum, no invoice', ans and 'Minimum for NOWPayments is $14.00' in ans[0]['body'].get('text', '') and not np_calls(ev, 'invoice'), ans)
+ev, _, scr = nav(NA, 'nkok:20', 'keypad 20 → NOWPayments confirm', ['🪙 <b>Confirm top-up</b>', 'Amount: <b>$20.00</b>', 'via NOWPayments'], ['npn:20', 'np'])
+ev, ans, calls, pa = np_new_invoice(NA, 20)
+b = calls[0]['body'] if calls else {}
+check('create → POST /v1/invoice with price_amount 20, usd, unique order_id, IPN URL, success/cancel back to the bot',
+      len(calls) == 1 and calls[0]['key_ok'] and b.get('price_amount') == 20 and b.get('price_currency') == 'usd' and b.get('order_id') == (pa or {}).get('id')
+      and b.get('ipn_callback_url') == 'https://liveira-shop.kelumayou.workers.dev/nowpayments/ipn'
+      and b.get('success_url') == 'https://t.me/liveira_test_bot?start=np_paid' and b.get('cancel_url') == 'https://t.me/liveira_test_bot?start=topup'
+      and b.get('is_fixed_rate') is False and 'pay_currency' not in b, b)
+card = last_screen(ev)
+check('invoice card: 💳 Pay now = invoice_url, NOWPayments how-it-works, check + cancel buttons',
+      card and any(x.get('url') == 'https://nowpayments.io/payment/?iid=' + calls[0]['invoice_id'] for x in buttons(card)) and 'NOWPayments page' in card['body']['text']
+      and f"tuchk:{pa['id']}" in cbdata(card) and f"tux:{pa['id']}" in cbdata(card), card and card['body'])
+check('payments row: provider nowpayments, pending, track np:<invoice id>, 24 h, not credited',
+      pa and pa['provider'] == 'nowpayments' and pa['status'] == 'pending' and pa['track_id'] == 'np:' + calls[0]['invoice_id'] and pa['credited'] == 0 and pa['id'].startswith('np_')
+      and 23 * 3600000 < iso_ms(pa['expires_at']) - now_ms() <= 24 * 3600000, pa)
+NA.mid = card['mid']
+ev, ans = NA.cb('npn:20')
+check('double tap on create → same open invoice reused, no second API call', not np_calls(ev, 'invoice') and len(sql(f"SELECT id FROM payments WHERE provider='nowpayments' AND telegram_user_id={NA.uid}")) == 1, ans)
+
+# IPN signature
+w = np_obj(pa, 'waiting')
+s_, body, _ = ipn(w, sig='0' * 128); check('IPN with a wrong signature → 401, nothing stored', s_ == 401 and not np_rows(pa['id']), (s_, body))
+s_, body, _ = ipn(w, sig=np_sig(w, b'another_secret_another_secret_xx')); check('IPN signed with another secret → 401', s_ == 401, s_)
+s_, body, _ = req('POST', '/nowpayments/ipn', raw=json.dumps(w).encode()); check('IPN without x-nowpayments-sig → 401', s_ == 401, s_)
+unsorted_sig = hmac.new(NPS, json.dumps(w, separators=(',', ':')).encode(), hashlib.sha512).hexdigest()
+s_, body, _ = ipn(w, sig=unsorted_sig); check('signature over the UNSORTED body → 401 (keys must be sorted)', s_ == 401, s_)
+tam = dict(w); tam['price_amount'] = 2000
+s_, body, _ = ipn(tam, sig=np_sig(w)); check('tampered body with the original signature → 401', s_ == 401, s_)
+m = mark(); s_, body, _ = ipn(w); ev = since(m); r = np_rows(pa['id']); p2 = np_pay(pa['id'])
+check('correctly signed (recursively sorted keys, nested fee) "waiting" IPN → 200 ok, payment stored, NOT credited, no API call',
+      s_ == 200 and body == 'ok' and len(r) == 1 and r[0]['status'] == 'waiting' and r[0]['payment_id'] == str(w['payment_id']) and p2['status'] == 'pending'
+      and p2['credited'] == 0 and not NA.bal() and not np_calls(ev, 'GET'), (s_, body, r, p2))
+s_, body, _ = ipn(w, sig=hmac.new(NPS, np_legacy_canon(w).encode(), hashlib.sha512).hexdigest())
+check('legacy docs form JSON.stringify(params, Object.keys(params).sort()) also accepted', s_ == 200 and np_rows(pa['id'])[0]['ipn_count'] == 2, s_)
+s_, body, _ = ipn(np_obj(pa, 'confirming', pid=w['payment_id']))
+check('"confirming" → top-up status paying', s_ == 200 and np_pay(pa['id'])['status'] == 'paying' and np_pay(pa['id'])['last_status'] == 'confirming')
+s_, body, _ = ipn(np_obj(pa, 'waiting', pid=w['payment_id'])); check('late "waiting" after "confirming" → no regression', np_rows(pa['id'])[0]['status'] == 'confirming' and np_pay(pa['id'])['status'] == 'paying')
+# finished in the IPN, but GET /payment says confirming → not credited (defense in depth)
+fin = np_obj(pa, 'finished', pid=w['payment_id']); np_set(np_obj(pa, 'confirming', pid=w['payment_id']))
+m = mark(); s_, body, _ = ipn(fin); ev = since(m)
+check('"finished" IPN but GET /v1/payment says confirming → NOT credited (API re-check with x-api-key)',
+      s_ == 200 and not NA.bal() and np_pay(pa['id'])['credited'] == 0 and [x for x in np_calls(ev, 'GET') if x['path'] == f"/np/v1/payment/{w['payment_id']}" and x['key_ok']]
+      and sql("SELECT COUNT(*) AS n FROM audit_log WHERE action='nowpayments_status_mismatch'")[0]['n'] == 1, (NA.bal(), np_calls(ev)))
+fpost('/_np/mode/get/500'); m = mark(); s_, body, _ = ipn(fin); ev = since(m)
+check('"finished" IPN while GET /v1/payment fails → 200 ok, NOT credited (cron re-checks later)', s_ == 200 and not NA.bal() and np_rows(pa['id'])[0]['status'] == 'finished', (s_, np_rows(pa['id'])))
+fpost('/_np/mode/get/200'); np_set(fin)
+m = mark(); s_, body, _ = ipn(fin); ev = since(m); p2 = np_pay(pa['id'])
+check('"finished" IPN + GET confirms → credited the invoice amount $20.00 once (topups method nowpayments)',
+      s_ == 200 and abs((NA.bal() or 0) - 20) < 1e-9 and p2['credited'] == 1 and p2['status'] == 'paid' and np_topups(pa['id']) == 1 and np_rows(pa['id'])[0]['credited'] == 1, (NA.bal(), p2))
+um = user_msgs(ev, NA); am = admin_msgs(ev)
+check('customer told: ✅ Payment confirmed, +$20.00, invoice card → paid card', any(x['body']['text'].startswith('✅ Payment confirmed, +$20.00 added. New balance: $20.00') for x in um)
+      and any(x['body'].get('message_id') == NA.mid and 'Payment received' in x['body']['text'] for x in tg(ev, 'editMessageText')), [x['body']['text'][:80] for x in um])
+check('admins told: NOWPayments top-up credited, coin + amount, new balance', am and 'NOWPayments top-up credited' in am[0]['body']['text'] and '13.95' in am[0]['body']['text'] and 'USDTTRC20' in am[0]['body']['text'] and 'New balance: $20.00' in am[0]['body']['text'], am and am[0]['body']['text'])
+check('audit nowpayments_credit with payment id, coin, amounts', sql(f"SELECT COUNT(*) AS n FROM audit_log WHERE action='nowpayments_credit' AND json_extract(details_json,'$.payment_id')='{pa['id']}' AND json_extract(details_json,'$.np_payment_id')='{w['payment_id']}' AND json_extract(details_json,'$.pay_currency')='usdttrc20'")[0]['n'] == 1)
+with cf.ThreadPoolExecutor(4) as ex: rs = list(ex.map(lambda _: ipn(fin), range(4)))
+m = mark(); ipn(fin); ev = since(m)
+check('repeated + concurrent "finished" IPNs → still credited exactly once, no new messages', all(r[0] == 200 for r in rs) and abs(NA.bal() - 20) < 1e-9 and np_topups(pa['id']) == 1 and not admin_msgs(ev) and not user_msgs(ev, NA), (NA.bal(), np_topups(pa['id'])))
+ex2 = np_obj(pa, 'finished'); np_set(ex2)
+m = mark(); ipn(ex2); ev = since(m); ipn(ex2)
+check('second finished payment for an already credited top-up → NOT credited, admins told once ("extra payment")',
+      abs(NA.bal() - 20) < 1e-9 and np_topups(pa['id']) == 1 and len([x for x in admin_msgs(ev) if 'extra payment' in x['body']['text']]) == 1
+      and sql(f"SELECT flag FROM np_payments WHERE payment_id='{ex2['payment_id']}'")[0]['flag'] == 'extra', NA.bal())
+s_, body, _ = ipn(np_obj(pa, 'waiting', order_id='np_unknown_order_123', invoice_id=999))
+check('signed IPN for an unknown order → 200 ok, audited as unmatched, nothing credited', s_ == 200 and sql("SELECT COUNT(*) AS n FROM audit_log WHERE action='nowpayments_ipn_unmatched'")[0]['n'] >= 1)
+NB = User(555061, 'Bia', 'bia'); NB.msg('/start'); ev, _, _, pb = np_new_invoice(NB, 25)
+bad_inv = np_obj(pb, 'finished', invoice_id=12345); np_set(bad_inv)
+s_, body, _ = ipn(bad_inv); check('IPN whose invoice_id differs from our invoice → mismatch, not credited', s_ == 200 and not NB.bal() and not np_rows(pb['id']), np_rows(pb['id']))
+# partially paid
+part = np_obj(pb, 'partially_paid', actually=7.5, due=24.9)
+m = mark(); ipn(part); ev = since(m); ipn(part); ev2 = since(m)
+check('partially_paid → not credited, status underpaid, customer + admins told once',
+      not NB.bal() and np_pay(pb['id'])['status'] == 'underpaid' and any('arrived only partially (7.5 of 24.9 USDTTRC20)' in x['body']['text'] for x in user_msgs(ev, NB))
+      and len([x for x in admin_msgs(ev2) if 'partially paid' in x['body']['text']]) == 1, (np_pay(pb['id']), [x['body']['text'][:90] for x in tg(ev2, 'sendMessage')]))
+# finished but less than 98 % of the due amount arrived → review
+short = np_obj(pb, 'finished', pid=part['payment_id'], actually=20.0, due=24.9); np_set(short)
+m = mark(); ipn(short); ev = since(m)
+check('finished but actually_paid < 98 % of pay_amount → review, not credited, admins told', not NB.bal() and np_pay(pb['id'])['status'] == 'review' and np_pay(pb['id'])['last_status'] == 'underpaid_finished'
+      and any('needs review' in x['body']['text'] for x in admin_msgs(ev)), np_pay(pb['id']))
+# price mismatch → review
+NC = User(555062, 'Caio', 'caio'); NC.msg('/start'); _, _, _, pc = np_new_invoice(NC, 30)
+pm = np_obj(pc, 'finished', price=3000); np_set(pm); ipn(pm)
+check('finished with a different price_amount than our top-up → review, not credited', not NC.bal() and np_pay(pc['id'])['status'] == 'review' and np_pay(pc['id'])['last_status'] == 'price_mismatch', np_pay(pc['id']))
+# missed IPN: cron fallback
+ND = User(555063, 'Duda', 'duda'); ND.msg('/start'); _, _, _, pd = np_new_invoice(ND, 14)
+wd = np_obj(pd, 'waiting'); ipn(wd); np_set(np_obj(pd, 'finished', pid=wd['payment_id']))
+ev = cron(); check('cron: a payment updated < 3 min ago is not polled yet', not [x for x in np_calls(ev, 'GET') if x['path'].endswith(str(wd['payment_id']))] and not ND.bal())
+sql(f"UPDATE np_payments SET updated_at='2026-01-01T00:00:00.000Z' WHERE payment_id='{wd['payment_id']}'")
+m = mark(); ev = cron()
+check('missed "finished" IPN → cron polls GET /v1/payment and credits $14.00, customer + admins told',
+      abs((ND.bal() or 0) - 14) < 1e-9 and np_topups(pd['id']) == 1 and any(x['body']['text'].startswith('✅ Payment confirmed, +$14.00') for x in user_msgs(ev, ND)) and admin_msgs(ev), ND.bal())
+sql(f"UPDATE np_payments SET updated_at='2026-01-01T00:00:00.000Z', checked_at=NULL WHERE payment_id='{wd['payment_id']}'")
+ev = cron(); check('credited payments are not polled again, no double credit', not [x for x in np_calls(ev, 'GET') if x['path'].endswith(str(wd['payment_id']))] and np_topups(pd['id']) == 1)
+# user "check status" button
+NE = User(555064, 'Edu', 'edu'); NE.msg('/start'); ev, _, _, pe = np_new_invoice(NE, 15); NE.mid = last_screen(ev)['mid']
+ev, ans = NE.cb(f"tuchk:{pe['id']}")
+check('check status before any payment → "No payment seen yet" toast, no API call', ans and 'No payment seen yet' in ans[0]['body'].get('text', '') and not np_calls(ev, 'GET'), ans)
+we = np_obj(pe, 'waiting'); ipn(we); np_set(np_obj(pe, 'finished', pid=we['payment_id']))
+ev, ans = NE.cb(f"tuchk:{pe['id']}")
+check('"I\'ve paid · Check status" → GET /v1/payment → credited $15.00', ans and 'Payment confirmed' in ans[0]['body'].get('text', '') and abs((NE.bal() or 0) - 15) < 1e-9 and np_topups(pe['id']) == 1, (ans, NE.bal()))
+# failed
+NF = User(555065, 'Fabi', 'fabi'); NF.msg('/start'); _, _, _, pf = np_new_invoice(NF, 16)
+m = mark(); ipn(np_obj(pf, 'failed')); ev = since(m)
+check('failed → status failed, not credited, customer + admins told', np_pay(pf['id'])['status'] == 'failed' and not NF.bal() and any('failed' in x['body']['text'] for x in user_msgs(ev, NF)) and any('payment failed' in x['body']['text'] for x in admin_msgs(ev)), np_pay(pf['id']))
+# expiry of an invoice nobody paid
+NG = User(555066, 'Gil', 'gil'); NG.msg('/start'); _, _, _, pg = np_new_invoice(NG, 17)
+sql(f"UPDATE payments SET expires_at='2026-01-01T00:00:00.000Z' WHERE id='{pg['id']}'"); cron()
+check('unpaid invoice past its 24 h → expired by the cron', np_pay(pg['id'])['status'] == 'expired')
+late = np_obj(pg, 'finished'); np_set(late); ipn(late)
+check('late finished payment on an expired invoice → still credited', abs((NG.bal() or 0) - 17) < 1e-9 and np_pay(pg['id'])['credited'] == 1, NG.bal())
+# cancel
+NH = User(555067, 'Hugo', 'hugo'); NH.msg('/start'); ev, _, _, ph = np_new_invoice(NH, 18); NH.mid = last_screen(ev)['mid']
+ev, ans = NH.cb(f"tux:{ph['id']}"); check('❌ Cancel works on a NOWPayments invoice', np_pay(ph['id'])['status'] == 'canceled' and ans and 'canceled' in ans[0]['body'].get('text', '').lower(), ans)
+# OxaPay confirm screen offers NOWPayments as an alternative (amount ≥ minimum only)
+ev, _, scr = nav(NH, 'tuc:25', 'OxaPay confirm $25', ['Confirm top-up'], ['tun:25', 'npn:25'], move=True)
+ev, _, scr = nav(NH, 'tuc:5', 'OxaPay confirm $5', ['Confirm top-up'], ['tun:5'])
+check('below the NOWPayments minimum → no NOWPayments alternative', 'npn:5' not in cbdata(scr), cbdata(scr))
+# OxaPay off → typed amounts and top-up menu use NOWPayments
+sql("UPDATE settings SET value='0' WHERE key='crypto_topup_enabled'")
+ev = NH.msg('22'); s_ = last_screen(ev)
+check('OxaPay disabled: typed amount 22 → NOWPayments confirm', s_ and '🪙 <b>Confirm top-up</b>' in s_['body']['text'] and 'npn:22' in cbdata(s_), s_ and s_['body']['text'])
+ev = NH.msg('9'); s_ = last_screen(ev)
+check('OxaPay disabled: typed amount 9 → NOWPayments keypad with the minimum explained', s_ and 'Minimum for NOWPayments is $14.00' in s_['body']['text'] and 'nk:1' in cbdata(s_), s_ and s_['body']['text'])
+ev = NH.msg('/topup'); s_ = last_screen(ev)
+check('OxaPay disabled: top-up menu → NOWPayments + Binance only', s_ and 'np' in cbdata(s_) and 'bn' in cbdata(s_) and 'kp:' not in cbdata(s_), cbdata(s_))
+sql("UPDATE settings SET value='1' WHERE key='crypto_topup_enabled'")
+ev = NH.msg('/start np_paid'); s_ = last_screen(ev)
+check('return from the NOWPayments page (start=np_paid) → latest NOWPayments invoice card', s_ and 'Top-up invoice · $18.00' in s_['body']['text'], s_ and s_['body']['text'])
+s_, body, _ = req('PUT', '/admin/api/settings', {'nowpayments_enabled': '0'}, AH)
+s_ = last_screen(NH.msg('/topup')); check('nowpayments_enabled=0 → no 🪙 NOWPayments in top-up', s_ and 'np' not in cbdata(s_) and 'NOWPayments' not in s_['body']['text'])
+req('PUT', '/admin/api/settings', {'nowpayments_enabled': '1'}, AH)
+# admin panel
+s_, body, _ = req('GET', '/admin/api/nowpayments/status', None, AH); d = json.loads(body)
+check('panel: NOWPayments status (available, min 14 auto, IPN URL, no secrets)', s_ == 200 and d['available'] and d['min'] == 14 and d['min_source'] == 'auto'
+      and d['ipn_url'].endswith('/nowpayments/ipn') and 'np_test' not in body, d)
+s_, body, _ = req('PUT', '/admin/api/settings', {'nowpayments_min': '0.5'}, AH); check('settings: NOWPayments minimum 0.5 → 400', s_ == 400, (s_, body))
+req('PUT', '/admin/api/settings', {'nowpayments_min': '20'}, AH)
+s_, body, _ = req('GET', '/admin/api/nowpayments/status', None, AH); d = json.loads(body); check('manual minimum 20 overrides the automatic one', d['min'] == 20 and d['min_source'] == 'manual', d)
+req('PUT', '/admin/api/settings', {'nowpayments_min': ''}, AH)
+s_, body, _ = req('POST', '/admin/api/nowpayments/test', None, AH); d = json.loads(body)
+check('panel: "Testar conexão" → GET /status ok + fresh minimum', s_ == 200 and d['ok'] and d['min']['usd'] == 14 and d['min']['per_coin']['trx'] == 12.3, d)
+s_, body, _ = req('POST', '/admin/api/nowpayments/test-invoice', None, AH); d = json.loads(body)
+check('panel: test invoice at the minimum, owned by the first ADMIN_IDS account', s_ == 200 and d['amount'] == 14 and d['invoice_url'].startswith('https://nowpayments.io/payment/?iid=')
+      and sql(f"SELECT telegram_user_id FROM payments WHERE id='{d['payment_id']}'")[0]['telegram_user_id'] == 1, d)
+s_, body, _ = req('GET', '/admin/api/payments?q=' + str(w['payment_id']), None, AH); d = json.loads(body)
+check('panel payments: search by NOWPayments payment id, provider + payment info shown', s_ == 200 and d['total'] == 1 and d['payments'][0]['provider'] == 'nowpayments' and d['payments'][0]['id'] == pa['id'] and 'finished' in (d['payments'][0]['np_info'] or ''), d)
+we2 = np_obj(ph, 'waiting'); ipn(we2); np_set(np_obj(ph, 'finished', pid=we2['payment_id']))
+s_, body, _ = req('POST', f"/admin/api/payments/{ph['id']}/sync", None, AH); d = json.loads(body)
+check('panel "Sincronizar" on a NOWPayments row → GET /payment → credited', s_ == 200 and d['result'] == 'credited' and abs((NH.bal() or 0) - 18) < 1e-9, d)
+s_, body, _ = req('GET', '/admin/api/payments?status=failed', None, AH); check('panel payments filter "failed"', s_ == 200 and json.loads(body)['total'] >= 1)
+s_, body, _ = req('GET', '/admin/app.js', None); check('panel app.js: NOWPayments settings card + provider label', 'Recarga via NOWPayments' in body and 'NOWPayments: ' in body and 'Testar conexão com a NOWPayments' in body)
+ev = NH.msg('/profile'); s_ = last_screen(ev); check('profile lists "NOWPayments top-up"', s_ and 'NOWPayments top-up' in s_['body']['text'], s_ and s_['body']['text'])
+
 # second Worker instance WITHOUT BINANCE_API_KEY / BINANCE_API_SECRET → option hidden, nothing happens
 BASE2 = 'http://127.0.0.1:8798'
 class User2(User):
@@ -637,6 +845,10 @@ s_, body, h = req('POST', '/admin/api/login', {'password': 'pw_local'}, {'X-Requ
 AH2 = {'Cookie': h.get('Set-Cookie').split(';')[0], 'X-Requested-With': 'liveira-admin'}
 s_, body, _ = req('GET', '/admin/api/settings', None, AH2, base=BASE2); check('panel (no secrets): binance_configured=false', json.loads(body)['info']['binance_configured'] is False)
 s_, body, _ = req('POST', '/admin/api/binance/test', None, AH2, base=BASE2); check('panel (no secrets): test → unconfigured, no request', json.loads(body)['reason'] == 'unconfigured')
+check('no NOWPayments secrets → no 🪙 NOWPayments option', 'np' not in cbdata(scr) and 'NOWPayments' not in scr['body']['text'], scr['body']['text'])
+s_, body, _ = req('POST', '/nowpayments/ipn', raw=b'{"payment_id":1}', headers={'x-nowpayments-sig': 'a' * 128}, base=BASE2)
+check('no NOWPayments secrets → IPN route answers 503', s_ == 503, s_)
+s_, body, _ = req('GET', '/admin/api/nowpayments/status', None, AH2, base=BASE2); check('panel (no secrets): NOWPayments not configured / hidden', json.loads(body)['configured'] is False and json.loads(body)['available'] is False)
 
 ans_all = [e for e in logs() if e.get('tg') == 'answerCallbackQuery']
 ids = [e['body']['callback_query_id'] for e in ans_all]

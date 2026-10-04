@@ -4,13 +4,15 @@
  * - Telegram bot webhook (POST /telegram, /webhook)
  * - Admin panel (/admin, /admin/api/*)
  * - OxaPay payment callback (POST /oxapay/callback)
- * - Cron (every minute): re-check pending Binance Pay claims (src/binance.js)
+ * - NOWPayments IPN (POST /nowpayments/ipn, HMAC-SHA512 with the IPN secret; src/nowpayments.js)
+ * - Cron (every minute): re-check pending Binance Pay claims (src/binance.js) and NOWPayments payments
  */
 import { CORS_HEADERS, json } from "./util.js";
 import { handleTelegramUpdate } from "./bot.js";
 import { handleAdmin } from "./admin.js";
 import { handleOxapayCallback } from "./oxapay.js";
 import { binanceCron } from "./binance.js";
+import { handleNpIpn, npCron } from "./nowpayments.js";
 
 function unauthorized() {
   return json({ error: "Unauthorized" }, 401);
@@ -137,6 +139,11 @@ export default {
     } catch (err) {
       console.error("binance cron error", err && err.stack ? err.stack : err);
     }
+    try {
+      await npCron(env);
+    } catch (err) {
+      console.error("nowpayments cron error", err && err.stack ? err.stack : err);
+    }
   },
 
   async fetch(request, env, ctx) {
@@ -176,6 +183,17 @@ export default {
       } catch (err) {
         console.error("oxapay callback error", err && err.stack ? err.stack : err);
         return new Response("error", { status: 500 }); // non-200 → OxaPay retries
+      }
+    }
+
+    // NOWPayments IPN (x-nowpayments-sig = HMAC-SHA512 of the key-sorted JSON body, IPN secret)
+    if (path === "/nowpayments/ipn") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      try {
+        return await handleNpIpn(request, env, ctx);
+      } catch (err) {
+        console.error("nowpayments ipn error", err && err.stack ? err.stack : err);
+        return new Response("error", { status: 500 }); // non-200 → NOWPayments may resend; the cron also re-checks
       }
     }
 

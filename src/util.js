@@ -77,6 +77,12 @@ export const SETTING_DEFAULTS = {
   binance_pay_id: "",
   binance_currencies: "USDT",
   binance_max: "1000",
+  // NOWPayments hosted invoices (src/nowpayments.js): shown only when NOWPAYMENTS_API_KEY/NOWPAYMENTS_IPN_SECRET are set.
+  // nowpayments_min: manual minimum in USD ("" = automatic, from GET /v1/min-amount, cached in nowpayments_min_auto*).
+  nowpayments_enabled: "1",
+  nowpayments_min: "",
+  nowpayments_min_auto: "",
+  nowpayments_min_auto_at: "",
 };
 
 export const EDITABLE_SETTINGS = [
@@ -92,6 +98,8 @@ export const EDITABLE_SETTINGS = [
   "topup_max",
   "accepted_currencies",
   "binance_enabled",
+  "nowpayments_enabled",
+  "nowpayments_min",
   "binance_pay_id",
   "binance_currencies",
   "binance_max",

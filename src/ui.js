@@ -119,6 +119,8 @@ const STATUS_LINE = {
   refunding: "↩️ Being refunded",
   refunded: "↩️ Refunded",
   error: "⚠️ Could not be created",
+  failed: "❌ Payment failed",
+  review: "🟠 Under review by the shop — not credited automatically",
 };
 
 /** Short network hint for the accepted coins ("" if nothing useful to add). */
@@ -136,6 +138,16 @@ export function howItWorks(s, { pickAmount = false } = {}) {
   );
 }
 
+/** "How it works" for NOWPayments invoices (the customer chooses coin and network on the hosted page). */
+export function howItWorksNp() {
+  return (
+    "<blockquote><b>How it works</b>\n" +
+    "1. Tap <b>💳 Pay now</b> and choose any coin and network on the secure NOWPayments page.\n" +
+    "2. Send the exact amount shown there.\n" +
+    "3. Your balance is credited automatically once the network confirms the payment.</blockquote>"
+  );
+}
+
 export function resumeParts(resume) {
   const m = /^([a-z0-9_-]{1,32}):(\d{1,4})$/.exec(String(resume || ""));
   return m ? { pid: m[1], days: Number(m[2]) } : null;
@@ -145,21 +157,24 @@ export function invoiceCard(pay, s, supportLine) {
   const cur = s.currency_symbol || "$";
   const st = pay.status;
   const open = st === "pending" || st === "paying";
-  let text = `🧾 <b>Top-up invoice · ${e(money(pay.amount_usd, cur))}</b>\n\n`;
+  const np = pay.provider === "nowpayments";
+  let text = `🧾 <b>Top-up invoice · ${e(money(pay.amount_usd, cur))}</b>${np ? " · NOWPayments" : ""}\n\n`;
   text += `Status: <b>${STATUS_LINE[st] || e(st)}</b>\n`;
   if (open && pay.expires_at) {
-    text += `⏳ Expires at <b>${e(fmtTimeBrt(pay.expires_at))}</b> (${tgRelTime(pay.expires_at, "60 min")})\n`;
+    text += np
+      ? `⏳ Open until <b>${e(fmtTimeBrt(pay.expires_at))}</b> (${tgRelTime(pay.expires_at, "24 h")})\n`
+      : `⏳ Expires at <b>${e(fmtTimeBrt(pay.expires_at))}</b> (${tgRelTime(pay.expires_at, "60 min")})\n`;
   }
   text += "\n";
-  if (open) text += howItWorks(s) + "\n";
+  if (open) text += (np ? howItWorksNp() : howItWorks(s)) + "\n";
   if (st === "canceled") text += "<i>If you already sent a payment, it will still be credited automatically.</i>\n\n";
-  if (st === "underpaid" || st === "refunding" || st === "refunded") text += `${supportLine}\n\n`;
+  if (["underpaid", "refunding", "refunded", "failed", "review"].includes(st)) text += `${supportLine}\n\n`;
   text += `Ref: <code>${e(pay.id)}</code>`;
   const rows = [];
   if (open && pay.pay_link) rows.push([urlBtn("💳 Pay now", pay.pay_link, "success")]);
   if (open || st === "canceled") rows.push([btn("🔄 I've paid · Check status", `tuchk:${pay.id}`, "primary")]);
   if (st === "pending") rows.push([btn("❌ Cancel", `tux:${pay.id}`, "danger")]);
-  if (["expired", "canceled", "error"].includes(st)) rows.push([btn("💰 New top-up", "topup", "success")]);
+  if (["expired", "canceled", "error", "failed"].includes(st)) rows.push([btn("💰 New top-up", "topup", "success")]);
   rows.push([HOME()]);
   return { text, reply_markup: kb(rows) };
 }

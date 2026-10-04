@@ -148,7 +148,7 @@ export async function oxapayAcceptedCoins(env) {
 }
 
 let BOT_USERNAME = null;
-async function botUsername(env) {
+export async function botUsername(env) {
   if (BOT_USERNAME) return BOT_USERNAME;
   try {
     const r = await tgApi(env, "getMe", {});
@@ -187,7 +187,7 @@ export async function createTopupInvoice(env, { userId, chatId, amount, shopName
   resume = /^[a-z0-9_-]{1,32}:\d{1,4}$/.test(String(resume || "")) ? String(resume) : null;
   // Re-use a fresh open invoice for the same amount (double taps, re-opened flows).
   const reuse = await env.DB.prepare(
-    `SELECT * FROM payments WHERE telegram_user_id=? AND amount_usd=? AND status='pending' AND credited=0
+    `SELECT * FROM payments WHERE provider='oxapay' AND telegram_user_id=? AND amount_usd=? AND status='pending' AND credited=0
        AND pay_link IS NOT NULL AND expires_at > ? ORDER BY created_at DESC LIMIT 1`
   )
     .bind(userId, amount, new Date(Date.now() + 15 * 60000).toISOString())
@@ -375,11 +375,11 @@ export async function setPaymentMessage(env, id, chatId, messageId) {
 /** User cancels an unpaid invoice (local only: a late payment is still credited). */
 export async function cancelPayment(env, id, userId) {
   const r = await env.DB.prepare(
-    "UPDATE payments SET status='canceled', updated_at=? WHERE id=? AND telegram_user_id=? AND credited=0 AND status='pending' AND provider='oxapay'"
+    "UPDATE payments SET status='canceled', updated_at=? WHERE id=? AND telegram_user_id=? AND credited=0 AND status='pending' AND provider IN ('oxapay','nowpayments')"
   )
     .bind(nowIso(), id, userId)
     .run();
-  if (r.meta?.changes === 1) await audit(env, `tg:${userId}`, "oxapay_invoice_canceled", { payment_id: id });
+  if (r.meta?.changes === 1) await audit(env, `tg:${userId}`, id.startsWith("np_") ? "nowpayments_invoice_canceled" : "oxapay_invoice_canceled", { payment_id: id });
   return r.meta?.changes === 1;
 }
 

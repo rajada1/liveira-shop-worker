@@ -1,4 +1,4 @@
-"""Fake OxaPay + fake Binance Pay history API + fake Telegram Bot API (port 9911) with Bot API validation.
+"""Fake OxaPay + fake Binance Pay history API + fake NOWPayments (/np/v1) + fake Telegram Bot API (port 9911) with Bot API validation.
 Telegram: stores messages per chat, returns real-looking message ids, and answers
 'message is not modified' / 'message to edit not found' like the real API.
 Every request is logged to /tmp/lvtest/fake.log; spec violations go to 'violation' entries."""
@@ -13,6 +13,12 @@ ACCEPTED = ['USDT']
 # Binance: GET /sapi/v1/pay/transactions (USER_DATA, HMAC-SHA256 over the query string, header X-MBX-APIKEY)
 BN_KEY, BN_SECRET = 'bn_test_key', b'bn_test_secret'
 BN_TXS = []; BN_MODE = {'status': 200, 'retry_after': None}
+# NOWPayments: x-api-key; POST /np/v1/invoice, GET /np/v1/payment/{id}, /np/v1/min-amount, /np/v1/status
+NP_KEY = 'np_test_key'; NP_INVOICES, NP_PAYS = {}, {}; NP_MODE = {'get': 200, 'invoice': 200}
+NP_MIN = {'usdttrc20': 11.42, 'usdtbsc': 12.13, 'ltc': 12.0, 'trx': 12.3}
+np_counter = itertools.count(5000000001)
+NP_DOC = {'price_amount', 'price_currency', 'pay_currency', 'ipn_callback_url', 'order_id', 'order_description', 'success_url',
+          'cancel_url', 'partially_paid_url', 'is_fixed_rate', 'is_fee_paid_by_user'}
 ALLOWED_TAGS = {'b','strong','i','em','u','ins','s','strike','del','span','tg-spoiler','a','tg-emoji','tg-time','code','pre','blockquote'}
 BTN_ACTIONS = {'url','callback_data','web_app','login_url','switch_inline_query','switch_inline_query_current_chat','switch_inline_query_chosen_chat','copy_text','callback_game','pay','disabled'}
 
@@ -96,7 +102,22 @@ class H(BaseHTTPRequestHandler):
         lo, hi = int(params.get('startTime', 0)), int(params.get('endTime', 10**15)); lim = min(int(params.get('limit', 100)), 100)
         data = sorted([t for t in BN_TXS if lo <= t['transactionTime'] <= hi], key=lambda t: -t['transactionTime'])[:lim]
         return self._send({'code': '000000', 'message': 'success', 'data': data, 'success': True})
+    def np_get(self):
+        path, _, q = self.path.partition('?'); params = dict(urllib.parse.parse_qsl(q))
+        log({'np': 'GET', 'path': path, 'params': params, 'key_ok': self.headers.get('x-api-key') == NP_KEY})
+        if self.headers.get('x-api-key') != NP_KEY: return self._send({'statusCode': 403, 'code': 'INVALID_API_KEY', 'message': 'Invalid api key'}, 403)
+        if path == '/np/v1/status': return self._send({'message': 'OK'})
+        if path == '/np/v1/min-amount':
+            c = params.get('currency_from', '')
+            return self._send({'currency_from': c, 'currency_to': 'false', 'min_amount': 1.0, 'fiat_equivalent': NP_MIN.get(c, 11.0)})
+        if path.startswith('/np/v1/payment/'):
+            if NP_MODE['get'] != 200: return self._send({'statusCode': NP_MODE['get'], 'message': 'fake error'}, NP_MODE['get'])
+            pid = path.rsplit('/', 1)[1]
+            if pid not in NP_PAYS: return self._send({'statusCode': 404, 'code': 'PAYMENT_NOT_FOUND', 'message': 'Payment not found'}, 404)
+            return self._send(NP_PAYS[pid])
+        return self._send({'statusCode': 404, 'message': 'not found'}, 404)
     def do_GET(self):
+        if self.path.startswith('/np/v1/'): return self.np_get()
         if self.path.startswith('/sapi/v1/pay/transactions'): return self.binance()
         if self.path == '/v1/payment/accepted-currencies':
             log({'oxapay': 'accepted', 'key': self.headers.get('merchant_api_key')})
@@ -116,6 +137,24 @@ class H(BaseHTTPRequestHandler):
         self._send({'ok': False}, 404)
     def do_POST(self):
         n = int(self.headers.get('Content-Length') or 0); body = self.rfile.read(n).decode(errors='replace') if n else ''
+        if self.path == '/np/v1/invoice':
+            d = json.loads(body); iid = str(next(np_counter))
+            for k in d:
+                if k not in NP_DOC: log({'violation': ['undocumented NOWPayments invoice field ' + k], 'method': 'np invoice', 'body': d})
+            log({'np': 'invoice', 'key_ok': self.headers.get('x-api-key') == NP_KEY, 'body': d, 'invoice_id': iid})
+            if self.headers.get('x-api-key') != NP_KEY: return self._send({'statusCode': 403, 'code': 'INVALID_API_KEY', 'message': 'Invalid api key'}, 403)
+            if NP_MODE['invoice'] != 200: return self._send({'statusCode': NP_MODE['invoice'], 'message': 'fake error'}, NP_MODE['invoice'])
+            if not isinstance(d.get('price_amount'), (int, float)) or d.get('price_currency') != 'usd':
+                return self._send({'statusCode': 400, 'code': 'INVALID_REQUEST_PARAMS', 'message': 'bad price'}, 400)
+            NP_INVOICES[iid] = d
+            return self._send({'id': iid, 'token_id': 'tok' + iid, 'order_id': d.get('order_id'), 'order_description': d.get('order_description'),
+                               'price_amount': str(d['price_amount']), 'price_currency': 'usd', 'pay_currency': None, 'ipn_callback_url': d.get('ipn_callback_url'),
+                               'invoice_url': 'https://nowpayments.io/payment/?iid=' + iid, 'success_url': d.get('success_url'), 'cancel_url': d.get('cancel_url'),
+                               'created_at': '2026-10-04T10:00:00.000Z', 'updated_at': '2026-10-04T10:00:00.000Z', 'is_fixed_rate': False, 'is_fee_paid_by_user': False})
+        if self.path == '/_np/pay':
+            o = json.loads(body); NP_PAYS[str(o['payment_id'])] = o; return self._send({'ok': True})
+        if self.path.startswith('/_np/mode/'):
+            _, _, _, k, st = self.path.split('/'); NP_MODE[k] = int(st); return self._send({'ok': True})
         if self.path == '/v1/payment/invoice':
             d = json.loads(body); tid = str(next(tid_counter))
             # Documented v1 generate-invoice fields only (docs.oxapay.com/api-reference/payment/generate-invoice)

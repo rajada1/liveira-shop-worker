@@ -1,5 +1,57 @@
 # Deploy notes (owner)
 
+## Release: NOWPayments top-ups (hosted invoice, any coin) — 2026-10-04
+
+The customer taps **💰 Top up → 🪙 Pay with crypto (NOWPayments)** (also offered as "🪙 Other coins via NOWPayments" on the
+OxaPay confirm screen, and used automatically for typed amounts / `/topup <amount>` when OxaPay is off), picks a preset
+or types a USD amount, confirms, and gets a **hosted NOWPayments invoice** (`POST /v1/invoice`, `price_currency=usd`,
+`order_id=np_…` unique per top-up, `ipn_callback_url` = **`https://liveira-shop.kelumayou.workers.dev/nowpayments/ipn`**,
+success/partial → `t.me/<bot>?start=np_paid`, cancel → `?start=topup`). On the NOWPayments page the customer chooses the
+coin and network. Code: `src/nowpayments.js`; table `np_payments` (migration `0009_nowpayments.sql`, idempotent).
+
+**Minimum:** `max(topup_min, nowpayments_min)`; `nowpayments_min` empty = automatic: `GET /v1/min-amount` with
+`fiat_equivalent=usd` and `currency_to=usdttrc20` (payout; override with var `NOWPAYMENTS_PAYOUT_CURRENCY`) for usdttrc20/usdtbsc/ltc/trx, the highest × 1.1, rounded up (cached 6 h, refreshed by the cron;
+fallback $15 until the first refresh). Live on 2026-10-04 that is **$14**. Presets = the minimum + the regular presets above it.
+Max = `topup_max`. At most 5 open NOWPayments invoices per user per hour; an open same-amount invoice without payments is reused.
+
+**IPN** (`POST /nowpayments/ipn`): `x-nowpayments-sig` must equal HMAC-SHA512 (hex) of the JSON body with keys sorted
+recursively, key = `NOWPAYMENTS_IPN_SECRET` → otherwise 401. Matched by `order_id` (+ invoice id must match). Each
+`payment_id` is stored in `np_payments`. Crediting rules:
+- only `finished`, and only after re-reading `GET /v1/payment/{id}` with the API key (defense in depth; the API answer wins);
+- `price_amount`/`price_currency` must equal the invoice (USD ±0.01) and `actually_paid ≥ 98 % of pay_amount` → credit
+  **the invoice USD amount** (`price_amount`). Paid less (finished with < 98 %) or price mismatch → **review**, no credit, admins
+  notified (if it's fine, adjust the user's balance manually in the panel / `/addbal`). Overpaid > 102 % → credited the invoice amount, admins told about the extra.
+- `partially_paid` → status **underpaid**, no credit, customer + admins notified (customer can pay the rest on the same page;
+  a later `finished` credits normally).
+- `failed` / `refunded` → status failed/refunded + notices; `expired` → expired (unless another payment on the invoice is active);
+  `confirming/confirmed/sending` → "paying"; `waiting` → only stored.
+- exactly once per top-up: nonce batch (`topups.method='nowpayments'`, `audit_log` `nowpayments_credit`, `np_payments.credited=1`);
+  repeated / concurrent IPNs are no-ops; a second finished payment on an already credited invoice → flagged for admins, not credited.
+- unknown `order_id` → 200 "ok" + audit `nowpayments_ipn_unmatched` (so NOWPayments stops retrying).
+
+**Fallback cron (every minute):** refreshes the minimum; re-polls up to 5 known payments (`np_payments`) without news for
+3 min (created < 3 days ago, not credited/flagged) through the same idempotent path; marks invoices pending > 24 h as expired
+(a late `finished` IPN still credits). 5 failed polls → status `unknown`. 🔄 Check status in the bot and "Sincronizar" in the panel
+force a poll. Limitation: a payment that never sent *any* IPN has no known `payment_id` (listing by invoice needs the
+dashboard JWT login) — it's credited once any IPN arrives, or manually.
+
+Panel (Configurações → "Recarga via NOWPayments"): enable/disable, minimum (empty = automatic), "Testar conexão",
+"Criar fatura de teste (valor mínimo)" (real invoice for the first ADMIN_IDS user, no Telegram message; don't pay it).
+Pagamentos shows provider "NOWPayments" with coin/paid info and the invoice link.
+
+Secrets (piped, never printed):
+```bash
+printf '%s' "$NOWPAYMENTS_API_KEY"   | npx wrangler secret put NOWPAYMENTS_API_KEY
+printf '%s' "$NOWPAYMENTS_IPN_SECRET" | npx wrangler secret put NOWPAYMENTS_IPN_SECRET
+```
+Without them the option is hidden and the IPN route answers 503.
+Steps for this release: (1) secrets; (2) `npx wrangler d1 execute liveira-shop --remote --file migrations/0009_nowpayments.sql`;
+(3) `npx wrangler deploy` (bindings and cron unchanged). All applied 2026-10-04.
+
+NOWPayments dashboard to-dos: payout wallet/currency (Store settings → payout), keep the IPN secret matching the Worker secret
+(regenerating it there requires updating the Worker secret), optional IPN URL above (it's also sent per invoice), and
+fiat/card on-ramp if wanted (see report).
+
 ## Release: Binance Pay top-ups (auto-verified) — 2026-10-04
 
 The customer taps **💰 Top up → 🟡 Binance Pay**, sends USDT via Binance Pay to the Pay ID (setting `binance_pay_id`,
@@ -53,8 +105,8 @@ Migration `0008_binance_order_id.sql` (adds `binance_tx.order_id`, not idempoten
 
 Notes / caveats: if a cross-bot setup ever verifies the same Binance account from another bot (@LiveiraStore_bot), the
 duplicate protection is per database — don't auto-verify the same account in both bots. Binance answers 451 from
-restricted regions (e.g. US IPs); Cloudflare runs the request near Telegram's webhook servers (EU), and the cron may run
-elsewhere — a 451 only pauses checks for 10 min, the claim stays pending.
+restricted regions (e.g. US IPs) — that's why calls go through the Tokyo egress Worker above; if Binance ever answers
+451/403 again, checks pause for 10 min and the claim stays pending.
 
 ---
 
