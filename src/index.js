@@ -5,7 +5,8 @@
  * - Admin panel (/admin, /admin/api/*)
  * - OxaPay payment callback (POST /oxapay/callback)
  * - NOWPayments IPN (POST /nowpayments/ipn, HMAC-SHA512 with the IPN secret; src/nowpayments.js)
- * - Cron (every minute): re-check pending Binance Pay claims (src/binance.js) and NOWPayments payments
+ * - Stripe webhook (POST /stripe/webhook, Stripe-Signature HMAC-SHA256; src/stripe.js)
+ * - Cron (every minute): re-check pending Binance Pay claims (src/binance.js), NOWPayments payments and Stripe sessions
  */
 import { CORS_HEADERS, json } from "./util.js";
 import { handleTelegramUpdate } from "./bot.js";
@@ -13,6 +14,7 @@ import { handleAdmin } from "./admin.js";
 import { handleOxapayCallback } from "./oxapay.js";
 import { binanceCron } from "./binance.js";
 import { handleNpIpn, npCron } from "./nowpayments.js";
+import { handleStripeWebhook, spCron } from "./stripe.js";
 
 function unauthorized() {
   return json({ error: "Unauthorized" }, 401);
@@ -144,6 +146,11 @@ export default {
     } catch (err) {
       console.error("nowpayments cron error", err && err.stack ? err.stack : err);
     }
+    try {
+      await spCron(env);
+    } catch (err) {
+      console.error("stripe cron error", err && err.stack ? err.stack : err);
+    }
   },
 
   async fetch(request, env, ctx) {
@@ -194,6 +201,17 @@ export default {
       } catch (err) {
         console.error("nowpayments ipn error", err && err.stack ? err.stack : err);
         return new Response("error", { status: 500 }); // non-200 → NOWPayments may resend; the cron also re-checks
+      }
+    }
+
+    // Stripe webhook (Stripe-Signature: t=…,v1=HMAC-SHA256("<t>.<raw body>", endpoint secret))
+    if (path === "/stripe/webhook") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      try {
+        return await handleStripeWebhook(request, env);
+      } catch (err) {
+        console.error("stripe webhook error", err && err.stack ? err.stack : err);
+        return new Response("error", { status: 500 }); // non-2xx → Stripe retries; the cron also re-checks sessions
       }
     }
 

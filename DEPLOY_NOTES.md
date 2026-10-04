@@ -1,5 +1,58 @@
 # Deploy notes (owner)
 
+## Release: Stripe card top-ups (Checkout, USD) — 2026-10-04
+
+The customer taps **💰 Top up → 💳 Pay by card (Stripe)** (also "💳 Pay by card instead (Stripe)" on the OxaPay confirm
+screen, a "💳 Pay $X by card" row on the not-enough-balance screen, and typed amounts / `/topup <amount>` when OxaPay and
+NOWPayments are both off), picks a preset or types a USD amount, confirms, and gets a **Stripe Checkout Session**
+(`POST /v1/checkout/sessions`, `mode=payment`, `payment_method_types[0]=card`, one line item "Wallet top-up" in **USD**,
+`client_reference_id` + `metadata` = our top-up id `sp_…` and the Telegram user id (copied to the PaymentIntent),
+success → `t.me/<bot>?start=sp_paid`, cancel → `?start=topup`, `expires_at` = +60 min, `Idempotency-Key`). API version
+pinned to `2024-06-20` (requests and webhook endpoint). Code: `src/stripe.js`; tables `stripe_sessions`, `stripe_events`
+(migration `0010_stripe.sql`, idempotent). USD presentment verified live on the BR account (real $5 session created and
+expired via the panel test, 2026-10-04).
+
+**Limits:** `stripe_min` (default $5) … `stripe_max` (default $500), also bounded by `topup_min` / `topup_max`; at most 5 open
+invoices/sessions per user per hour (all providers); an open same-amount session (> 15 min left) is reused. ❌ Cancel first
+expires the session at Stripe (so it can't be paid any more); if Stripe refuses because it was already paid, the session is
+synced and credited instead.
+
+**Webhook** `POST /stripe/webhook` — endpoint **`we_1UMoUeAdfCVAa0YUnqDpVlgK`** (created via the API, id kept in setting
+`stripe_webhook_id`; signing secret = Worker secret `STRIPE_WEBHOOK_SECRET`, copy in gitignored `stripe_webhook_secret.txt`,
+mode 600). Events: `checkout.session.completed`, `…async_payment_succeeded`, `…async_payment_failed`, `…expired`,
+`charge.refunded`, `charge.dispute.created`. `Stripe-Signature` = HMAC-SHA256(`<t>.<raw body>`), any `v1`, |now − t| ≤ 300 s,
+else **400**. Each event id is stored once (`stripe_events`): repeats → 200 "duplicate"; a delivery that fails (e.g. Stripe
+API down) is un-recorded and answered 500 so Stripe retries. Sessions of *other* integrations on the same Stripe account
+(e.g. the `cf-chase-key-server` endpoint) arrive too and are ignored quietly (audit `stripe_event_unmatched`).
+
+**Crediting:** never from the webhook body — the session is re-read (`GET /v1/checkout/sessions/{id}?expand[]=payment_intent`)
+and must be `status=complete`, `payment_status=paid`, our `client_reference_id`, currency `usd` and `amount_total` = the
+top-up in cents → credit the **requested USD amount** exactly once (nonce batch, `topups.method='stripe'`, audit
+`stripe_credit`, customer + admin notices). Different amount → **review** (not credited, admins told once).
+`complete` + `unpaid` (delayed methods only) → "paying"; `async_payment_failed` → failed (+ notices); `expired` → expired.
+
+**Fallback cron (every minute):** re-reads up to 5 open/complete-but-unpaid sessions with no news for 2 min (created < 2 days,
+not credited/flagged); sessions close at Stripe after 60 min, the cron sees `expired` and stops. 🔄 Check status in the bot
+and "Sincronizar" in the panel force a re-read.
+
+**Refunds / disputes (choice):** admins always get a prominent 🚨 notice (amount, reason, evidence deadline for disputes).
+The refunded + disputed USD amount (capped at the top-up) is **deducted from the wallet only if the balance covers the whole
+difference**; otherwise nothing is deducted and the amount is recorded as `unrecovered_usd` ("NÃO recuperado" in the panel)
+for the admin to decide (the customer may already have spent it on licenses). State-based, so repeated/partial refund events
+only deduct the difference (`topups.method='stripe_refund'`, audit `stripe_debit` / `stripe_unrecovered`). The customer is
+told about refund deductions, not about disputes. A dispute later *won* is not re-credited automatically (not subscribed to
+`charge.dispute.closed`) — re-credit manually if you win.
+
+Panel (Configurações → "Recarga com cartão (Stripe)"): on/off, min/max, "Testar conexão com a Stripe" (account country /
+currency / charges / payouts + webhook status and events), "Testar checkout" (real min-amount USD session, expired at once).
+Pagamentos shows "Cartão (Stripe)" with session state, refunds, disputes, deducted / not-recovered amounts; search by
+`cs_…`, `pi_…`, `ch_…`, `dp_…`.
+
+Secrets (piped, never printed): `printf '%s' "$STRIPE_SECRET_KEY" | npx wrangler secret put STRIPE_SECRET_KEY` and
+`npx wrangler secret put STRIPE_WEBHOOK_SECRET < stripe_webhook_secret.txt`. Without both the option is hidden and the
+webhook answers 503. Steps for this release (all done 2026-10-04): migration 0010 remote → STRIPE_SECRET_KEY → deploy →
+create the webhook endpoint → STRIPE_WEBHOOK_SECRET → `stripe_webhook_id` setting.
+
 ## Release: NOWPayments top-ups (hosted invoice, any coin) — 2026-10-04
 
 The customer taps **💰 Top up → 🪙 Pay with crypto (NOWPayments)** (also offered as "🪙 Other coins via NOWPayments" on the

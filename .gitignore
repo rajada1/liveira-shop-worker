@@ -8,3 +8,4 @@ admin_password.txt
 .index.js.bak-*
 oxapay_merchant_key.txt
 previews/
+stripe_webhook_secret.txt

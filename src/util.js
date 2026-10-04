@@ -83,6 +83,12 @@ export const SETTING_DEFAULTS = {
   nowpayments_min: "",
   nowpayments_min_auto: "",
   nowpayments_min_auto_at: "",
+  // Stripe card top-ups (src/stripe.js): shown only when STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET are set.
+  // stripe_min / stripe_max in USD (also bounded by topup_min / topup_max); stripe_webhook_id is informational.
+  stripe_enabled: "1",
+  stripe_min: "5",
+  stripe_max: "500",
+  stripe_webhook_id: "",
 };
 
 export const EDITABLE_SETTINGS = [
@@ -100,6 +106,9 @@ export const EDITABLE_SETTINGS = [
   "binance_enabled",
   "nowpayments_enabled",
   "nowpayments_min",
+  "stripe_enabled",
+  "stripe_min",
+  "stripe_max",
   "binance_pay_id",
   "binance_currencies",
   "binance_max",

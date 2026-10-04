@@ -123,6 +123,12 @@ const STATUS_LINE = {
   review: "🟠 Under review by the shop — not credited automatically",
 };
 
+const SP_STATUS_LINE = {
+  pending: "🟡 Waiting for card payment",
+  paying: "🔵 Payment processing",
+  expired: "⌛ Payment link expired — your card was not charged",
+};
+
 /** Short network hint for the accepted coins ("" if nothing useful to add). */
 export function networkHint(s) {
   return acceptedCoins(s).includes("USDT") ? " — pick your network on the page (e.g. TRC20 or BEP20)" : "";
@@ -135,6 +141,16 @@ export function howItWorks(s, { pickAmount = false } = {}) {
     `1. ${pickAmount ? "Pick an amount, tap" : "Tap"} <b>💳 Pay now</b> and pay with ${coinsLabel(s, { bold: true })}${networkHint(s)}.\n` +
     "2. Send the exact amount shown on the secure OxaPay page.\n" +
     "3. Your balance is credited automatically — usually within a few minutes.</blockquote>"
+  );
+}
+
+/** "How it works" for Stripe card payments (hosted Checkout page). */
+export function howItWorksSp() {
+  return (
+    "<blockquote><b>How it works</b>\n" +
+    "1. Tap <b>💳 Pay by card</b> and enter your card on the secure Stripe page.\n" +
+    "2. Your balance is credited automatically right after the payment is approved.\n" +
+    "<i>Charged in US dollars — your bank may add a foreign-currency fee.</i></blockquote>"
   );
 }
 
@@ -158,21 +174,22 @@ export function invoiceCard(pay, s, supportLine) {
   const st = pay.status;
   const open = st === "pending" || st === "paying";
   const np = pay.provider === "nowpayments";
-  let text = `🧾 <b>Top-up invoice · ${e(money(pay.amount_usd, cur))}</b>${np ? " · NOWPayments" : ""}\n\n`;
-  text += `Status: <b>${STATUS_LINE[st] || e(st)}</b>\n`;
+  const sp = pay.provider === "stripe";
+  let text = `🧾 <b>Top-up invoice · ${e(money(pay.amount_usd, cur))}</b>${np ? " · NOWPayments" : sp ? " · Card (Stripe)" : ""}\n\n`;
+  text += `Status: <b>${(sp && SP_STATUS_LINE[st]) || STATUS_LINE[st] || e(st)}</b>\n`;
   if (open && pay.expires_at) {
     text += np
       ? `⏳ Open until <b>${e(fmtTimeBrt(pay.expires_at))}</b> (${tgRelTime(pay.expires_at, "24 h")})\n`
-      : `⏳ Expires at <b>${e(fmtTimeBrt(pay.expires_at))}</b> (${tgRelTime(pay.expires_at, "60 min")})\n`;
+      : `⏳ ${sp ? "Payment link valid until" : "Expires at"} <b>${e(fmtTimeBrt(pay.expires_at))}</b> (${tgRelTime(pay.expires_at, "60 min")})\n`;
   }
   text += "\n";
-  if (open) text += (np ? howItWorksNp() : howItWorks(s)) + "\n";
-  if (st === "canceled") text += "<i>If you already sent a payment, it will still be credited automatically.</i>\n\n";
+  if (open) text += (np ? howItWorksNp() : sp ? howItWorksSp() : howItWorks(s)) + "\n";
+  if (st === "canceled") text += sp ? "<i>The payment link was closed — your card was not charged.</i>\n\n" : "<i>If you already sent a payment, it will still be credited automatically.</i>\n\n";
   if (["underpaid", "refunding", "refunded", "failed", "review"].includes(st)) text += `${supportLine}\n\n`;
   text += `Ref: <code>${e(pay.id)}</code>`;
   const rows = [];
-  if (open && pay.pay_link) rows.push([urlBtn("💳 Pay now", pay.pay_link, "success")]);
-  if (open || st === "canceled") rows.push([btn("🔄 I've paid · Check status", `tuchk:${pay.id}`, "primary")]);
+  if (open && pay.pay_link) rows.push([urlBtn(sp ? "💳 Pay by card" : "💳 Pay now", pay.pay_link, "success")]);
+  if (open || (st === "canceled" && !sp)) rows.push([btn("🔄 I've paid · Check status", `tuchk:${pay.id}`, "primary")]);
   if (st === "pending") rows.push([btn("❌ Cancel", `tux:${pay.id}`, "danger")]);
   if (["expired", "canceled", "error", "failed"].includes(st)) rows.push([btn("💰 New top-up", "topup", "success")]);
   rows.push([HOME()]);

@@ -48,6 +48,7 @@ import {
   paidCard,
   howItWorks,
   howItWorksNp,
+  howItWorksSp,
   networkHint,
   replyKeyboard,
   keyboardTarget,
@@ -57,6 +58,7 @@ import {
 } from "./ui.js";
 import { getNav, claimMenu, setKeyboardMessage, noteMessage } from "./chatnav.js";
 import { npConfig, createNpInvoice, npCheck } from "./nowpayments.js";
+import { spConfig, createSpSession, spCheck, spCancel } from "./stripe.js";
 import {
   binanceConfig,
   binanceConfigured,
@@ -234,9 +236,18 @@ function shortfallBlock(s, env, bal, price, pid, days) {
     rows.push([btn(`🪙 Top up ${money(amt, cur)} with crypto`, `npc:${amt}:${pid}:${days}`, "success")]);
     rows.push([btn("💰 Other amount", "topup")]);
     text += `\nTop up with crypto via NOWPayments (min ${e(money(npc.min, cur))}) — you can continue this purchase right after the payment is confirmed.`;
-  } else {
-    text += `\n${supportLine(s)}`;
   }
+  const spc = spConfig(s, env);
+  if (spc.available) {
+    const amt = shortfallAmount(missing, spc);
+    const cardRow = [btn(`💳 Pay ${money(amt, cur)} by card`, `spc:${amt}:${pid}:${days}`, rows.length ? undefined : "success")];
+    if (rows.length) rows.splice(rows.length - 1, 0, cardRow);
+    else {
+      rows.push(cardRow, [btn("💰 Other amount", "topup")]);
+      text += `\nTop up by card (Stripe, min ${e(money(spc.min, cur))}) — you can continue this purchase right after the payment.`;
+    }
+  }
+  if (!rows.length) text += `\n${supportLine(s)}`;
   return { text, rows };
 }
 
@@ -419,6 +430,8 @@ const METHOD_LABEL = {
   oxapay: "OxaPay top-up",
   binance: "Binance Pay top-up",
   nowpayments: "NOWPayments top-up",
+  stripe: "Card top-up (Stripe)",
+  stripe_refund: "card refund / chargeback",
   admin_add: "credit",
   panel_add: "credit",
   admin_sub: "adjustment",
@@ -493,21 +506,24 @@ async function screenTopup(env, s, user) {
   const tc = topupConfig(s, env);
   const bc = binanceConfig(s, env);
   const npc = npConfig(s, env);
-  if (!tc.available && !bc.available && !npc.available) return unavailableTopup(s);
+  const spc = spConfig(s, env);
+  if (!tc.available && !bc.available && !npc.available && !spc.available) return unavailableTopup(s);
   const cur = s.currency_symbol;
   const bal = await getBalance(env, user.id);
   const binanceLine = "🟡 Have Binance? Tap <b>Binance Pay</b>: send USDT to our Pay ID and paste the transaction ID — no invoice needed.";
   const npLine = `🪙 Other coins? Tap <b>Pay with crypto (NOWPayments)</b> — 300+ cryptocurrencies, you pick the coin and network (min ${e(money(npc.min, cur))}).`;
   const npRow = npc.available ? [btn("🪙 Pay with crypto (NOWPayments)", "np", tc.available ? undefined : "primary")] : null;
+  const spLine = `💳 Prefer a card? Tap <b>Pay by card (Stripe)</b> — Visa, Mastercard and other credit/debit cards (min ${e(money(spc.min, cur))}).`;
+  const spRow = spc.available ? [btn("💳 Pay by card (Stripe)", "sp", tc.available || npc.available ? undefined : "primary")] : null;
   if (!tc.available) {
-    const lines = [npc.available ? npLine : "", bc.available ? binanceLine : ""].filter(Boolean);
+    const lines = [npc.available ? npLine : "", spc.available ? spLine : "", bc.available ? binanceLine : ""].filter(Boolean);
     return {
       text:
         "💰 <b>Top up balance</b>\n\n" +
         `Current balance: <b>${e(money(bal, cur))}</b>\n\n` +
-        (npc.available ? "" : "OxaPay invoices are currently unavailable.\n\n") +
+        (npc.available || spc.available ? "" : "OxaPay invoices are currently unavailable.\n\n") +
         lines.join("\n\n"),
-      reply_markup: kb([npRow, bc.available ? [btn("🟡 Binance Pay", "bn", npc.available ? undefined : "primary")] : null, navRow("home")]),
+      reply_markup: kb([npRow, spRow, bc.available ? [btn("🟡 Binance Pay", "bn", npc.available || spc.available ? undefined : "primary")] : null, navRow("home")]),
     };
   }
   const presetBtns = tc.presets.map((a) => btn(money(a, cur).replace(/\.00$/, ""), `tuc:${a}`, "primary"));
@@ -521,21 +537,23 @@ async function screenTopup(env, s, user) {
       `💳 We accept: ${coinsLabel(s, { bold: true })}\n\n` +
       howItWorks(s, { pickAmount: true }) +
       (npc.available ? `\n${npLine}` : "") +
+      (spc.available ? `\n${spLine}` : "") +
       (bc.available ? `\n${binanceLine}` : ""),
-    reply_markup: kb([...grid(presetBtns, presetBtns.length === 4 ? 2 : 3), otherRow, npRow, navRow("home")]),
+    reply_markup: kb([...grid(presetBtns, presetBtns.length === 4 ? 2 : 3), otherRow, npRow, spRow, navRow("home")]),
   };
 }
 
 function screenKeypad(s, env, digits, note, mode = "kp") {
   const np = mode === "np";
-  const tc = np ? npConfig(s, env) : topupConfig(s, env);
-  if (!tc.available) return np ? npUnavailable(s) : unavailableTopup(s);
+  const sp = mode === "sp";
+  const tc = np ? npConfig(s, env) : sp ? spConfig(s, env) : topupConfig(s, env);
+  if (!tc.available) return np ? npUnavailable(s) : sp ? spUnavailable(s) : unavailableTopup(s);
   const cur = s.currency_symbol;
-  const P = np ? "nk" : "kp";
+  const P = np ? "nk" : sp ? "sk" : "kp";
   const shown = digits ? Number(digits).toLocaleString("en-US") : "0";
   const valid = digits && Number(digits) >= tc.min && Number(digits) <= tc.max;
   const text =
-    `✏️ <b>Other amount${np ? " · NOWPayments" : ""}</b>\n\n` +
+    `✏️ <b>Other amount${np ? " · NOWPayments" : sp ? " · Card" : ""}</b>\n\n` +
     `<b>💵 ${e(cur)} ${e(shown)}</b>${digits ? "" : " ▏"}\n\n` +
     `Min ${e(money(tc.min, cur))} · Max ${e(money(tc.max, cur))}\n` +
     (np ? "<i>Crypto networks can't process smaller payments, so NOWPayments has a minimum.</i>\n" : "") +
@@ -549,7 +567,7 @@ function screenKeypad(s, env, digits, note, mode = "kp") {
       [d(4), d(5), d(6)],
       [d(7), d(8), d(9)],
       [btn("⌫", `${P}:${digits.slice(0, -1)}`), d(0), btn("✅", `${P}ok:${digits}`, valid ? "success" : undefined)],
-      navRow(np ? "np" : "topup"),
+      navRow(np ? "np" : sp ? "sp" : "topup"),
     ]),
   };
 }
@@ -570,6 +588,7 @@ function screenConfirmTopup(s, env, amount, resume) {
     reply_markup: kb([
       [btn(`✅ Create invoice · ${money(amount, cur)}`, `tun:${amount}${suffix}`, "success")],
       npAltRow(s, env, amount, suffix),
+      spAltRow(s, env, amount, suffix),
       [btn("✏️ Change amount", "topup")],
       [HOME()],
     ]),
@@ -581,6 +600,105 @@ function npAltRow(s, env, amount, suffix) {
   const npc = npConfig(s, env);
   if (!npc.available || amount < npc.min || amount > npc.max) return null;
   return [btn("🪙 Other coins via NOWPayments", `npn:${amount}${suffix}`)];
+}
+
+/** "Pay by card" shortcut on the OxaPay confirm screen when the amount is within the Stripe limits. */
+function spAltRow(s, env, amount, suffix) {
+  const spc = spConfig(s, env);
+  if (!spc.available || amount < spc.min || amount > spc.max) return null;
+  return [btn("💳 Pay by card instead (Stripe)", `spn:${amount}${suffix}`)];
+}
+
+/* ─── Stripe (hosted Checkout: credit / debit card, USD) ─── */
+
+function spUnavailable(s) {
+  return {
+    text: `💳 <b>Pay by card (Stripe)</b>\n\nCard payments are currently unavailable.\n\n${supportLine(s)}`,
+    reply_markup: kb([navRow("topup")]),
+  };
+}
+
+function screenSp(s, env) {
+  const spc = spConfig(s, env);
+  if (!spc.available) return spUnavailable(s);
+  const cur = s.currency_symbol;
+  const presetBtns = spc.presets.map((a) => btn(money(a, cur).replace(/\.00$/, ""), `spc:${a}`, "primary"));
+  return {
+    text:
+      "💳 <b>Pay by card (Stripe)</b>\n\n" +
+      "Pay with a credit or debit card (Visa, Mastercard, American Express and more) on the secure Stripe page. " +
+      "Your card details never reach this bot.\n\n" +
+      `Min ${e(money(spc.min, cur))} · Max ${e(money(spc.max, cur))}\n\n` +
+      "Choose an amount:\n\n" +
+      howItWorksSp(),
+    reply_markup: kb([...grid(presetBtns, presetBtns.length === 4 ? 2 : 3), [btn("✏️ Other amount", "sk:")], navRow("topup")]),
+  };
+}
+
+function screenConfirmSp(s, env, amount, resume) {
+  const spc = spConfig(s, env);
+  if (!spc.available) return spUnavailable(s);
+  const cur = s.currency_symbol;
+  const suffix = resume ? `:${resume.pid}:${resume.days}` : "";
+  return {
+    text:
+      "💳 <b>Confirm card top-up</b>\n\n" +
+      `Amount: <b>${e(money(amount, cur))}</b> (charged in USD)\n` +
+      "Pay with: credit / debit card via Stripe\n" +
+      (resume ? "\n🛒 After the payment you can continue your purchase in one tap.\n" : "") +
+      "\n<i>Your balance is credited automatically right after the payment is approved.</i>",
+    reply_markup: kb([
+      [btn(`✅ Continue to payment · ${money(amount, cur)}`, `spn:${amount}${suffix}`, "success")],
+      [btn("✏️ Change amount", "sp")],
+      [HOME()],
+    ]),
+  };
+}
+
+function spAmountError(spc, amount, cur) {
+  if (amount === null || !Number.isFinite(amount)) return "Please enter a valid amount.";
+  if (amount < spc.min) return `Minimum for card payments is ${money(spc.min, cur)}.`;
+  if (amount > spc.max) return `Maximum for card payments is ${money(spc.max, cur)}.`;
+  return null;
+}
+
+async function createSpFlow(env, s, user, nav, amount, resume) {
+  const spc = spConfig(s, env);
+  if (!spc.available) return show(env, nav, spUnavailable(s));
+  const errMsg = spAmountError(spc, amount, s.currency_symbol);
+  if (errMsg) return show(env, nav, screenKeypad(s, env, "", errMsg, "sp"));
+  const r = await createSpSession(env, s, { userId: user.id, chatId: nav.chatId, amount, resume: resume ? `${resume.pid}:${resume.days}` : null });
+  if (!r.ok) {
+    const msg =
+      r.reason === "too_many"
+        ? "🧾 You already have several open payments. Please finish one of them or wait until they expire."
+        : r.reason === "unconfigured"
+          ? "Card payments are currently unavailable."
+          : "⚠️ Could not start the card payment right now. Please try again in a minute.";
+    return show(env, nav, { text: `💳 <b>Pay by card (Stripe)</b>\n\n${msg}\n\n${supportLine(s)}`, reply_markup: kb([navRow("sp")]) });
+  }
+  const card = invoiceCard(r.payment, s, supportLine(s));
+  if (r.reused && nav.messageId && r.payment.message_id === nav.messageId) nav.inPlace = true;
+  const res = await show(env, nav, { ...card, record: true });
+  if (res?.message_id) await setPaymentMessage(env, r.payment.id, nav.chatId, res.message_id);
+  return { ...res, toast: r.reused ? "Your open card payment for this amount" : "💳 Payment link ready" };
+}
+
+/** Return from the Stripe page (success_url deep link): show the latest card top-up. */
+async function spLatestFlow(env, s, user, nav) {
+  const pay = await env.DB.prepare(
+    "SELECT id FROM payments WHERE provider='stripe' AND telegram_user_id=? AND status<>'error' ORDER BY created_at DESC LIMIT 1"
+  )
+    .bind(user.id)
+    .first();
+  if (!pay) return show(env, nav, await screenTopup(env, s, user));
+  return checkStatusFlow(env, s, user, nav, pay.id);
+}
+
+function spTypedAmount(env, s, nav, amount) {
+  const err = spAmountError(spConfig(s, env), amount, s.currency_symbol);
+  if (err) return show(env, nav, screenKeypad(s, env, "", err, "sp"));
+  return show(env, nav, screenConfirmSp(s, env, amount, null));
 }
 
 /* ─── NOWPayments (hosted invoice: any coin / network) ─── */
@@ -727,7 +845,13 @@ async function checkStatusFlow(env, s, user, nav, id) {
     return { toast: "✅ Already paid and credited" };
   }
   let toast = null;
-  if (pay.provider === "nowpayments") {
+  if (pay.provider === "stripe") {
+    const r = await spCheck(env, s, { ...pay, message_id: nav.messageId || pay.message_id }, "user_check");
+    if (r.action === "credited") return { toast: "✅ Payment confirmed!" };
+    if (r.action === "duplicate") return { toast: "✅ Already paid and credited" };
+    if (r.action === "api_error") toast = "Couldn't reach the payment provider — try again in a moment.";
+    if ((r.action === "pending" || r.throttled) && pay.status === "pending") toast = "🟡 No card payment yet — tap 💳 Pay by card to finish it";
+  } else if (pay.provider === "nowpayments") {
     const r = await npCheck(env, s, { ...pay, message_id: nav.messageId || pay.message_id }, "user_check");
     if (r.action === "credited") return { toast: "✅ Payment confirmed!" };
     if (r.action === "duplicate") return { toast: "✅ Already paid and credited" };
@@ -953,6 +1077,8 @@ async function route(env, s, user, nav, data) {
   if (data === "bn" || data === "binance") return show(env, nav, await screenBinance(env, s));
   if (data === "np" || data === "nowpayments") return show(env, nav, screenNp(s, env));
   if (data === "np_paid") return npLatestFlow(env, s, user, nav);
+  if (data === "sp" || data === "stripe") return show(env, nav, screenSp(s, env));
+  if (data === "sp_paid") return spLatestFlow(env, s, user, nav);
   if (data === "bnp") {
     if (!binanceConfig(s, env).available) return show(env, nav, binanceUnavailable(s));
     await sendMessage(env, nav.chatId, e(BINANCE_PROMPT), { reply_markup: { force_reply: true, input_field_placeholder: "Transaction ID" } });
@@ -986,6 +1112,29 @@ async function route(env, s, user, nav, data) {
     return show(env, nav, screenConfirmTopup(s, env, amount, null));
   }
 
+  // Stripe keypad (sk:/skok:), confirm (spc) and create (spn)
+  if ((m = /^sk:(\d{0,12})$/.exec(data))) {
+    const spc = spConfig(s, env);
+    const digits = m[1].replace(/^0+/, "");
+    if (digits.length > KEYPAD_MAX_DIGITS || (digits && Number(digits) > spc.max)) return { toast: `Maximum is ${money(spc.max, s.currency_symbol)}` };
+    return show(env, nav, screenKeypad(s, env, digits, null, "sp"));
+  }
+  if ((m = /^skok:(\d{0,12})$/.exec(data))) {
+    const err = spAmountError(spConfig(s, env), m[1] ? Number(m[1]) : 0, s.currency_symbol);
+    if (err) return { toast: err.slice(0, 190) };
+    return show(env, nav, screenConfirmSp(s, env, Number(m[1]), null));
+  }
+  if ((m = /^(spc|spn):(.+)$/.exec(data))) {
+    const p = parseTopupData(m[2]);
+    const spc = spConfig(s, env);
+    if (!spc.available) return show(env, nav, spUnavailable(s));
+    if (!p) return { toast: "Invalid amount" };
+    const err = spAmountError(spc, p.amount, s.currency_symbol);
+    if (err) return show(env, nav, screenKeypad(s, env, "", err, "sp"));
+    if (m[1] === "spn") return createSpFlow(env, s, user, nav, p.amount, p.resume);
+    return show(env, nav, screenConfirmSp(s, env, p.amount, p.resume));
+  }
+
   // NOWPayments keypad (nk:/nkok:), confirm (npc) and create (npn)
   if ((m = /^nk:(\d{0,12})$/.exec(data))) {
     const npc = npConfig(s, env);
@@ -1015,6 +1164,7 @@ async function route(env, s, user, nav, data) {
     const p = parseTopupData(m[2]);
     const tc = topupConfig(s, env);
     if (!tc.available && p && npConfig(s, env).available) return route(env, s, user, nav, `npc:${m[2]}`); // OxaPay off → NOWPayments
+    if (!tc.available && p && spConfig(s, env).available) return route(env, s, user, nav, `spc:${m[2]}`); // … or card
     if (!tc.available) return show(env, nav, unavailableTopup(s));
     if (!p) return { toast: "Invalid amount" };
     const err = amountError(tc, p.amount, s.currency_symbol);
@@ -1029,7 +1179,13 @@ async function route(env, s, user, nav, data) {
   if (data.startsWith("tux:")) {
     nav.inPlace = true;
     const id = data.slice(4);
-    const ok = await cancelPayment(env, id, user.id);
+    const before = await env.DB.prepare("SELECT * FROM payments WHERE id=? AND telegram_user_id=?").bind(id, user.id).first();
+    let ok;
+    if (before?.provider === "stripe") {
+      const r = await spCancel(env, s, before, user.id);
+      if (r.action === "credited" || r.action === "duplicate") return { toast: "✅ This payment was already completed and credited" };
+      ok = r.ok;
+    } else ok = await cancelPayment(env, id, user.id);
     const pay = await env.DB.prepare("SELECT * FROM payments WHERE id=? AND telegram_user_id=?").bind(id, user.id).first();
     if (pay) await show(env, nav, invoiceCard(pay, s, supportLine(s)));
     return { toast: ok ? "Invoice canceled" : pay ? `Can't cancel — status: ${pay.status}` : "Payment not found" };
@@ -1079,7 +1235,7 @@ async function handleCallback(env, query, s) {
   }
 }
 
-const DEEP_LINKS = new Set(["shop", "topup", "binance", "nowpayments", "np_paid", "licenses", "downloads", "profile", "support", "help", "home", "menu"]);
+const DEEP_LINKS = new Set(["shop", "topup", "binance", "nowpayments", "np_paid", "stripe", "sp_paid", "licenses", "downloads", "profile", "support", "help", "home", "menu"]);
 
 async function handleCommand(env, message, s) {
   const text = message.text || "";
@@ -1141,6 +1297,7 @@ async function handleCommand(env, message, s) {
       const tc = topupConfig(s, env);
       const amount = parseAmount(args.join(" "));
       if (!tc.available && npConfig(s, env).available) return npTypedAmount(env, s, nav, amount);
+      if (!tc.available && spConfig(s, env).available) return spTypedAmount(env, s, nav, amount);
       if (!tc.available) return show(env, nav, unavailableTopup(s));
       const err = amountError(tc, amount, s.currency_symbol);
       if (err) return show(env, nav, screenKeypad(s, env, "", err));
@@ -1271,6 +1428,10 @@ async function handleCommand(env, message, s) {
     if (amount !== null && !tc.available && npConfig(s, env).available) {
       await ensureKeyboard(env, nav);
       return npTypedAmount(env, s, nav, amount);
+    }
+    if (amount !== null && !tc.available && spConfig(s, env).available) {
+      await ensureKeyboard(env, nav);
+      return spTypedAmount(env, s, nav, amount);
     }
     if (amount !== null && tc.available) {
       await ensureKeyboard(env, nav);

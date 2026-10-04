@@ -473,14 +473,15 @@
     });
   };
 
-  /* ───────── Pagamentos (OxaPay · Binance Pay · NOWPayments) ───────── */
+  /* ───────── Pagamentos (OxaPay · Binance Pay · NOWPayments · Stripe) ───────── */
   var PAY_STATUS = {
     creating: ["", "criando"], pending: ["", "aguardando"], paying: ["warn", "pagando"], paid: ["ok", "pago"],
     underpaid: ["warn", "pago a menor"], expired: ["", "expirado"], canceled: ["", "cancelado"], refunding: ["warn", "reembolsando"],
     refunded: ["bad", "reembolsado"], error: ["bad", "erro"], review: ["warn", "em revisão"], rejected: ["bad", "recusado"], failed: ["bad", "falhou"],
   };
   var NP_REASON = { invoice: "fatura criada", waiting: "aguardando pagamento", confirming: "confirmando", confirmed: "confirmado", sending: "enviando", partially_paid: "pago parcialmente", finished: "concluído", failed: "falhou", refunded: "reembolsado", expired: "expirado", price_mismatch: "preço diferente da fatura", underpaid_finished: "concluído, mas valor recebido menor" };
-  var PROV = { oxapay: "OxaPay", binance: "Binance", nowpayments: "NOWPayments" };
+  var PROV = { oxapay: "OxaPay", binance: "Binance", nowpayments: "NOWPayments", stripe: "Cartão (Stripe)" };
+  var SP_REASON = { open: "aguardando pagamento", processing: "processando", paid: "pago", expired: "expirado", "expired (test)": "expirado (teste)", amount_mismatch: "valor diferente da sessão", async_payment_failed: "pagamento falhou", refunded: "REEMBOLSADO", partially_refunded: "reembolso parcial", disputed: "DISPUTA (chargeback)" };
   var BN_REASON = { outgoing: "não é entrada", currency: "moeda não aceita", type: "tipo não aceito", too_small: "valor pequeno", over_max: "acima do limite", receiver: "destinatário diferente do Pay ID", submitted: "aguardando", credited: "creditado" };
   function payBadge(st) { var m = PAY_STATUS[st] || ["", st]; return el("span", { class: "badge " + m[0] }, m[1]); }
   var pState = { q: "", status: "", page: 1 };
@@ -498,6 +499,7 @@
         var acts = el("div", { class: "row" });
         var bn = p.provider === "binance";
         var np = p.provider === "nowpayments";
+        var sp = p.provider === "stripe";
         if (bn && !p.credited && p.status === "review") {
           acts.appendChild(el("button", { class: "btn s p", title: "Creditar o valor recebido na Binance", onclick: function (ev) {
             var b = ev.currentTarget;
@@ -509,32 +511,33 @@
           } }, "Aprovar e creditar"));
         }
         if (p.track_id && !p.credited && ["pending", "paying", "expired", "underpaid", "canceled"].indexOf(p.status) >= 0) {
-          acts.appendChild(el("button", { class: "btn s", title: bn ? "Procurar a transação no histórico do Binance Pay" : np ? "Consultar status na NOWPayments" : "Consultar status na OxaPay", onclick: function (ev) {
+          acts.appendChild(el("button", { class: "btn s", title: bn ? "Procurar a transação no histórico do Binance Pay" : np ? "Consultar status na NOWPayments" : sp ? "Consultar a sessão na Stripe" : "Consultar status na OxaPay", onclick: function (ev) {
             var b = ev.currentTarget; b.disabled = true;
             api("POST", "/payments/" + encodeURIComponent(p.id) + "/sync").then(function (r) {
-              toast(r.result === "credited" ? "Pago — saldo creditado" : (bn ? "Binance: " : np ? "NOWPayments: " : "Status OxaPay: ") + (np ? (NP_REASON[r.remote_status] || r.remote_status || r.result) : (r.remote_status || r.result)), r.result === "credited" ? "ok" : "");
+              toast(r.result === "credited" ? "Pago — saldo creditado" : (bn ? "Binance: " : np ? "NOWPayments: " : sp ? "Stripe: " : "Status OxaPay: ") + (np ? (NP_REASON[r.remote_status] || r.remote_status || r.result) : (r.remote_status || r.result)), r.result === "credited" ? "ok" : "");
               router();
             }, function (e2) { b.disabled = false; toast(e2.message, "bad"); });
           } }, "Sincronizar"));
         }
-        if (p.track_id) acts.appendChild(el("button", { class: "btn s", onclick: function () { copy(p.track_id.replace(/^(binance|np):/, "")); } }, bn ? "Copiar ID" : np ? "Copiar fatura" : "Copiar track"));
+        if (p.track_id) acts.appendChild(el("button", { class: "btn s", onclick: function () { copy(p.track_id.replace(/^(binance|np|stripe):/, "")); } }, bn ? "Copiar ID" : np ? "Copiar fatura" : sp ? "Copiar sessão" : "Copiar track"));
         if (np && p.pay_link && !p.credited) acts.appendChild(el("a", { class: "btn s", href: p.pay_link, target: "_blank", rel: "noopener noreferrer" }, "Abrir fatura"));
         return el("tr", null,
           el("td", null, fmtDate(p.created_at)),
           el("td", null, el("a", { href: "#/usuarios/" + encodeURIComponent(p.telegram_user_id) }, userLabel(p.telegram_user_id, p.username))),
           el("td", null, money(p.amount_usd)),
-          el("td", null, payBadge(p.status), p.last_status && p.last_status.length < 40 ? el("div", { class: "muted small" }, (bn ? "Binance: " + (BN_REASON[p.last_status] || p.last_status) : np ? "NOWPayments: " + (NP_REASON[p.last_status] || p.last_status) : "OxaPay: " + p.last_status)) : null),
-          el("td", { class: "mono" }, p.provider !== "oxapay" && p.track_id ? el("span", null, el("span", { class: "badge" }, PROV[p.provider] || p.provider), " ", p.track_id.replace(/^(binance|np):/, ""),
-            np && p.np_info ? el("div", { class: "muted small" }, "pagamento " + p.np_info) : null) : (p.track_id || "—")),
+          el("td", null, payBadge(p.status), p.last_status && p.last_status.length < 40 ? el("div", { class: "muted small" }, (bn ? "Binance: " + (BN_REASON[p.last_status] || p.last_status) : np ? "NOWPayments: " + (NP_REASON[p.last_status] || p.last_status) : sp ? "Stripe: " + (SP_REASON[p.last_status] || p.last_status) : "OxaPay: " + p.last_status)) : null),
+          el("td", { class: "mono" }, p.provider !== "oxapay" && p.track_id ? el("span", null, el("span", { class: "badge" }, PROV[p.provider] || p.provider), " ", p.track_id.replace(/^(binance|np|stripe):/, ""),
+            np && p.np_info ? el("div", { class: "muted small" }, "pagamento " + p.np_info) : null,
+            sp && p.sp_info ? el("div", { class: "muted small" + (/DISPUTA|reembolso|NÃO/.test(p.sp_info) ? " bad" : "") }, "sessão " + p.sp_info) : null) : (p.track_id || "—")),
           el("td", { class: "hide-m" }, fmtDate(p.paid_at)),
           el("td", { class: "mono hide-m small" }, p.id),
           el("td", null, acts));
       });
-      clear(main).append(el("h1", null, "Pagamentos (OxaPay · Binance Pay · NOWPayments)"), form, el("div", { class: "card" },
+      clear(main).append(el("h1", null, "Pagamentos (OxaPay · Binance Pay · NOWPayments · Stripe)"), form, el("div", { class: "card" },
         el("div", { class: "row f" }, el("span", { class: "badge" }, d.total + " pagamento(s)"), el("span", { class: "badge ok" }, "Creditado " + money(d.credited_sum))),
-        table(["Data", "Usuário", "Valor", "Status", "Track ID / ID Binance / fatura NOWPayments", { t: "Pago em", cls: "hide-m" }, { t: "Referência", cls: "hide-m" }, "Ações"], rows, "Nenhum pagamento ainda."),
+        table(["Data", "Usuário", "Valor", "Status", "Track ID / ID Binance / fatura NOWPayments / sessão Stripe", { t: "Pago em", cls: "hide-m" }, { t: "Referência", cls: "hide-m" }, "Ações"], rows, "Nenhum pagamento ainda."),
         pager(d.total, d.page, d.page_size, function (pg) { pState.page = pg; router(); })),
-        el("div", { class: "muted small" }, "Faturas não pagas são marcadas como expiradas ~10 min após o vencimento. Binance Pay: o bot procura o ID por 30 min; acima do limite por transação fica \"em revisão\" até você aprovar. NOWPayments: crédito automático só com status \"finished\" (pago parcialmente / falhou / revisão → aviso no Telegram, ajuste o saldo manualmente se for o caso); faturas sem pagamento fecham após 24 h. Horários em BRT."));
+        el("div", { class: "muted small" }, "Faturas não pagas são marcadas como expiradas ~10 min após o vencimento. Binance Pay: o bot procura o ID por 30 min; acima do limite por transação fica \"em revisão\" até você aprovar. NOWPayments: crédito automático só com status \"finished\" (pago parcialmente / falhou / revisão → aviso no Telegram, ajuste o saldo manualmente se for o caso); faturas sem pagamento fecham após 24 h. Cartão (Stripe): crédito automático após a Stripe confirmar o pagamento; o link expira em 60 min; reembolso/disputa → alerta no Telegram e desconto do saldo se houver saldo suficiente. Horários em BRT."));
     });
   };
 
@@ -755,6 +758,58 @@
             function (e2) { toast(e2.message, "bad"); nSave.disabled = false; });
       });
       api("GET", "/nowpayments/status").then(showNp, function () {});
+      var sEnabled = el("input", { type: "checkbox", checked: s.stripe_enabled === "1" });
+      var sMin = el("input", { type: "number", min: 1, step: "0.01", value: s.stripe_min, inputmode: "decimal" });
+      var sMax = el("input", { type: "number", min: 1, step: "0.01", value: s.stripe_max, inputmode: "decimal" });
+      var sBox = el("div", { class: "f" });
+      var sLink = el("div", { class: "f" });
+      function showSp(st, acct, wh) {
+        clear(sBox).appendChild(el("div", { class: "kv" },
+          el("div", null, "Situação no bot"), el("div", null, st.available ? el("span", { class: "badge ok" }, "visível para os clientes") : el("span", { class: "badge warn" }, "oculta")),
+          el("div", null, "Modo"), el("div", null, st.livemode ? el("span", { class: "badge ok" }, "produção (live)") : el("span", { class: "badge warn" }, "teste")),
+          el("div", null, "Limites efetivos"), el("div", null, money(st.min) + " – " + money(st.max)),
+          el("div", null, "Em aberto / revisão"), el("div", null, String(st.open == null ? "—" : st.open)),
+          el("div", null, "Reembolsos / disputas"), el("div", null, st.refunds_disputes ? el("span", { class: "badge bad" }, String(st.refunds_disputes)) : "0"),
+          acct ? el("div", null, "Conta Stripe") : null,
+          acct ? el("div", null, acct.country + " · moeda padrão " + String(acct.default_currency || "").toUpperCase() + " · cobranças " + (acct.charges_enabled ? "ativas" : "BLOQUEADAS") + " · saques " + (acct.payouts_enabled ? "ativos" : "BLOQUEADOS") + (acct.billing_name ? " · nome na fatura do cartão: " + acct.billing_name : "")) : null,
+          wh ? el("div", null, "Webhook") : null,
+          wh ? el("div", null, wh.error ? el("span", { class: "badge bad" }, "não encontrado") : el("span", { class: "badge " + (wh.status === "enabled" && wh.url_ok && !(wh.missing_events || []).length ? "ok" : "warn") }, wh.status + (wh.url_ok ? "" : " · URL diferente") + ((wh.missing_events || []).length ? " · faltam eventos" : ""))) : null));
+      }
+      var sTest = el("button", { class: "btn", type: "button" }, "Testar conexão com a Stripe");
+      sTest.addEventListener("click", function () {
+        sTest.disabled = true;
+        api("POST", "/stripe/test").then(function (r) {
+          sTest.disabled = false; showSp(r.status || {}, r.account, r.webhook);
+          toast(r.ok ? "Conectado à Stripe" : (r.reason === "unconfigured" ? "Chaves da Stripe ausentes" : "Falhou (HTTP " + r.http + ")"), r.ok ? "ok" : "bad");
+        }, function (e2) { sTest.disabled = false; toast(e2.message, "bad"); });
+      });
+      var sSess = el("button", { class: "btn", type: "button" }, "Testar checkout (cria e expira na hora)");
+      sSess.addEventListener("click", function () {
+        confirmDlg("Criar uma sessão real de checkout da Stripe no valor mínimo, em seu nome, e expirá-la imediatamente (ninguém consegue pagar)?").then(function (ok) {
+          if (!ok) return; sSess.disabled = true;
+          api("POST", "/stripe/test-session").then(function (r) {
+            sSess.disabled = false;
+            toast(r.ok ? "Checkout em USD criado (" + money(r.amount) + ")" + (r.expired ? " e expirado" : " — NÃO expirou, verifique") : "Falhou: " + (r.error && r.error.message || r.reason), r.ok && r.expired ? "ok" : "bad");
+            clear(sLink).appendChild(el("div", { class: "muted small mono" }, "Sessão " + (r.session_id || "—")));
+          }, function (e2) { sSess.disabled = false; toast(e2.message, "bad"); });
+        });
+      });
+      var sSave = el("button", { class: "btn p", type: "submit" }, "Salvar");
+      var sform = el("form", { class: "card" }, el("h2", null, "Recarga com cartão (Stripe)"),
+        el("div", { class: "kv f" },
+          el("div", null, "Chaves STRIPE_SECRET_KEY / WEBHOOK_SECRET"), el("div", null, info.stripe_configured ? el("span", { class: "badge ok" }, "configuradas") : el("span", { class: "badge bad" }, "ausentes — opção oculta no bot")),
+          el("div", null, "Webhook URL"), el("div", { class: "mono" }, info.stripe_webhook_url)),
+        el("label", { class: "chk" }, sEnabled, "Mostrar \"💳 Pay by card (Stripe)\" na recarga do bot"),
+        el("div", { class: "row" }, el("div", { class: "grow" }, field("Valor mínimo (USD)", sMin)), el("div", { class: "grow" }, field("Valor máximo por pagamento (USD)", sMax))),
+        el("div", { class: "muted small f" }, "O cliente escolhe o valor em USD e paga com cartão de crédito/débito na página segura da Stripe (cobrança em dólar). O saldo é creditado automaticamente quando a Stripe confirma (o bot consulta a sessão com a chave secreta antes de creditar). Reembolso ou disputa (chargeback) → alerta para você no Telegram; o valor é descontado do saldo do cliente se ele ainda tiver saldo suficiente, senão fica marcado como \"não recuperado\" para você decidir. Limites também respeitam o mínimo/máximo geral de recarga."),
+        el("div", { class: "row f" }, sTest, sSess), sLink, sBox, sSave);
+      sform.addEventListener("submit", function (e) {
+        e.preventDefault(); sSave.disabled = true;
+        api("PUT", "/settings", { stripe_enabled: sEnabled.checked ? "1" : "0", stripe_min: sMin.value, stripe_max: sMax.value })
+          .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); sSave.disabled = false; router(); },
+            function (e2) { toast(e2.message, "bad"); sSave.disabled = false; });
+      });
+      api("GET", "/stripe/status").then(function (st) { showSp(st); }, function () {});
       var whBox = el("div", { class: "f" });
       function showWh(wi) {
         clear(whBox).appendChild(el("div", { class: "kv" },
@@ -795,7 +850,7 @@
             if (ok) api("POST", "/sessions/revoke-all").then(function () { ME = null; renderLogin("Todas as sessões foram encerradas."); }, function (e) { toast(e.message, "bad"); });
           });
         } }, "Encerrar todas as sessões"));
-      clear(main).append(el("h1", null, "Configurações"), form, cform, bform, nform, wh, apiCard, sys);
+      clear(main).append(el("h1", null, "Configurações"), form, cform, bform, nform, sform, wh, apiCard, sys);
     });
   };
 

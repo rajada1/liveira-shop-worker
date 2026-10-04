@@ -1,4 +1,4 @@
-"""Fake OxaPay + fake Binance Pay history API + fake NOWPayments (/np/v1) + fake Telegram Bot API (port 9911) with Bot API validation.
+"""Fake OxaPay + fake Binance Pay history API + fake NOWPayments (/np/v1) + fake Stripe (/stripe/v1) + fake Telegram Bot API (port 9911) with Bot API validation.
 Telegram: stores messages per chat, returns real-looking message ids, and answers
 'message is not modified' / 'message to edit not found' like the real API.
 Every request is logged to /tmp/lvtest/fake.log; spec violations go to 'violation' entries."""
@@ -19,6 +19,14 @@ NP_MIN = {'usdttrc20': 11.42, 'usdtbsc': 12.13, 'ltc': 12.0, 'trx': 12.3}
 np_counter = itertools.count(5000000001)
 NP_DOC = {'price_amount', 'price_currency', 'pay_currency', 'ipn_callback_url', 'order_id', 'order_description', 'success_url',
           'cancel_url', 'partially_paid_url', 'is_fixed_rate', 'is_fee_paid_by_user'}
+# Stripe: Bearer key, form-encoded POSTs, Stripe-Version pinned; /stripe/v1/checkout/sessions, …/expire, /charges, /payment_intents
+SP_KEY = 'sk_test_local_fake'; SP_SESS, SP_CHARGES, SP_PIS, SP_IDEM = {}, {}, {}, {}; SP_MODE = {'get': 200, 'create': 200}
+sp_counter = itertools.count(1)
+SP_DOC = {'mode', 'payment_method_types[0]', 'line_items[0][quantity]', 'line_items[0][price_data][currency]', 'line_items[0][price_data][unit_amount]',
+          'line_items[0][price_data][product_data][name]', 'line_items[0][price_data][product_data][description]', 'client_reference_id',
+          'metadata[topup_id]', 'metadata[telegram_user_id]', 'metadata[source]', 'payment_intent_data[metadata][topup_id]',
+          'payment_intent_data[metadata][telegram_user_id]', 'payment_intent_data[metadata][source]', 'payment_intent_data[description]',
+          'submit_type', 'success_url', 'cancel_url', 'expires_at'}
 ALLOWED_TAGS = {'b','strong','i','em','u','ins','s','strike','del','span','tg-spoiler','a','tg-emoji','tg-time','code','pre','blockquote'}
 BTN_ACTIONS = {'url','callback_data','web_app','login_url','switch_inline_query','switch_inline_query_current_chat','switch_inline_query_chosen_chat','copy_text','callback_game','pay','disabled'}
 
@@ -116,7 +124,66 @@ class H(BaseHTTPRequestHandler):
             if pid not in NP_PAYS: return self._send({'statusCode': 404, 'code': 'PAYMENT_NOT_FOUND', 'message': 'Payment not found'}, 404)
             return self._send(NP_PAYS[pid])
         return self._send({'statusCode': 404, 'message': 'not found'}, 404)
+    def sp_err(self, code, typ, msg, ecode=None, param=None):
+        return self._send({'error': {'type': typ, 'code': ecode, 'message': msg, 'param': param}}, code)
+    def sp_auth(self, method, path, form=None):
+        entry = {'sp': method, 'path': path.split('?')[0], 'query': path.partition('?')[2], 'key_ok': self.headers.get('Authorization') == 'Bearer ' + SP_KEY,
+                 'version': self.headers.get('Stripe-Version'), 'idem': self.headers.get('Idempotency-Key'), 'form': form,
+                 'ctype': self.headers.get('Content-Type')}
+        log(entry); return entry['key_ok']
+    def sp_get(self):
+        path, _, q = self.path.partition('?')
+        if not self.sp_auth('GET', self.path): return self.sp_err(401, 'invalid_request_error', 'Invalid API Key provided')
+        if path == '/stripe/v1/account':
+            return self._send({'id': 'acct_fake', 'object': 'account', 'country': 'BR', 'default_currency': 'brl', 'charges_enabled': True, 'payouts_enabled': True,
+                               'capabilities': {'card_payments': 'active'}, 'settings': {'payments': {'statement_descriptor': 'LIVEIRA TEST'}}})
+        if path.startswith('/stripe/v1/webhook_endpoints/'):
+            wid = path.rsplit('/', 1)[1]
+            if wid != 'we_fake123456': return self.sp_err(404, 'invalid_request_error', 'No such webhook endpoint', 'resource_missing')
+            return self._send({'id': wid, 'object': 'webhook_endpoint', 'url': 'https://liveira-shop.kelumayou.workers.dev/stripe/webhook', 'status': 'enabled', 'api_version': '2024-06-20',
+                               'enabled_events': ['checkout.session.completed', 'checkout.session.async_payment_succeeded', 'checkout.session.async_payment_failed',
+                                                  'checkout.session.expired', 'charge.refunded', 'charge.dispute.created']})
+        if path.startswith('/stripe/v1/checkout/sessions/'):
+            if SP_MODE['get'] != 200: return self.sp_err(SP_MODE['get'], 'api_error', 'fake error')
+            sid = path.rsplit('/', 1)[1]; ss = SP_SESS.get(sid)
+            if not ss: return self.sp_err(404, 'invalid_request_error', 'No such checkout.session', 'resource_missing')
+            out = dict(ss)
+            if 'expand[]=payment_intent' in urllib.parse.unquote(q) and ss.get('payment_intent'): out['payment_intent'] = SP_PIS.get(ss['payment_intent'])
+            return self._send(out)
+        if path.startswith('/stripe/v1/charges/'):
+            ch = SP_CHARGES.get(path.rsplit('/', 1)[1])
+            return self._send(ch) if ch else self.sp_err(404, 'invalid_request_error', 'No such charge', 'resource_missing')
+        if path.startswith('/stripe/v1/payment_intents/'):
+            pi = SP_PIS.get(path.rsplit('/', 1)[1])
+            return self._send(pi) if pi else self.sp_err(404, 'invalid_request_error', 'No such payment_intent', 'resource_missing')
+        return self.sp_err(404, 'invalid_request_error', 'Unrecognized request URL')
+    def sp_post(self, body):
+        form = dict(urllib.parse.parse_qsl(body, keep_blank_values=True))
+        if not self.sp_auth('POST', self.path, form): return self.sp_err(401, 'invalid_request_error', 'Invalid API Key provided')
+        if self.path == '/stripe/v1/checkout/sessions':
+            for k in form:
+                if k not in SP_DOC: log({'violation': ['unexpected Stripe checkout param ' + k], 'method': 'stripe session', 'body': form})
+            if self.headers.get('Content-Type') != 'application/x-www-form-urlencoded': log({'violation': ['stripe content-type'], 'method': 'stripe session'})
+            idem = self.headers.get('Idempotency-Key')
+            if idem and idem in SP_IDEM: return self._send(SP_SESS[SP_IDEM[idem]])
+            if SP_MODE['create'] != 200: return self.sp_err(SP_MODE['create'], 'invalid_request_error', 'fake create error', 'parameter_invalid', 'line_items[0][price_data][currency]')
+            n = next(sp_counter); sid = 'cs_test_a1Fake%06dSessionXYZ' % n
+            amt = int(form['line_items[0][price_data][unit_amount]']) * int(form.get('line_items[0][quantity]', 1))
+            meta = {k[9:-1]: v for k, v in form.items() if k.startswith('metadata[')}
+            ss = {'id': sid, 'object': 'checkout.session', 'url': 'https://checkout.stripe.com/c/pay/' + sid + '#fidkdWxOYHwnPyd1blpxYHZxWjA0', 'amount_total': amt,
+                  'currency': form.get('line_items[0][price_data][currency]'), 'status': 'open', 'payment_status': 'unpaid', 'client_reference_id': form.get('client_reference_id'),
+                  'metadata': meta, 'expires_at': int(form.get('expires_at', 0)), 'payment_intent': None, 'mode': form.get('mode'), 'livemode': False}
+            SP_SESS[sid] = ss
+            if idem: SP_IDEM[idem] = sid
+            return self._send(ss)
+        if self.path.startswith('/stripe/v1/checkout/sessions/') and self.path.endswith('/expire'):
+            sid = self.path.split('/')[5]; ss = SP_SESS.get(sid)
+            if not ss: return self.sp_err(404, 'invalid_request_error', 'No such checkout.session', 'resource_missing')
+            if ss['status'] != 'open': return self.sp_err(400, 'invalid_request_error', 'Only Checkout Sessions with a status in ["open"] can be expired.')
+            ss['status'] = 'expired'; return self._send(ss)
+        return self.sp_err(404, 'invalid_request_error', 'Unrecognized request URL')
     def do_GET(self):
+        if self.path.startswith('/stripe/v1/'): return self.sp_get()
         if self.path.startswith('/np/v1/'): return self.np_get()
         if self.path.startswith('/sapi/v1/pay/transactions'): return self.binance()
         if self.path == '/v1/payment/accepted-currencies':
@@ -137,6 +204,24 @@ class H(BaseHTTPRequestHandler):
         self._send({'ok': False}, 404)
     def do_POST(self):
         n = int(self.headers.get('Content-Length') or 0); body = self.rfile.read(n).decode(errors='replace') if n else ''
+        if self.path.startswith('/stripe/v1/'): return self.sp_post(body)
+        if self.path.startswith('/_sp/pay/'):  # mark a session paid: complete/paid + PaymentIntent + Charge
+            sid = self.path.split('/')[3]; ss = SP_SESS[sid]; o = json.loads(body) if body else {}
+            pi, ch = 'pi_fake' + sid[-14:], 'ch_fake' + sid[-14:]
+            ss.update({'status': o.get('status', 'complete'), 'payment_status': o.get('payment_status', 'paid'), 'payment_intent': pi})
+            for k in ('amount_total', 'currency'):
+                if k in o: ss[k] = o[k]
+            SP_PIS[pi] = {'id': pi, 'object': 'payment_intent', 'latest_charge': ch, 'metadata': ss.get('metadata', {}), 'amount': ss['amount_total'], 'currency': ss['currency']}
+            SP_CHARGES.setdefault(ch, {'id': ch, 'object': 'charge', 'payment_intent': pi, 'amount': ss['amount_total'], 'amount_refunded': 0, 'refunded': False, 'currency': ss['currency']})
+            return self._send({'ok': True, 'payment_intent': pi, 'charge': ch})
+        if self.path.startswith('/_sp/session/'):
+            sid = self.path.split('/')[3]; SP_SESS[sid].update(json.loads(body)); return self._send({'ok': True})
+        if self.path.startswith('/_sp/charge/'):
+            ch = self.path.split('/')[3]; SP_CHARGES.setdefault(ch, {'id': ch, 'object': 'charge'}).update(json.loads(body)); return self._send({'ok': True})
+        if self.path.startswith('/_sp/pi/'):
+            pi = self.path.split('/')[3]; SP_PIS.setdefault(pi, {'id': pi, 'object': 'payment_intent'}).update(json.loads(body)); return self._send({'ok': True})
+        if self.path.startswith('/_sp/mode/'):
+            _, _, _, k, st = self.path.split('/'); SP_MODE[k] = int(st); return self._send({'ok': True})
         if self.path == '/np/v1/invoice':
             d = json.loads(body); iid = str(next(np_counter))
             for k in d:

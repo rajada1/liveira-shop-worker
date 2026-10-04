@@ -1,4 +1,4 @@
-"""Local integration tests: bot UX + OxaPay security + Binance Pay + NOWPayments + token API + admin. Run against wrangler dev on :8799
+"""Local integration tests: bot UX + OxaPay security + Binance Pay + NOWPayments + Stripe + token API + admin. Run against wrangler dev on :8799
 (and :8798 = same Worker without the Binance secrets)."""
 import json, hmac, hashlib, subprocess, time, urllib.request, urllib.error, concurrent.futures as cf, itertools, re
 BASE = 'http://127.0.0.1:8799'; KEY = b'local_test_merchant_key'; FAKE = 'http://127.0.0.1:9911'
@@ -233,10 +233,10 @@ s = last_screen(ADM.msg('/start')); check('maintenance: admin still gets home', 
 sql("UPDATE settings SET value='0' WHERE key='maintenance_mode'")
 
 # ───── toggle off
-sql("UPDATE settings SET value='0' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled')")
+sql("UPDATE settings SET value='0' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled','stripe_enabled')")
 ev, _, scr = nav(A, 'topup', 'top-up disabled → unavailable (menu not latest)', ['unavailable'], move=True)
 ev, ans = A.cb('tun:10'); check('disabled → no invoice', not [e for e in ev if e.get('oxapay')])
-sql("UPDATE settings SET value='1' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled')")
+sql("UPDATE settings SET value='1' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled','stripe_enabled')")
 
 # ───── OxaPay security (unchanged behaviour)
 ev, _, _ = nav(A, 'tun:25', 'invoice $25'); inv = [e for e in ev if e.get('oxapay') == 'invoice'][0]; T4, P4 = inv['track_id'], inv['body']['order_id']
@@ -825,6 +825,220 @@ s_, body, _ = req('GET', '/admin/api/payments?status=failed', None, AH); check('
 s_, body, _ = req('GET', '/admin/app.js', None); check('panel app.js: NOWPayments settings card + provider label', 'Recarga via NOWPayments' in body and 'NOWPayments: ' in body and 'Testar conexão com a NOWPayments' in body)
 ev = NH.msg('/profile'); s_ = last_screen(ev); check('profile lists "NOWPayments top-up"', s_ and 'NOWPayments top-up' in s_['body']['text'], s_ and s_['body']['text'])
 
+# ───── Stripe card top-ups (fake API on :9911/stripe/v1, webhook secret whsec_test_local_0123456789abcdef)
+SPW = b'whsec_test_local_0123456789abcdef'
+sp_evt_n = itertools.count(1)
+def sp_sig(raw, t=None, secret=SPW):
+    t = int(time.time()) if t is None else t
+    return f"t={t},v1=" + hmac.new(secret, f"{t}.".encode() + raw, hashlib.sha256).hexdigest()
+def sp_event(etype, obj, eid=None):
+    return {'id': eid or 'evt_test%08dFakeEvt' % next(sp_evt_n), 'object': 'event', 'type': etype, 'livemode': False, 'created': int(time.time()),
+            'api_version': '2024-06-20', 'data': {'object': obj}}
+def sp_send(evt, sig=None, raw=None, base=None):
+    raw = raw if raw is not None else json.dumps(evt).encode()
+    return req('POST', '/stripe/webhook', raw=raw, headers={'Stripe-Signature': sp_sig(raw) if sig is None else sig}, base=base)
+def sp_sid(pay): return pay['track_id'].split(':', 1)[1]
+def sp_sess_obj(pay, status='complete', payment_status='paid', **kw):
+    o = {'id': sp_sid(pay), 'object': 'checkout.session', 'client_reference_id': pay['id'], 'metadata': {'topup_id': pay['id']}, 'status': status,
+         'payment_status': payment_status, 'amount_total': int(round(pay['amount_usd'] * 100)), 'currency': 'usd'}
+    o.update(kw); return o
+def sp_paid(pay, **kw): return json.loads(fpost(f"/_sp/pay/{sp_sid(pay)}", kw))
+def sp_calls(ev, method=None, contains=''): return [x for x in ev if x.get('sp') and (method is None or x['sp'] == method) and contains in x['path']]
+def sp_topups(pid, method='stripe'): return sql(f"SELECT amount FROM topups WHERE ref='{pid}' AND method='{method}' ORDER BY id")
+def sp_row(pid): r = sql(f"SELECT * FROM stripe_sessions WHERE payment_id='{pid}'"); return r[0] if r else None
+def sp_new(u, amount):
+    ev, ans = u.cb(f'spn:{amount}')
+    p = sql(f"SELECT * FROM payments WHERE provider='stripe' AND telegram_user_id={u.uid} ORDER BY created_at DESC LIMIT 1")
+    return ev, ans, sp_calls(ev, 'POST', '/checkout/sessions'), (p[0] if p else None)
+
+SA = User(555070, 'Sara', 'sara'); ev = SA.msg('/start'); SA.mid = last_screen(ev)['mid']
+ev, _, scr = nav(SA, 'topup', 'top-up menu offers 💳 Pay by card (Stripe)', ['Pay by card (Stripe)', 'min $5.00'], ['sp', 'np', 'kp:', 'bn'])
+check('💳 Pay by card (Stripe) is its own row', any([b.get('callback_data') for b in r] == ['sp'] for r in scr['body']['reply_markup']['inline_keyboard']))
+ev, _, scr = nav(SA, 'sp', 'Stripe screen', ['💳 <b>Pay by card (Stripe)</b>', 'Min $5.00 · Max $500.00', 'secure Stripe page'], ['spc:5', 'spc:10', 'spc:25', 'spc:50', 'sk:', 'topup'])
+ev, _, scr = nav(SA, 'sk:', 'Stripe keypad', ['Other amount · Card', 'Min $5.00'], ['sk:1', 'skok:', 'sp'])
+ev, ans = SA.cb('skok:3'); check('card keypad 3 → toast "Minimum for card payments is $5.00", no session', ans and 'Minimum for card payments is $5.00' in ans[0]['body'].get('text', '') and not sp_calls(ev), ans)
+ev, ans = SA.cb('sk:5001'); check('card keypad above the max → toast', ans and 'Maximum is $500.00' in ans[0]['body'].get('text', ''), ans)
+ev, _, scr = nav(SA, 'skok:20', 'card keypad 20 → confirm', ['💳 <b>Confirm card top-up</b>', 'Amount: <b>$20.00</b> (charged in USD)'], ['spn:20', 'sp'])
+ev, ans, calls, sa = sp_new(SA, 20)
+f = calls[0]['form'] if calls else {}
+check('create → POST /v1/checkout/sessions: payment mode, card only, USD 2000 cents, "Wallet top-up", ids in client_reference_id + metadata, t.me success/cancel, ~60 min expiry',
+      len(calls) == 1 and calls[0]['key_ok'] and calls[0]['version'] == '2024-06-20' and calls[0]['idem'] == f"liveira-{(sa or {}).get('id')}"
+      and calls[0]['ctype'] == 'application/x-www-form-urlencoded' and f.get('mode') == 'payment' and f.get('payment_method_types[0]') == 'card'
+      and f.get('line_items[0][price_data][currency]') == 'usd' and f.get('line_items[0][price_data][unit_amount]') == '2000' and f.get('line_items[0][quantity]') == '1'
+      and f.get('line_items[0][price_data][product_data][name]') == 'Wallet top-up' and f.get('client_reference_id') == sa['id'] and f.get('metadata[topup_id]') == sa['id']
+      and f.get('metadata[telegram_user_id]') == str(SA.uid) and f.get('payment_intent_data[metadata][topup_id]') == sa['id']
+      and f.get('success_url') == 'https://t.me/liveira_test_bot?start=sp_paid' and f.get('cancel_url') == 'https://t.me/liveira_test_bot?start=topup'
+      and 3500 < int(f.get('expires_at', 0)) - time.time() <= 3600, (calls and calls[0], f))
+card = last_screen(ev)
+check('card: "💳 Pay by card" = session url, Card (Stripe) how-it-works, check + cancel', card and any(x.get('url', '').startswith('https://checkout.stripe.com/c/pay/' + sp_sid(sa)) for x in buttons(card))
+      and 'Card (Stripe)' in card['body']['text'] and 'secure Stripe page' in card['body']['text'] and f"tuchk:{sa['id']}" in cbdata(card) and f"tux:{sa['id']}" in cbdata(card), card and card['body'])
+check('payments row: provider stripe, pending, track stripe:<cs id>, expires in ~60 min; stripe_sessions row open/unpaid',
+      sa and sa['provider'] == 'stripe' and sa['status'] == 'pending' and sa['track_id'].startswith('stripe:cs_test_') and sa['id'].startswith('sp_') and 55 * 60000 < iso_ms(sa['expires_at']) - now_ms() <= 60 * 60000
+      and sp_row(sa['id'])['status'] == 'open' and sp_row(sa['id'])['amount_total'] == 2000, (sa, sp_row(sa['id']) if sa else None))
+SA.mid = card['mid']
+ev, ans = SA.cb('spn:20'); check('double tap → open session reused, no second create', not sp_calls(ev, 'POST') and len(sql(f"SELECT id FROM payments WHERE provider='stripe' AND telegram_user_id={SA.uid}")) == 1, ans)
+
+# webhook signature
+done = sp_event('checkout.session.completed', sp_sess_obj(sa))
+raw = json.dumps(done).encode()
+s_, body, _ = sp_send(done, sig='t=%d,v1=%s' % (int(time.time()), '0' * 64)); check('webhook with a wrong signature → 400, nothing stored', s_ == 400 and not sql(f"SELECT id FROM stripe_events WHERE id='{done['id']}'"), (s_, body))
+s_, body, _ = req('POST', '/stripe/webhook', raw=raw); check('webhook without Stripe-Signature → 400', s_ == 400, s_)
+s_, body, _ = sp_send(done, sig=sp_sig(raw, secret=b'whsec_other_secret_xxxxxxxxxxxxxx')); check('webhook signed with another secret → 400', s_ == 400, s_)
+s_, body, _ = sp_send(done, sig=sp_sig(raw, t=int(time.time()) - 400)); check('correct signature but timestamp 400 s old → 400 (5 min tolerance)', s_ == 400, s_)
+s_, body, _ = sp_send(done, sig=sp_sig(raw, t=int(time.time()) + 400)); check('timestamp 400 s in the future → 400', s_ == 400, s_)
+s_, body, _ = sp_send(done, sig=sp_sig(raw), raw=raw.replace(b'"paid"', b'"unpaid"', 1)); check('tampered body with the original signature → 400', s_ == 400, s_)
+s_, body, _ = sp_send(done, sig=sp_sig(raw).split(',')[0] + ',v1=' + 'f' * 64 + ',v0=abc'); check('only a wrong v1 → 400', s_ == 400, s_)
+# signed "completed" event, but Stripe still says open/unpaid → not credited (session re-fetched with the secret key)
+m = mark(); good = sp_sig(raw); t0 = good.split(',')[0]
+s_, body, _ = sp_send(done, sig=good.replace(',v1=', ',v1=' + '0' * 64 + ',v1=')); ev = since(m)
+check('signed checkout.session.completed (two v1, one valid) but GET session says open/unpaid → 200, NOT credited, re-fetched with the key',
+      s_ == 200 and not SA.bal() and sql(f"SELECT credited FROM payments WHERE id='{sa['id']}'")[0]['credited'] == 0
+      and [x for x in sp_calls(ev, 'GET', '/checkout/sessions/' + sp_sid(sa)) if x['key_ok'] and 'payment_intent' in urllib.parse.unquote(x['query'])], (s_, body, sp_calls(ev)))
+pi = sp_paid(sa)
+m = mark(); s_, body, _ = sp_send(sp_event('checkout.session.completed', sp_sess_obj(sa))); ev = since(m)
+p2 = sql(f"SELECT * FROM payments WHERE id='{sa['id']}'")[0]
+check('completed + GET says complete/paid → credited $20.00 once (topups method stripe), PaymentIntent/charge linked',
+      s_ == 200 and abs((SA.bal() or 0) - 20) < 1e-9 and p2['credited'] == 1 and p2['status'] == 'paid' and [r['amount'] for r in sp_topups(sa['id'])] == [20]
+      and sp_row(sa['id'])['payment_intent'] == pi['payment_intent'] and sp_row(sa['id'])['charge_id'] == pi['charge'] and sp_row(sa['id'])['credited'] == 1, (SA.bal(), p2, sp_row(sa['id'])))
+um = user_msgs(ev, SA); am = admin_msgs(ev)
+check('customer told ✅ Payment confirmed +$20.00; card → paid', any(x['body']['text'].startswith('✅ Payment confirmed, +$20.00 added. New balance: $20.00') for x in um)
+      and any(x['body'].get('message_id') == SA.mid and 'Payment received' in x['body']['text'] for x in tg(ev, 'editMessageText')), [x['body']['text'][:80] for x in um])
+check('admins told: Card top-up credited (Stripe), new balance', am and 'Card top-up credited (Stripe)' in am[0]['body']['text'] and 'New balance: $20.00' in am[0]['body']['text'], am and am[0]['body']['text'])
+check('audit stripe_credit', sql(f"SELECT COUNT(*) AS n FROM audit_log WHERE action='stripe_credit' AND json_extract(details_json,'$.payment_id')='{sa['id']}'")[0]['n'] == 1)
+dup = sp_event('checkout.session.completed', sp_sess_obj(sa))
+s1 = sp_send(dup)[0]; m = mark(); s2, body2, _ = sp_send(dup); ev = since(m)
+check('same event delivered twice → 200 "duplicate", not processed again (no API call, no message)', s1 == 200 and s2 == 200 and 'duplicate' in body2 and not sp_calls(ev) and not tg(ev, 'sendMessage'), (s1, s2, body2))
+with cf.ThreadPoolExecutor(4) as ex: rs = list(ex.map(lambda k: sp_send(sp_event('checkout.session.completed' if k % 2 else 'checkout.session.async_payment_succeeded', sp_sess_obj(sa))), range(4)))
+m = mark(); sp_send(sp_event('checkout.session.completed', sp_sess_obj(sa))); ev = since(m)
+check('repeated + concurrent events (different ids) → still credited exactly once, no new messages', all(r[0] == 200 for r in rs) and abs(SA.bal() - 20) < 1e-9 and len(sp_topups(sa['id'])) == 1 and not tg(ev, 'sendMessage'), (rs, SA.bal()))
+m = mark(); s_, body, _ = sp_send(sp_event('checkout.session.completed', {'id': 'cs_live_a1OtherIntegrationSession', 'object': 'checkout.session', 'status': 'complete', 'payment_status': 'paid', 'amount_total': 999, 'currency': 'usd', 'metadata': {}})); ev = since(m)
+check('event for a session of another integration on the same account → 200, ignored quietly (no API call, no message), audited', s_ == 200 and not sp_calls(ev) and not tg(ev, 'sendMessage')
+      and sql("SELECT COUNT(*) AS n FROM audit_log WHERE action='stripe_event_unmatched'")[0]['n'] >= 1, (s_, body))
+SB = User(555071, 'Sol', 'sol'); SB.msg('/start'); _, _, _, sb = sp_new(SB, 25)
+m = mark(); s_, body, _ = sp_send(sp_event('checkout.session.completed', sp_sess_obj(sb, id='cs_test_a1ForgedSessionIdXYZ123'))); ev = since(m)
+check('our client_reference_id but a different session id → not credited', s_ == 200 and not SB.bal() and not sp_calls(ev, 'GET'), (s_, SB.bal()))
+sp_paid(sb, amount_total=100)
+m = mark(); sp_send(sp_event('checkout.session.completed', sp_sess_obj(sb))); sp_send(sp_event('checkout.session.completed', sp_sess_obj(sb))); ev = since(m)
+check('paid session whose amount_total differs from the top-up → review, not credited, admins told once', not SB.bal() and sql(f"SELECT status, last_status FROM payments WHERE id='{sb['id']}'")[0] == {'status': 'review', 'last_status': 'amount_mismatch'}
+      and len([x for x in admin_msgs(ev) if 'needs review' in x['body']['text']]) == 1, (SB.bal(), sql(f"SELECT status, last_status FROM payments WHERE id='{sb['id']}'")))
+# GET fails → 500 (Stripe retries), event not marked processed; retry credits
+SC = User(555072, 'Cris', 'cris'); SC.msg('/start'); _, _, _, sc = sp_new(SC, 10); sp_paid(sc)
+fpost('/_sp/mode/get/500'); ec = sp_event('checkout.session.completed', sp_sess_obj(sc))
+s_, body, _ = sp_send(ec); check('session re-fetch fails → 500 (Stripe retries), not credited, event not kept', s_ == 500 and not SC.bal() and not sql(f"SELECT id FROM stripe_events WHERE id='{ec['id']}'"), (s_, body))
+fpost('/_sp/mode/get/200'); s_, body, _ = sp_send(ec)
+check('Stripe retries the same event → credited $10.00', s_ == 200 and abs((SC.bal() or 0) - 10) < 1e-9 and len(sp_topups(sc['id'])) == 1, (s_, SC.bal()))
+# missed webhook: cron fallback
+SD = User(555073, 'Davi', 'davi'); SD.msg('/start'); _, _, _, sd = sp_new(SD, 15); sp_paid(sd)
+ev = cron(); check('cron: a session created < 2 min ago is not polled yet', not sp_calls(ev, 'GET', sp_sid(sd)) and not SD.bal())
+sql(f"UPDATE stripe_sessions SET updated_at='2026-01-01T00:00:00.000Z' WHERE payment_id='{sd['id']}'")
+m = mark(); ev = cron()
+check('missed webhook → cron re-fetches the session and credits $15.00, customer + admins told', abs((SD.bal() or 0) - 15) < 1e-9 and len(sp_topups(sd['id'])) == 1
+      and any(x['body']['text'].startswith('✅ Payment confirmed, +$15.00') for x in user_msgs(ev, SD)) and admin_msgs(ev), (SD.bal(), sp_calls(ev)))
+sql(f"UPDATE stripe_sessions SET updated_at='2026-01-01T00:00:00.000Z', checked_at=NULL WHERE payment_id='{sd['id']}'")
+ev = cron(); check('credited sessions are not polled again', not sp_calls(ev, 'GET', sp_sid(sd)) and len(sp_topups(sd['id'])) == 1)
+# expired
+SE = User(555074, 'Enzo', 'enzo'); SE.msg('/start'); _, _, _, se = sp_new(SE, 12)
+fpost(f"/_sp/session/{sp_sid(se)}", {'status': 'expired'})
+s_, body, _ = sp_send(sp_event('checkout.session.expired', sp_sess_obj(se, status='expired', payment_status='unpaid')))
+check('checkout.session.expired → top-up expired, not credited', s_ == 200 and sql(f"SELECT status FROM payments WHERE id='{se['id']}'")[0]['status'] == 'expired' and not SE.bal())
+ev = cron(); check('expired sessions are not polled any more', not sp_calls(ev, 'GET', sp_sid(se)))
+# check status button
+SF = User(555075, 'Flor', 'flor'); SF.msg('/start'); ev, _, _, sf = sp_new(SF, 8); SF.mid = last_screen(ev)['mid']
+ev, ans = SF.cb(f"tuchk:{sf['id']}")
+check('check status before paying → GET session → "No card payment yet" toast', ans and 'No card payment yet' in ans[0]['body'].get('text', '') and sp_calls(ev, 'GET', sp_sid(sf)), ans)
+sp_paid(sf); sql(f"UPDATE stripe_sessions SET checked_at=NULL WHERE payment_id='{sf['id']}'")
+ev, ans = SF.cb(f"tuchk:{sf['id']}")
+check('"I\'ve paid · Check status" after paying → credited $8.00', ans and 'Payment confirmed' in ans[0]['body'].get('text', '') and abs((SF.bal() or 0) - 8) < 1e-9, (ans, SF.bal()))
+# cancel: session expired at Stripe first
+SG = User(555076, 'Gabi', 'gabi'); SG.msg('/start'); ev, _, _, sg = sp_new(SG, 9); SG.mid = last_screen(ev)['mid']
+ev, ans = SG.cb(f"tux:{sg['id']}"); c = last_screen(ev)
+check('❌ Cancel → POST /checkout/sessions/{id}/expire, canceled, card says not charged, no Pay button',
+      sp_calls(ev, 'POST', sp_sid(sg) + '/expire') and sql(f"SELECT status FROM payments WHERE id='{sg['id']}'")[0]['status'] == 'canceled' and ans and 'canceled' in ans[0]['body'].get('text', '').lower()
+      and c and 'your card was not charged' in c['body']['text'] and not any(x.get('url') for x in buttons(c)), (ans, c and c['body']['text']))
+SH = User(555077, 'Hana', 'hana'); SH.msg('/start'); ev, _, _, sh = sp_new(SH, 11); SH.mid = last_screen(ev)['mid']; sp_paid(sh)
+ev, ans = SH.cb(f"tux:{sh['id']}")
+check('cancel after paying (expire refused by Stripe) → session synced → credited, toast says already completed', ans and 'already completed' in ans[0]['body'].get('text', '') and abs((SH.bal() or 0) - 11) < 1e-9, (ans, SH.bal()))
+# async payment failed
+SI = User(555078, 'Ivo', 'ivo'); SI.msg('/start'); _, _, _, si = sp_new(SI, 13); sp_paid(si, payment_status='unpaid')
+s_, body, _ = sp_send(sp_event('checkout.session.completed', sp_sess_obj(si, payment_status='unpaid')))
+check('completed but payment_status unpaid (delayed method) → "paying", not credited', sql(f"SELECT status FROM payments WHERE id='{si['id']}'")[0]['status'] == 'paying' and not SI.bal())
+m = mark(); s_, body, _ = sp_send(sp_event('checkout.session.async_payment_failed', sp_sess_obj(si, payment_status='unpaid'))); ev = since(m)
+check('async_payment_failed → failed, customer + admins told', sql(f"SELECT status FROM payments WHERE id='{si['id']}'")[0]['status'] == 'failed' and not SI.bal()
+      and any('card payment for the $13.00 top-up failed' in x['body']['text'] for x in user_msgs(ev, SI)) and any('Stripe card payment failed' in x['body']['text'] for x in admin_msgs(ev)), [x['body']['text'][:80] for x in tg(ev, 'sendMessage')])
+# refunds
+chA = sp_row(sa['id'])['charge_id']
+fpost(f"/_sp/charge/{chA}", {'amount_refunded': 2000, 'refunded': True})
+m = mark(); s_, body, _ = sp_send(sp_event('charge.refunded', {'id': chA, 'object': 'charge', 'payment_intent': sp_row(sa['id'])['payment_intent'], 'amount': 2000, 'amount_refunded': 2000, 'refunded': True, 'currency': 'usd'})); ev = since(m)
+am = admin_msgs(ev)
+check('charge.refunded (full) → charge re-read with the key, $20.00 deducted (balance covered it), topup −20 "stripe_refund"',
+      s_ == 200 and abs(SA.bal() - 0) < 1e-9 and [r['amount'] for r in sp_topups(sa['id'], 'stripe_refund')] == [-20] and sp_calls(ev, 'GET', '/charges/' + chA)
+      and sp_row(sa['id'])['debited_usd'] == 20 and sp_row(sa['id'])['refunded_cents'] == 2000, (SA.bal(), sp_row(sa['id'])))
+check('admins get a prominent 🚨 STRIPE REFUND notice with the deduction; customer told', am and '🚨 <b>STRIPE REFUND</b>' in am[0]['body']['text'] and 'Deducted from the wallet: <b>$20.00</b>' in am[0]['body']['text']
+      and any('was refunded, so $20.00 was deducted' in x['body']['text'] for x in user_msgs(ev, SA)), [x['body']['text'][:120] for x in tg(ev, 'sendMessage')])
+m = mark(); sp_send(sp_event('charge.refunded', {'id': chA, 'object': 'charge', 'payment_intent': sp_row(sa['id'])['payment_intent'], 'amount': 2000, 'amount_refunded': 2000, 'refunded': True, 'currency': 'usd'})); ev = since(m)
+check('another refund event for the same (already deducted) refund → nothing more deducted', abs(SA.bal() - 0) < 1e-9 and len(sp_topups(sa['id'], 'stripe_refund')) == 1, SA.bal())
+chD = sp_row(sd['id'])['charge_id']
+fpost(f"/_sp/charge/{chD}", {'amount_refunded': 500}); sp_send(sp_event('charge.refunded', {'id': chD, 'object': 'charge', 'payment_intent': None, 'amount_refunded': 500, 'currency': 'usd'}))
+check('partial refund $5 → $5 deducted (found by charge id)', abs(SD.bal() - 10) < 1e-9 and [r['amount'] for r in sp_topups(sd['id'], 'stripe_refund')] == [-5], (SD.bal(), sp_topups(sd['id'], 'stripe_refund')))
+fpost(f"/_sp/charge/{chD}", {'amount_refunded': 1500, 'refunded': True}); sp_send(sp_event('charge.refunded', {'id': chD, 'object': 'charge', 'amount_refunded': 1500, 'currency': 'usd'}))
+check('second partial refund (total $15) → only the difference $10 deducted', abs(SD.bal() - 0) < 1e-9 and [r['amount'] for r in sp_topups(sd['id'], 'stripe_refund')] == [-5, -10], (SD.bal(), sp_topups(sd['id'], 'stripe_refund')))
+# dispute while the customer already spent the balance
+sql(f"UPDATE users SET balance=3 WHERE user_id={SC.uid}")
+m = mark(); s_, body, _ = sp_send(sp_event('charge.dispute.created', {'id': 'dp_fakeDispute000001', 'object': 'dispute', 'charge': sp_row(sc['id'])['charge_id'], 'payment_intent': sp_row(sc['id'])['payment_intent'],
+                                                                     'amount': 1000, 'currency': 'usd', 'reason': 'fraudulent', 'status': 'needs_response', 'evidence_details': {'due_by': int(time.time()) + 7 * 86400}})); ev = since(m)
+am = admin_msgs(ev)
+check('charge.dispute.created with balance $3 < $10 → NOT deducted, flagged unrecovered $10, prominent admin notice with reason + deadline, customer not messaged',
+      s_ == 200 and abs(SC.bal() - 3) < 1e-9 and sp_row(sc['id'])['unrecovered_usd'] == 10 and sp_row(sc['id'])['dispute_id'] == 'dp_fakeDispute000001'
+      and am and 'STRIPE DISPUTE (chargeback)' in am[0]['body']['text'] and 'NOT deducted' in am[0]['body']['text'] and 'fraudulent' in am[0]['body']['text'] and 'Evidence due by' in am[0]['body']['text']
+      and not user_msgs(ev, SC), (SC.bal(), sp_row(sc['id']), am and am[0]['body']['text']))
+SJ = User(555079, 'Jade', 'jade'); SJ.msg('/start'); ev, _, _, sj = sp_new(SJ, 30); sp_paid(sj); sp_send(sp_event('checkout.session.completed', sp_sess_obj(sj)))
+m = mark(); sp_send(sp_event('charge.dispute.created', {'id': 'dp_fakeDispute000002', 'object': 'dispute', 'charge': sp_row(sj['id'])['charge_id'], 'amount': 3000, 'currency': 'usd', 'reason': 'product_not_received', 'status': 'needs_response'})); ev = since(m)
+check('dispute with enough balance → $30.00 deducted, admins told', abs(SJ.bal() - 0) < 1e-9 and sp_row(sj['id'])['debited_usd'] == 30 and any('Deducted from the wallet: <b>$30.00</b>' in x['body']['text'] for x in admin_msgs(ev)), (SJ.bal(), sp_row(sj['id'])))
+fpost('/_sp/pi/pi_otherIntegration01', {'metadata': {}})
+m = mark(); s_, body, _ = sp_send(sp_event('charge.refunded', {'id': 'ch_otherIntegration01', 'object': 'charge', 'payment_intent': 'pi_otherIntegration01', 'amount_refunded': 500, 'currency': 'usd'})); ev = since(m)
+check('refund of another integration\'s charge → 200, ignored (no message)', s_ == 200 and not tg(ev, 'sendMessage'), (s_, body))
+s_, body, _ = sp_send(sp_event('customer.subscription.updated', {'id': 'sub_123', 'object': 'subscription'})); check('unsubscribed event type → 200 ignored', s_ == 200 and 'ignored' in body)
+# shortfall offers card
+ev, _, scr = nav(SG, 'days:liveira_access:7', 'shortfall offers 💳 card', ['Not enough balance'], ['tuc:10:liveira_access:7', 'spc:10:liveira_access:7'], move=True)
+# OxaPay confirm screen offers card
+ev, _, scr = nav(SG, 'tuc:25', 'OxaPay confirm offers 💳 card', ['Confirm top-up'], ['tun:25', 'spn:25'])
+# OxaPay + NOWPayments off → typed amount goes to card
+sql("UPDATE settings SET value='0' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled')")
+ev = SH.msg('40'); s_ = last_screen(ev); check('OxaPay + NOWPayments off: typed 40 → card confirm', s_ and 'Confirm card top-up' in s_['body']['text'] and 'spn:40' in cbdata(s_), s_ and s_['body']['text'])
+ev = SH.msg('/topup'); s_ = last_screen(ev); check('OxaPay + NOWPayments off: top-up menu → card + Binance', s_ and 'sp' in cbdata(s_) and 'bn' in cbdata(s_) and 'kp:' not in cbdata(s_) and 'np' not in cbdata(s_), cbdata(s_))
+sql("UPDATE settings SET value='1' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled')")
+ev = SF.msg('/start sp_paid'); s_ = last_screen(ev)
+check('return from Stripe (start=sp_paid) → latest card top-up (paid card)', s_ and 'Payment received' in s_['body']['text'] and '$8.00' in s_['body']['text'], s_ and s_['body']['text'])
+s_, body, _ = req('PUT', '/admin/api/settings', {'stripe_enabled': '0'}, AH)
+s_ = last_screen(SH.msg('/topup')); check('stripe_enabled=0 → no 💳 card option', s_ and 'sp' not in cbdata(s_) and 'Stripe' not in s_['body']['text'])
+req('PUT', '/admin/api/settings', {'stripe_enabled': '1'}, AH)
+# admin panel
+s_, body, _ = req('GET', '/admin/api/stripe/status', None, AH); d = json.loads(body)
+check('panel: Stripe status (available, $5–$500, webhook URL, no secrets)', s_ == 200 and d['available'] and d['min'] == 5 and d['max'] == 500 and d['webhook_url'] == 'https://liveira-shop.kelumayou.workers.dev/stripe/webhook'
+      and 'sk_test' not in body and 'whsec' not in body and d['refunds_disputes'] >= 3, d)
+s_, body, _ = req('PUT', '/admin/api/settings', {'stripe_min': '0.5'}, AH); check('settings: card minimum 0.5 → 400', s_ == 400, (s_, body))
+req('PUT', '/admin/api/settings', {'stripe_max': '100'}, AH)
+s_, body, _ = req('GET', '/admin/api/stripe/status', None, AH); check('card max 100 applied', json.loads(body)['max'] == 100)
+ev, ans = SH.cb('spc:150'); check('above the card max → keypad error', last_screen(ev) and 'Maximum for card payments is $100.00' in last_screen(ev)['body']['text'])
+req('PUT', '/admin/api/settings', {'stripe_max': '500'}, AH)
+sql("INSERT OR REPLACE INTO settings (key, value) VALUES ('stripe_webhook_id', 'we_fake123456')")
+s_, body, _ = req('POST', '/admin/api/stripe/test', None, AH); d = json.loads(body)
+check('panel: "Testar conexão" → account BR/brl/charges+payouts, webhook enabled with all events', s_ == 200 and d['ok'] and d['account']['country'] == 'BR' and d['account']['charges_enabled']
+      and d['webhook']['status'] == 'enabled' and d['webhook']['url_ok'] and d['webhook']['missing_events'] == [], d)
+m = mark(); s_, body, _ = req('POST', '/admin/api/stripe/test-session', None, AH); d = json.loads(body); ev = since(m)
+check('panel: test checkout → real USD session at the minimum, expired right away, top-up canceled, no Telegram message', s_ == 200 and d['ok'] and d['amount'] == 5 and d['expired']
+      and sp_calls(ev, 'POST', d['session_id'] + '/expire') and sql(f"SELECT status, telegram_user_id FROM payments WHERE id='{d['payment_id']}'")[0] == {'status': 'canceled', 'telegram_user_id': 1} and not tg(ev, 'sendMessage'), d)
+s_, body, _ = req('GET', '/admin/api/payments?q=' + sp_sid(sc), None, AH); d = json.loads(body)
+check('panel payments: search by session id → provider stripe + dispute info', s_ == 200 and d['total'] == 1 and d['payments'][0]['provider'] == 'stripe' and 'DISPUTA' in (d['payments'][0]['sp_info'] or '') and 'NÃO recuperado $10.00' in d['payments'][0]['sp_info'], d)
+s_, body, _ = req('GET', '/admin/api/payments?q=' + sp_row(sa['id'])['payment_intent'], None, AH); d = json.loads(body)
+check('panel payments: search by PaymentIntent id', s_ == 200 and d['total'] == 1 and d['payments'][0]['id'] == sa['id'] and 'reembolso $20.00' in (d['payments'][0]['sp_info'] or ''), d)
+SK = User(555080, 'Kai', 'kai'); SK.msg('/start'); _, _, _, sk = sp_new(SK, 7); sp_paid(sk)
+s_, body, _ = req('POST', f"/admin/api/payments/{sk['id']}/sync", None, AH); d = json.loads(body)
+check('panel "Sincronizar" on a Stripe row → credited', s_ == 200 and d['result'] == 'credited' and abs((SK.bal() or 0) - 7) < 1e-9, d)
+s_, body, _ = req('GET', '/admin/app.js', None); check('panel app.js: Stripe settings card + provider label', 'Recarga com cartão (Stripe)' in body and 'Testar conexão com a Stripe' in body and 'Cartão (Stripe)' in body)
+ev = SA.msg('/profile'); s_ = last_screen(ev); check('profile lists "Card top-up (Stripe)" and the refund', s_ and 'Card top-up (Stripe)' in s_['body']['text'] and 'card refund / chargeback' in s_['body']['text'], s_ and s_['body']['text'])
+check('no unexpected Stripe API params / auth failures in the whole run', all(x['key_ok'] for x in logs() if x.get('sp')) and all(x['version'] == '2024-06-20' for x in logs() if x.get('sp')))
+
 # second Worker instance WITHOUT BINANCE_API_KEY / BINANCE_API_SECRET → option hidden, nothing happens
 BASE2 = 'http://127.0.0.1:8798'
 class User2(User):
@@ -849,6 +1063,11 @@ check('no NOWPayments secrets → no 🪙 NOWPayments option', 'np' not in cbdat
 s_, body, _ = req('POST', '/nowpayments/ipn', raw=b'{"payment_id":1}', headers={'x-nowpayments-sig': 'a' * 128}, base=BASE2)
 check('no NOWPayments secrets → IPN route answers 503', s_ == 503, s_)
 s_, body, _ = req('GET', '/admin/api/nowpayments/status', None, AH2, base=BASE2); check('panel (no secrets): NOWPayments not configured / hidden', json.loads(body)['configured'] is False and json.loads(body)['available'] is False)
+check('no Stripe secrets → no 💳 card option', 'sp' not in cbdata(scr) and 'Stripe' not in scr['body']['text'], scr['body']['text'])
+s_, body, _ = req('POST', '/stripe/webhook', raw=b'{"id":"evt_x"}', headers={'Stripe-Signature': 't=1,v1=' + 'a' * 64}, base=BASE2)
+check('no Stripe secrets → webhook answers 503', s_ == 503, s_)
+s_, body, _ = req('GET', '/admin/api/stripe/status', None, AH2, base=BASE2); check('panel (no secrets): Stripe not configured / hidden', json.loads(body)['configured'] is False and json.loads(body)['available'] is False)
+ev = cron(BASE2); check('no Stripe secrets → cron makes no Stripe request', not [x for x in ev if x.get('sp')])
 
 ans_all = [e for e in logs() if e.get('tg') == 'answerCallbackQuery']
 ids = [e['body']['callback_query_id'] for e in ans_all]

@@ -24,6 +24,7 @@ import { topupConfig, syncPayment, expireStale, callbackUrl, round2, oxapayAccep
 import { noteMessages } from "./chatnav.js";
 import { binanceConfigured, binanceStatus, binanceDiag, refreshHistory, verifyClaim, approveClaim, notifyClaim } from "./binance.js";
 import { npConfig, npConfigured, npStatus, npCheck, npApiStatus, refreshNpMin, createNpInvoice, ipnUrl } from "./nowpayments.js";
+import { spConfig, spConfigured, spStatus, spCheck, spAccount, createSpSession, expireSpSession, webhookUrl, spWebhookEndpoint } from "./stripe.js";
 
 const COOKIE = "__Host-lv_admin";
 const SESSION_TTL = 12 * 3600; // seconds
@@ -394,6 +395,11 @@ async function route(ctx, method, api) {
   if (api === "/nowpayments/test" && method === "POST") return npTestApi(ctx);
   if (api === "/nowpayments/test-invoice" && method === "POST") return npTestInvoiceApi(ctx);
 
+  // Stripe (status / account + webhook check / test session that is expired right away; secrets are never returned)
+  if (api === "/stripe/status" && method === "GET") return aj(await spStatus(env, ctx.settings));
+  if (api === "/stripe/test" && method === "POST") return spTestApi(ctx);
+  if (api === "/stripe/test-session" && method === "POST") return spTestSessionApi(ctx);
+
   // Tokens
   if (api === "/tokens" && method === "GET") return listTokens(ctx);
   if (api === "/tokens" && method === "POST") return createTokenAdmin(ctx);
@@ -762,6 +768,9 @@ async function listPayments({ env, url }) {
     if (/^\d+$/.test(q)) {
       conds.push("(p.telegram_user_id = ? OR p.track_id = ? OR p.track_id = ? OR p.track_id = ? OR EXISTS (SELECT 1 FROM np_payments n WHERE n.order_id=p.id AND n.payment_id=?))");
       binds.push(Number(q), q, `binance:${q}`, `np:${q}`, q);
+    } else if (/^(cs|pi|ch|dp|du)_[A-Za-z0-9_]{6,200}$/.test(q)) {
+      conds.push("(p.track_id = ? OR EXISTS (SELECT 1 FROM stripe_sessions ss WHERE ss.payment_id=p.id AND (ss.payment_intent=? OR ss.charge_id=? OR ss.dispute_id=?)))");
+      binds.push(`stripe:${q}`, q, q, q);
     } else if (q.startsWith("@")) {
       conds.push("lower(u.username) = lower(?)");
       binds.push(q.slice(1));
@@ -781,7 +790,13 @@ async function listPayments({ env, url }) {
     `SELECT p.id, p.provider, p.telegram_user_id, u.username, p.amount_usd, p.track_id, p.status, p.last_status, p.pay_link,
             p.created_at, p.updated_at, p.expires_at, p.paid_at, p.credited,
             (SELECT n.payment_id || ' · ' || n.status || COALESCE(' · ' || n.actually_paid || '/' || n.pay_amount || ' ' || upper(n.pay_currency), '')
-               FROM np_payments n WHERE n.order_id=p.id ORDER BY n.updated_at DESC LIMIT 1) AS np_info ${base}
+               FROM np_payments n WHERE n.order_id=p.id ORDER BY n.updated_at DESC LIMIT 1) AS np_info,
+            (SELECT COALESCE(ss.status, '?') || '/' || COALESCE(ss.payment_status, '?')
+                    || CASE WHEN ss.refunded_cents > 0 THEN ' · reembolso $' || printf('%.2f', ss.refunded_cents / 100.0) ELSE '' END
+                    || CASE WHEN ss.dispute_id IS NOT NULL THEN ' · DISPUTA ' || COALESCE(ss.dispute_status, '') ELSE '' END
+                    || CASE WHEN ss.debited_usd > 0 THEN ' · debitado $' || printf('%.2f', ss.debited_usd) ELSE '' END
+                    || CASE WHEN ss.unrecovered_usd > 0 THEN ' · NÃO recuperado $' || printf('%.2f', ss.unrecovered_usd) ELSE '' END
+               FROM stripe_sessions ss WHERE ss.payment_id=p.id) AS sp_info ${base}
       ORDER BY p.created_at DESC LIMIT ${limit} OFFSET ${offset}`
   )
     .bind(...binds)
@@ -804,6 +819,14 @@ async function syncPaymentApi({ env, actor, settings }, id) {
     await audit(env, actor, "payment_sync", { payment_id: id, track_id: pay.track_id, result: r.action, api_error: r.apiError || null });
     const upd = await env.DB.prepare("SELECT * FROM payments WHERE id=?").bind(id).first();
     return aj({ ok: true, result: r.action, remote_status: r.apiError ? `erro Binance: ${r.apiError}` : r.reason || r.action, payment: upd });
+  }
+  if (pay.provider === "stripe") {
+    if (!spConfigured(env)) throw new HttpError(503, "STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET não configuradas");
+    const r = await spCheck(env, settings, pay, "panel_sync", { force: true });
+    await audit(env, actor, "payment_sync", { payment_id: id, track_id: pay.track_id, result: r.action });
+    const upd = await env.DB.prepare("SELECT * FROM payments WHERE id=?").bind(id).first();
+    const label = { api_error: "erro ao consultar a Stripe", pending: "sessão aberta — ainda não pago", expired: "sessão expirada (não pago)" }[r.action];
+    return aj({ ok: true, result: r.action, remote_status: label || upd?.last_status || r.action, payment: upd });
   }
   if (pay.provider === "nowpayments") {
     if (!npConfigured(env)) throw new HttpError(503, "NOWPAYMENTS_API_KEY / NOWPAYMENTS_IPN_SECRET não configuradas");
@@ -866,6 +889,41 @@ async function npTestInvoiceApi({ env, actor, settings }) {
   await audit(env, actor, "nowpayments_test_invoice", { ok: r.ok, reason: r.reason || null, payment_id: r.payment?.id || null, amount: min });
   if (!r.ok) throw new HttpError(502, `Falha ao criar a fatura: ${r.reason}`);
   return aj({ ok: true, amount: min, payment_id: r.payment.id, invoice_url: r.payment.pay_link, track_id: r.payment.track_id });
+}
+
+async function spTestApi({ env, actor, settings }) {
+  if (!spConfigured(env)) return aj({ ok: false, reason: "unconfigured", status: await spStatus(env, settings) });
+  const a = await spAccount(env);
+  let webhook = null;
+  if (a.ok && settings.stripe_webhook_id) {
+    webhook = await spWebhookEndpoint(env, settings.stripe_webhook_id);
+  }
+  await audit(env, actor, "stripe_test", { ok: a.ok, http: a.http, charges_enabled: a.charges_enabled ?? null });
+  return aj({ ok: a.ok, http: a.http, account: a.ok ? a : null, error: a.ok ? null : a.error, webhook, status: await spStatus(env, settings) });
+}
+
+/** Real Checkout Session for the minimum amount (first ADMIN_IDS account, no Telegram message), expired right away. */
+async function spTestSessionApi({ env, actor, settings }) {
+  if (!spConfigured(env)) throw new HttpError(503, "STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET não configuradas");
+  const owner = String(env.ADMIN_IDS || "").split(",").map((x) => x.trim()).find((x) => /^\d+$/.test(x));
+  if (!owner) throw new HttpError(503, "ADMIN_IDS não configurado");
+  const s = { ...settings, stripe_enabled: "1" };
+  const min = spConfig(s, env).min;
+  const r = await createSpSession(env, s, { userId: Number(owner), chatId: null, amount: min, resume: null });
+  if (!r.ok) {
+    await audit(env, actor, "stripe_test_session", { ok: false, reason: r.reason, error: r.error || null });
+    return aj({ ok: false, reason: r.reason, error: r.error || null }, 502);
+  }
+  const sid = String(r.payment.track_id || "").replace(/^stripe:/, "");
+  const x = await expireSpSession(env, sid);
+  if (x.ok) {
+    await env.DB.batch([
+      env.DB.prepare("UPDATE stripe_sessions SET status='expired', updated_at=? WHERE session_id=?").bind(new Date().toISOString(), sid),
+      env.DB.prepare("UPDATE payments SET status='canceled', last_status='expired (test)', updated_at=? WHERE id=? AND credited=0").bind(new Date().toISOString(), r.payment.id),
+    ]);
+  }
+  await audit(env, actor, "stripe_test_session", { ok: true, payment_id: r.payment.id, session_id: sid, amount: min, expired: x.ok });
+  return aj({ ok: true, amount: min, currency: "usd", payment_id: r.payment.id, session_id: sid, url: r.payment.pay_link, expired: x.ok, expire_status: x.status });
 }
 
 /* ─── tokens ─── */
@@ -995,6 +1053,8 @@ function publicInfo(ctx) {
     binance_configured: binanceConfigured(ctx.env),
     nowpayments_configured: npConfigured(ctx.env),
     nowpayments_ipn_url: ipnUrl(ctx.env),
+    stripe_configured: spConfigured(ctx.env),
+    stripe_webhook_url: webhookUrl(ctx.env),
   };
 }
 
@@ -1058,10 +1118,14 @@ async function putSettings({ request, env, settings, actor }) {
       if (v && !/^\d{4,20}$/.test(v)) throw new HttpError(400, "Pay ID da Binance: use apenas números (4 a 20 dígitos)");
     } else if (k === "binance_max") {
       v = String(round2(num(String(b[k]).replace(",", "."), "Limite por transação Binance", { min: 1, max: 100000 })));
+    } else if (k === "stripe_min") {
+      v = String(round2(num(String(b[k]).replace(",", "."), "Mínimo do cartão (Stripe)", { min: 1, max: 100000 })));
+    } else if (k === "stripe_max") {
+      v = String(round2(num(String(b[k]).replace(",", "."), "Máximo do cartão (Stripe)", { min: 1, max: 100000 })));
     } else if (k === "nowpayments_min") {
       const raw = String(b[k]).trim().replace(",", ".");
       v = raw === "" || raw === "0" ? "" : String(round2(num(raw, "Mínimo NOWPayments", { min: 1, max: 100000 })));
-    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled" || k === "binance_enabled" || k === "nowpayments_enabled") {
+    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled" || k === "binance_enabled" || k === "nowpayments_enabled" || k === "stripe_enabled") {
       v = b[k] === true || b[k] === "1" || b[k] === 1 ? "1" : "0";
     } else {
       v = String(b[k]).replace(/\r\n/g, "\n");
