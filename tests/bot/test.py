@@ -1039,6 +1039,135 @@ s_, body, _ = req('GET', '/admin/app.js', None); check('panel app.js: Stripe set
 ev = SA.msg('/profile'); s_ = last_screen(ev); check('profile lists "Card top-up (Stripe)" and the refund', s_ and 'Card top-up (Stripe)' in s_['body']['text'] and 'card refund / chargeback' in s_['body']['text'], s_ and s_['body']['text'])
 check('no unexpected Stripe API params / auth failures in the whole run', all(x['key_ok'] for x in logs() if x.get('sp')) and all(x['version'] == '2024-06-20' for x in logs() if x.get('sp')))
 
+# ───── community group: mandatory membership (gate) + "New purchase!" feed (like @LiveiraStore_bot)
+GRP = -1001234567890; GRP2 = -1009876543210; INVITE = 'https://t.me/+FakeInvite123'
+def gcm(ev): return tg(ev, 'getChatMember')
+def gposts(ev, chat=GRP): return [x for x in tg(ev, 'sendMessage') if x['body']['chat_id'] == chat and not x.get('error')]
+def member(uid, status, is_member=None, chat=GRP): fpost(f'/_tg/member/{chat}/{uid}/{status}' + ('' if is_member is None else '/' + ('1' if is_member else '0')))
+def is_gate(scr): return bool(scr) and 'To use the shop, join our group' in scr['body']['text']
+def buy(u, data='confirm:liveira_access:3'):
+    ev, ans = u.cb(data)
+    rec = [x for x in ev if x.get('tg') in ('sendMessage', 'editMessageText') and not x.get('error') and x['body']['chat_id'] == u.uid]
+    rec = rec[-1] if rec else None
+    if rec and rec['tg'] == 'sendMessage': u.mid = rec['mid']
+    return ev, ans, rec
+def gsetting(k): r = sql(f"SELECT value FROM settings WHERE key='{k}'"); return r[0]['value'] if r else None
+s_, body, _ = req('GET', '/admin/api/settings', None, AH); d = json.loads(body)['settings']
+check('group settings: defaults (no group = off, gate + purchase feed on)', d.get('group_chat_id') == '' and d.get('group_invite_link') == '' and d.get('group_gate') == '1' and d.get('feed_purchases') == '1', d)
+GA = User(555090, 'Gabriel', 'gabriel_secret')
+sql(f"INSERT OR REPLACE INTO users (user_id, username, balance, created_at) VALUES ({GA.uid}, 'gabriel_secret', 50, '2026-10-06T00:00:00Z')")
+ev = GA.msg('/start'); GA.mid = last_screen(ev)['mid']
+ev, ans, scr = nav(GA, 'confirm:liveira_access:3', 'no group configured: purchase works', ['Purchase successful'], ['licenses'])
+check('no group configured → no getChatMember, no group post', not gcm(ev) and not [x for x in tg(ev, 'sendMessage') if str(x['body']['chat_id']).startswith('-')], [e.get('tg') for e in ev])
+for bad in ['abc', '12345', '-12', '-1001234567890x']:
+    s_, body, _ = req('PUT', '/admin/api/settings', {'group_chat_id': bad}, AH); check(f'group_chat_id invalid {bad!r} → 400', s_ == 400, (s_, body))
+for bad in ['http://t.me/+x123', 'https://evil.com/x', 'javascript:alert(1)', 'https://t.me/<b>']:
+    s_, body, _ = req('PUT', '/admin/api/settings', {'group_invite_link': bad}, AH); check(f'group_invite_link invalid {bad!r} → 400', s_ == 400, (s_, body))
+s_, body, _ = req('POST', '/admin/api/group/check', None, AH); check('panel "Verificar grupo" without a group → unset', s_ == 200 and json.loads(body)['reason'] == 'unset', body)
+s_, body, _ = req('PUT', '/admin/api/settings', {'group_chat_id': str(GRP), 'group_invite_link': INVITE, 'group_gate': '1', 'feed_purchases': '1'}, AH)
+check('panel saves group id + invite link', s_ == 200 and gsetting('group_chat_id') == str(GRP) and gsetting('group_invite_link') == INVITE, body)
+m = mark(); s_, body, _ = req('POST', '/admin/api/group/check', None, AH); d = json.loads(body); ev = since(m)
+check('panel "Verificar grupo": title, supergroup, bot is admin, can invite, title stored, no warnings', s_ == 200 and d['ok'] and d['title'] == 'Liveira Test Group' and d['type'] == 'supergroup'
+      and d['is_admin'] and d['can_invite'] and d['can_send'] and d['warnings'] == [] and gsetting('group_title') == 'Liveira Test Group'
+      and tg(ev, 'getChat') and gcm(ev)[0]['body']['user_id'] == 123, d)
+s_, body, _ = req('GET', '/admin/api/settings', None, AH); check('settings API returns group_title (read-only)', json.loads(body)['settings']['group_title'] == 'Liveira Test Group')
+# non-member
+G1 = User(555091, 'Gina', 'gina')
+ev = G1.msg('/start'); scr = last_screen(ev)
+b = buttons(scr)
+check('non-member /start → join-the-group screen (no home card)', is_gate(scr) and 'Hi, <b>' not in scr['body']['text'] and 'Tap <b>👥 Join the group</b> and then <b>✅ I\'ve joined</b>' in scr['body']['text'], scr and scr['body']['text'])
+check('gate buttons: 👥 Join the group (invite URL, primary) + ✅ I\'ve joined (jg, success)', b and b[0].get('url') == INVITE and b[0]['text'] == '👥 Join the group' and b[0].get('style') == 'primary'
+      and b[1].get('callback_data') == 'jg' and b[1]['text'] == "✅ I've joined" and b[1].get('style') == 'success', b)
+check('gate: getChatMember(group, user) asked once', len(gcm(ev)) == 1 and gcm(ev)[0]['body'] == {'chat_id': GRP, 'user_id': G1.uid}, gcm(ev))
+check('gate: non-member cached 30 s in D1', (r := sql(f"SELECT member, expires_at FROM group_members WHERE chat_id={GRP} AND user_id={G1.uid}")) and r[0]['member'] == 0 and 20000 < r[0]['expires_at'] - now_ms() <= 31000, r)
+check('gate: user row still created (ensureUser)', sql(f'SELECT user_id FROM users WHERE user_id={G1.uid}'))
+ev = G1.msg('/start shop'); scr = last_screen(ev)
+check('non-member deep link /start shop → gate keeps the target (jg:shop), answered from cache (no getChatMember)', is_gate(scr) and 'jg:shop' in cbdata(scr) and not gcm(ev), (cbdata(scr), len(gcm(ev))))
+ev = G1.msg('/start topup_25'); check('deep link topup_25 kept through the gate', 'jg:topup_25' in cbdata(last_screen(ev)))
+ev = G1.msg('/start ../evil<>'); check('weird deep-link payload dropped (plain jg)', [c for c in cbdata(last_screen(ev)) if c] == ['jg'], cbdata(last_screen(ev)))
+ev = G1.msg('🛒 Shop'); scr = last_screen(ev)
+check('non-member reply-keyboard "🛒 Shop" → gate, button press deleted, no shop', is_gate(scr) and any(x['body']['message_id'] == G1.last_in for x in tg(ev, 'deleteMessage')) and 'Pick a product' not in json.dumps([x['body'] for x in tg(ev, 'sendMessage')]))
+ev = G1.msg('25'); check('non-member typed amount → gate (no top-up confirm)', is_gate(last_screen(ev)) and 'Confirm top-up' not in json.dumps([x['body'] for x in tg(ev, 'sendMessage')]))
+ev = G1.msg('/whoami'); check('/whoami still works for non-members', any('Your Telegram ID' in x['body']['text'] for x in tg(ev, 'sendMessage')))
+ev, ans = G1.cb('shop'); scr = last_screen(ev)
+check('non-member taps a menu button (shop) → gate instead, toast', is_gate(scr) and 'Pick a product' not in scr['body']['text'] and len(ans) == 1 and 'Join our group' in (ans[0]['body'].get('text') or ''), (ans, scr and scr['body']['text']))
+ev, ans = G1.cb('confirm:liveira_access:3'); check('non-member cannot buy via callback (gate, no order)', is_gate(last_screen(ev)) and not sql(f'SELECT id FROM orders WHERE user_id={G1.uid}'))
+ev, ans = G1.cb('tuchk:lv_doesnotexist'); check('payment-card actions (tuchk) stay available behind the gate', not is_gate(last_screen(ev)) and 'Payment not found' in (last_screen(ev) or {'body': {'text': ''}})['body']['text'], last_screen(ev))
+G1.msg('/start shop'); gate_mid = G1.mid
+ev, ans = G1.cb('jg:shop')
+check('"✅ I\'ve joined" while still out → alert "We still don\'t see you", fresh getChatMember, screen unchanged', len(ans) == 1 and ans[0]['body'].get('show_alert') and "We still don't see you in the group" in ans[0]['body']['text']
+      and len(gcm(ev)) == 1 and not tg(ev, 'editMessageText') and not [x for x in tg(ev, 'sendMessage') if x['body']['chat_id'] == G1.uid], (ans, [e.get('tg') for e in ev]))
+member(G1.uid, 'member')
+ev, ans = G1.cb('jg:shop'); scr = last_screen(ev)
+check('"✅ I\'ve joined" after joining → toast "All set — welcome!" and the deep-link target (shop)', len(ans) == 1 and 'All set' in (ans[0]['body'].get('text') or '') and scr and '🛒 <b>Shop</b>' in scr['body']['text'], (ans, scr and scr['body']['text']))
+check('…persistent reply keyboard attached on the way in', any('keyboard' in (x['body'].get('reply_markup') or {}) for x in tg(ev, 'sendMessage')))
+check('…member cached 10 min', (r := sql(f"SELECT member, expires_at FROM group_members WHERE chat_id={GRP} AND user_id={G1.uid}")) and r[0]['member'] == 1 and 590000 < r[0]['expires_at'] - now_ms() <= 600500, r)
+if scr and scr['tg'] == 'sendMessage': G1.mid = scr['mid']
+ev = G1.msg('/menu'); check('member uses the bot normally, answered from the cache (no getChatMember)', last_screen(ev) and 'Hi, <b>Gina</b>' in last_screen(ev)['body']['text'] and not gcm(ev))
+# statuses
+for uid, st, im, ok in [(555092, 'restricted', True, True), (555093, 'restricted', False, False), (555094, 'kicked', None, False), (555095, 'administrator', None, True), (555096, 'creator', None, True), (555097, 'left', None, False)]:
+    member(uid, st, im); u = User(uid, 'U', 'u%d' % uid); ev = u.msg('/start'); g = is_gate(last_screen(ev))
+    check(f'status {st}' + ('' if im is None else f' (is_member={im})') + (' → allowed' if ok else ' → gate'), g != ok, last_screen(ev) and last_screen(ev)['body']['text'][:80])
+fpost('/_tg/mode/member/notfound'); u = User(555098, 'NF', 'nf'); ev = u.msg('/start'); fpost('/_tg/mode/member/ok')
+check('getChatMember 400 PARTICIPANT_ID_INVALID → treated as not in the group (gate)', is_gate(last_screen(ev)))
+fpost('/_tg/mode/member/500'); u = User(555099, 'Err', 'err'); ev = u.msg('/start'); fpost('/_tg/mode/member/ok')
+check('getChatMember 500 → fail-open (home), not cached', last_screen(ev) and 'Hi, <b>Err</b>' in last_screen(ev)['body']['text'] and not sql(f'SELECT 1 FROM group_members WHERE user_id=555099'))
+ev = User(1, 'Admin', 'admin').msg('/start'); check('admin not in the group → never blocked, no getChatMember', last_screen(ev) and 'Hi, <b>Admin</b>' in last_screen(ev)['body']['text'] and not gcm(ev))
+# chat_member updates
+def chat_member(uid, old, new, chat=GRP):
+    return req('POST', '/telegram', {'update_id': 9, 'chat_member': {'chat': {'id': chat, 'type': 'supergroup', 'title': 'Liveira Test Group'}, 'from': {'id': uid, 'is_bot': False, 'first_name': 'x'}, 'date': int(time.time()),
+               'old_chat_member': {'user': {'id': uid, 'is_bot': False, 'first_name': 'x'}, 'status': old}, 'new_chat_member': {'user': {'id': uid, 'is_bot': False, 'first_name': 'x'}, 'status': new}}}, {'X-Telegram-Bot-Api-Secret-Token': 'whs_local'})
+member(G1.uid, 'left'); m = mark(); chat_member(G1.uid, 'member', 'left'); ev = since(m)
+check('chat_member "left" → cache dropped, no message sent', not sql(f'SELECT 1 FROM group_members WHERE chat_id={GRP} AND user_id={G1.uid}') and not tg(ev, 'sendMessage'))
+ev = G1.msg('/menu'); check('…user who left is asked again and sees the gate', is_gate(last_screen(ev)) and len(gcm(ev)) == 1)
+G2 = User(555100, 'Gus', 'gus'); chat_member(G2.uid, 'left', 'member')
+ev = G2.msg('/start'); check('chat_member "member" (joined) → cached, bot opens without asking Telegram', last_screen(ev) and 'Hi, <b>Gus</b>' in last_screen(ev)['body']['text'] and not gcm(ev))
+chat_member(555101, 'left', 'member', chat=-1005555555555); check('chat_member of another chat ignored', not sql('SELECT 1 FROM group_members WHERE user_id=555101'))
+m = mark(); req('POST', '/telegram', {'update_id': 10, 'message': {'message_id': 5, 'from': GA.frm(), 'chat': {'id': GRP, 'type': 'supergroup', 'title': 'Liveira Test Group'}, 'date': int(time.time()), 'text': '/start@liveira_test_bot'}}, {'X-Telegram-Bot-Api-Secret-Token': 'whs_local'}); ev = since(m)
+check('commands sent inside the group are ignored (no menu / balance posted in the group)', not tg(ev, 'sendMessage') and not tg(ev, 'editMessageText'), [e.get('tg') for e in ev])
+# purchase feed
+member(GA.uid, 'member'); ev = GA.msg('/start'); GA.mid = last_screen(ev)['mid']
+ev, ans, scr = buy(GA, 'confirm:liveira_access:7')
+check('member buys → receipt (edits the menu in place), answered once', scr and scr['tg'] == 'editMessageText' and 'Purchase successful' in scr['body']['text'] and len(ans) == 1, scr)
+key = re.search(r'<code>([^<]+)</code>', scr['body']['text']).group(1)
+posts = gposts(ev)
+pt = posts[0]['body']['text'] if posts else ''
+norders = sql('SELECT COUNT(*) AS n FROM orders')[0]['n']
+check('purchase → one "🛍 New purchase!" post in the group', len(posts) == 1 and '<b>🛍 New purchase!</b>' in pt, [x['body'] for x in tg(ev, 'sendMessage')])
+check('group post: product, plan, masked buyer id, total purchases', '🔑 <b>Product:</b> Liveira Access' in pt and '⏳ <b>Plan:</b> 7 days' in pt and '👤 <b>By:</b> <code>555***90</code>' in pt and f'📈 <b>Total purchases:</b> {norders}' in pt, pt)
+check('group post: NO license key, price, balance, username, name or full id', key not in pt and '$' not in pt and 'gabriel' not in pt.lower() and str(GA.uid) not in pt and 'balance' not in pt.lower() and 'lv_' not in pt, pt)
+check('group post: silent, "🛒 Open shop" deep link, no link preview', posts and posts[0]['body'].get('disable_notification') is True and buttons(posts[0]) == [{'text': '🛒 Open shop', 'url': 'https://t.me/liveira_test_bot?start=shop'}] and posts[0]['body'].get('link_preview_options', {}).get('is_disabled'), posts and posts[0]['body'])
+order = [e.get('tg') for e in ev if e.get('tg') in ('answerCallbackQuery', 'sendMessage', 'editMessageText')]
+check('group post goes out after the receipt and after the button is answered', posts and ev.index(posts[0]) > ev.index(tg(ev, 'answerCallbackQuery')[0]) and ev.index(posts[0]) > ev.index(scr), order)
+print('EXAMPLE GROUP POST:', pt.replace('\n', ' | '))
+req('PUT', '/admin/api/settings', {'feed_purchases': '0'}, AH)
+ev, ans, scr = buy(GA)
+check('feed_purchases=0 → purchase works, no group post', scr and 'Purchase successful' in scr['body']['text'] and not gposts(ev))
+req('PUT', '/admin/api/settings', {'feed_purchases': '1'}, AH)
+fpost('/_tg/mode/groupsend/403'); b0 = GA.bal(); nk = len(sql(f'SELECT token FROM tokens WHERE telegram_user_id={GA.uid}'))
+ev, ans, scr = buy(GA)
+fpost('/_tg/mode/groupsend/ok')
+check('group post fails (bot kicked) → receipt with key, balance debited once, license created, button answered, failure audited', scr and 'Purchase successful' in scr['body']['text'] and '<code>' in scr['body']['text'] and abs(GA.bal() - (b0 - 5)) < 1e-9 and len(sql(f'SELECT token FROM tokens WHERE telegram_user_id={GA.uid}')) == nk + 1 and len(ans) == 1
+      and sql("SELECT 1 FROM audit_log WHERE action='group_feed_failed'"), (GA.bal(), b0))
+fpost(f'/_tg/migrate/{GRP}/{GRP2}'); member(GA.uid, 'member', chat=GRP2)
+ev, ans, scr = buy(GA)
+fpost(f'/_tg/migrate/{GRP}/0')
+check('purchase fine + migrate_to_chat_id on the group post → id updated to the supergroup and the post re-sent there', gsetting('group_chat_id') == str(GRP2) and len(gposts(ev, GRP2)) == 1, (gsetting('group_chat_id'), [x['body']['chat_id'] for x in tg(ev, 'sendMessage')]))
+req('POST', '/telegram', {'update_id': 11, 'message': {'message_id': 6, 'chat': {'id': GRP2, 'type': 'group', 'title': 'x'}, 'date': int(time.time()), 'migrate_to_chat_id': GRP}}, {'X-Telegram-Bot-Api-Secret-Token': 'whs_local'})
+check('migrate_to_chat_id service message in the configured group → id switched', gsetting('group_chat_id') == str(GRP))
+m = mark(); req('POST', '/telegram', {'update_id': 12, 'my_chat_member': {'chat': {'id': GRP, 'type': 'supergroup', 'title': 'Liveira Test Group'}, 'from': {'id': 1, 'is_bot': False, 'first_name': 'A'}, 'date': int(time.time()),
+    'old_chat_member': {'user': {'id': 123, 'is_bot': True, 'first_name': 'b'}, 'status': 'administrator'}, 'new_chat_member': {'user': {'id': 123, 'is_bot': True, 'first_name': 'b'}, 'status': 'kicked'}}}, {'X-Telegram-Bot-Api-Secret-Token': 'whs_local'}); ev = since(m)
+check('bot removed from the group (my_chat_member) → admins alerted', any('removed from the community group' in x['body']['text'] for x in admin_msgs(ev)), [x['body'] for x in tg(ev, 'sendMessage')])
+# gate off, feed on
+req('PUT', '/admin/api/settings', {'group_gate': '0'}, AH)
+u = User(555102, 'Free', 'free'); ev = u.msg('/start'); check('group_gate=0 → non-members use the bot, no getChatMember', last_screen(ev) and 'Hi, <b>Free</b>' in last_screen(ev)['body']['text'] and not gcm(ev))
+req('PUT', '/admin/api/settings', {'group_gate': '1'}, AH)
+m = mark(); s_, body, _ = req('POST', '/admin/api/webhook/reset', None, AH); ev = since(m)
+check('panel "Reconfigurar webhook" subscribes chat_member + my_chat_member', tg(ev, 'setWebhook') and set(tg(ev, 'setWebhook')[0]['body']['allowed_updates']) == {'message', 'callback_query', 'chat_member', 'my_chat_member'}, tg(ev, 'setWebhook'))
+s_, body, _ = req('GET', '/admin/app.js', None); check('panel app.js: community group card', 'Grupo da comunidade (Telegram)' in body and '/group/check' in body and 'Verificar grupo' in body)
+s_, body, _ = req('PUT', '/admin/api/settings', {'group_chat_id': ''}, AH)
+u = User(555103, 'After', 'after'); ev = u.msg('/start'); check('group id cleared → nothing required any more', s_ == 200 and last_screen(ev) and 'Hi, <b>After</b>' in last_screen(ev)['body']['text'] and not gcm(ev))
+
 # second Worker instance WITHOUT BINANCE_API_KEY / BINANCE_API_SECRET → option hidden, nothing happens
 BASE2 = 'http://127.0.0.1:8798'
 class User2(User):
@@ -1068,6 +1197,15 @@ s_, body, _ = req('POST', '/stripe/webhook', raw=b'{"id":"evt_x"}', headers={'St
 check('no Stripe secrets → webhook answers 503', s_ == 503, s_)
 s_, body, _ = req('GET', '/admin/api/stripe/status', None, AH2, base=BASE2); check('panel (no secrets): Stripe not configured / hidden', json.loads(body)['configured'] is False and json.loads(body)['available'] is False)
 ev = cron(BASE2); check('no Stripe secrets → cron makes no Stripe request', not [x for x in ev if x.get('sp')])
+
+# group gate on a database WITHOUT migration 0011 (no group_members table): works, just uncached
+sql('DROP TABLE IF EXISTS group_members', state='/tmp/lvtest/state2')
+sql("INSERT OR REPLACE INTO settings (key, value) VALUES ('group_chat_id', '-1001234567890'), ('group_invite_link', 'https://t.me/+FakeInvite123')", state='/tmp/lvtest/state2')
+P2 = User2(555041, 'Noa', 'noa'); ev = P2.msg('/start')
+check('no migration 0011: non-member still gets the gate (no crash)', last_screen(ev) and 'To use the shop, join our group' in last_screen(ev)['body']['text'], last_screen(ev))
+fpost('/_tg/member/-1001234567890/555041/member'); ev = P2.msg('/start')
+check('no migration 0011: member gets in (asked every time, no cache)', last_screen(ev) and 'Hi, <b>Noa</b>' in last_screen(ev)['body']['text'] and len(tg(ev, 'getChatMember')) == 1)
+sql("DELETE FROM settings WHERE key IN ('group_chat_id', 'group_invite_link')", state='/tmp/lvtest/state2')
 
 ans_all = [e for e in logs() if e.get('tg') == 'answerCallbackQuery']
 ids = [e['body']['callback_query_id'] for e in ans_all]

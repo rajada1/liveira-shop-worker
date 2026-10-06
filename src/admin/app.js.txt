@@ -810,6 +810,45 @@
             function (e2) { toast(e2.message, "bad"); sSave.disabled = false; });
       });
       api("GET", "/stripe/status").then(function (st) { showSp(st); }, function () {});
+      // Grupo da comunidade (como no @LiveiraStore_bot): participação obrigatória + aviso de compras
+      var gId = el("input", { value: s.group_chat_id || "", maxlength: 21, inputmode: "numeric", placeholder: "-1001234567890" });
+      var gLink = el("input", { value: s.group_invite_link || "", maxlength: 120, placeholder: "https://t.me/+AbCdEf123" });
+      var gGate = el("input", { type: "checkbox", checked: s.group_gate === "1" });
+      var gFeed = el("input", { type: "checkbox", checked: s.feed_purchases === "1" });
+      var gBox = el("div", { class: "f" });
+      function showGroup(r) {
+        if (!r.ok) {
+          clear(gBox).appendChild(el("span", { class: "badge " + (r.reason === "unset" ? "warn" : "bad") }, r.reason === "unset" ? "Nenhum grupo configurado — nada é exigido e nada é postado" : "Não consegui acessar o grupo: " + (r.description || r.reason) + (r.migrated_to ? " (grupo virou supergrupo: ID atualizado para " + r.migrated_to + ")" : "")));
+          return;
+        }
+        var kv = el("div", { class: "kv" },
+          el("div", null, "Grupo"), el("div", null, (r.title || "—") + " (" + r.id + ", " + r.type + (r.username ? ", @" + r.username : "") + ")"),
+          el("div", null, "Bot no grupo"), el("div", null, r.is_admin ? el("span", { class: "badge ok" }, "administrador") : el("span", { class: "badge bad" }, r.bot_status + " — precisa ser administrador")),
+          el("div", null, "Pode enviar mensagens"), el("div", null, r.can_send ? el("span", { class: "badge ok" }, "sim") : el("span", { class: "badge bad" }, "não")),
+          el("div", null, "Pode convidar via link"), el("div", null, r.can_invite ? "sim" : "não"));
+        clear(gBox).append(kv);
+        (r.warnings || []).forEach(function (w) { gBox.appendChild(el("div", { class: "warnbox" }, w)); });
+      }
+      var gTest = el("button", { class: "btn", type: "button" }, "Verificar grupo");
+      gTest.addEventListener("click", function () {
+        gTest.disabled = true;
+        api("POST", "/group/check").then(function (r) { gTest.disabled = false; showGroup(r); }, function (e2) { gTest.disabled = false; toast(e2.message, "bad"); });
+      });
+      var gSave = el("button", { class: "btn p", type: "submit" }, "Salvar");
+      var gform = el("form", { class: "card" }, el("h2", null, "Grupo da comunidade (Telegram)"),
+        el("div", { class: "kv f" }, el("div", null, "Grupo atual"), el("div", null, s.group_chat_id ? (s.group_title || "sem nome") + " (" + s.group_chat_id + ")" : "nenhum")),
+        field("ID do grupo (número negativo, ex.: -1001234567890) — vazio = desligado", gId),
+        field("Link de convite (botão \"👥 Join the group\")", gLink),
+        el("label", { class: "chk" }, gGate, "Exigir participação no grupo para usar o bot (admins nunca são bloqueados)"),
+        el("label", { class: "chk" }, gFeed, "Postar \"🛍 New purchase!\" no grupo a cada compra"),
+        el("div", { class: "muted small f" }, "Adicione o bot ao grupo como ADMINISTRADOR (o Telegram só garante a consulta de participantes para admins). Quem não está no grupo vê o convite com \"👥 Join the group\" e \"✅ I've joined\"; a consulta fica em cache por 10 min (30 s para quem ainda não entrou). Se o Telegram falhar, o acesso é liberado para não travar vendas. O aviso de compra mostra só o produto, o plano, o ID do comprador mascarado (ex.: 555***02) e o total de compras — nunca a chave, o preço, o saldo, o @usuário ou IDs de pagamento. Depois de configurar, use \"Reconfigurar webhook\" abaixo para o bot receber entradas/saídas do grupo na hora."),
+        el("div", { class: "row f" }, gTest), gBox, gSave);
+      gform.addEventListener("submit", function (e) {
+        e.preventDefault(); gSave.disabled = true;
+        api("PUT", "/settings", { group_chat_id: gId.value, group_invite_link: gLink.value, group_gate: gGate.checked ? "1" : "0", feed_purchases: gFeed.checked ? "1" : "0" })
+          .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); gSave.disabled = false; router(); },
+            function (e2) { toast(e2.message, "bad"); gSave.disabled = false; });
+      });
       var whBox = el("div", { class: "f" });
       function showWh(wi) {
         clear(whBox).appendChild(el("div", { class: "kv" },
@@ -850,7 +889,7 @@
             if (ok) api("POST", "/sessions/revoke-all").then(function () { ME = null; renderLogin("Todas as sessões foram encerradas."); }, function (e) { toast(e.message, "bad"); });
           });
         } }, "Encerrar todas as sessões"));
-      clear(main).append(el("h1", null, "Configurações"), form, cform, bform, nform, sform, wh, apiCard, sys);
+      clear(main).append(el("h1", null, "Configurações"), form, gform, cform, bform, nform, sform, wh, apiCard, sys);
     });
   };
 

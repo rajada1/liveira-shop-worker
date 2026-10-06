@@ -74,6 +74,18 @@ import {
   verifyClaim,
   BINANCE_PROMPT,
 } from "./binance.js";
+import {
+  canUseShop,
+  gateActive,
+  joinPromptScreen,
+  safePayload,
+  postPurchaseFeed,
+  onChatMemberUpdate,
+  onMyChatMember,
+  migrateGroup,
+  GATE_NOT_YET,
+  GATE_OK,
+} from "./group.js";
 
 const TG_UPLOAD_LIMIT = 50 * 1024 * 1024; // Bot API sendDocument upload limit
 const TOPUP_PROMPT = "Enter the top-up amount in USD"; // legacy ForceReply prompt (old messages)
@@ -339,6 +351,8 @@ async function doPurchase(env, s, user, pid, days) {
     reply_markup: kb(rows),
     toast: "✅ Purchase successful!",
     record: true, // kept in the chat as a receipt: never deleted or reused as the menu
+    // Community group post (src/group.js): masked buyer id + product + plan only — never the key, price or balance.
+    feed: { userId: user.id, productName: product.name, days },
   };
 }
 
@@ -1064,6 +1078,44 @@ async function sendProductFile(env, chatId, product) {
   return { ok: true };
 }
 
+/** Work to do once the user already has the answer (group post after a purchase). Never throws. */
+function after(nav, fn) {
+  (nav.after ||= []).push(fn);
+}
+
+async function runAfter(nav) {
+  for (const fn of nav.after || []) {
+    try {
+      await fn();
+    } catch (err) {
+      console.error("after-task failed", err && err.stack ? err.stack : err);
+    }
+  }
+  nav.after = [];
+}
+
+/** /start <payload> targets (also used after "✅ I've joined"): topup_<amount>, DEEP_LINKS, else home. */
+async function startRoute(env, s, user, nav, payload) {
+  let m;
+  if ((m = /^topup_(\d{1,7})$/.exec(payload || ""))) return route(env, s, user, nav, `tuc:${m[1]}`);
+  if (DEEP_LINKS.has(payload)) return route(env, s, user, nav, payload);
+  return show(env, nav, await screenHome(env, s, user));
+}
+
+/** "✅ I've joined": check again without the cache, then continue to the deep-link target (or home). */
+async function joinedFlow(env, s, user, nav, payload) {
+  if (!(await canUseShop(env, s, user.id, { admin: isAdmin(env, user.id), fresh: true }))) return { toast: GATE_NOT_YET, alert: true };
+  await answerCallback(env, nav.queryId, GATE_OK);
+  nav.answered = true;
+  await ensureKeyboard(env, nav);
+  return startRoute(env, s, user, nav, safePayload(payload));
+}
+
+/** Callbacks that work without being in the group: actions on payment records the user already has. */
+function gateFree(data) {
+  return data === "noop" || data.startsWith("tuchk:") || data.startsWith("tux:") || data.startsWith("bnchk:");
+}
+
 /** Route a navigation target (callback data, deep link or command) to a screen. Returns { toast?, alert? }. */
 async function route(env, s, user, nav, data) {
   if (data === "noop") return {};
@@ -1092,7 +1144,11 @@ async function route(env, s, user, nav, data) {
   if ((m = /^(days|confirm):([a-z0-9_-]{1,32}):(\d{1,4})$/.exec(data))) {
     const days = Number(m[3]);
     if (m[1] === "days") return show(env, nav, await screenConfirmPurchase(env, s, user, m[2], days));
-    return show(env, nav, await doPurchase(env, s, user, m[2], days));
+    const screen = await doPurchase(env, s, user, m[2], days);
+    const res = await show(env, nav, screen);
+    // Group "New purchase!" post: after the receipt and after the button is answered; failures never touch the purchase.
+    if (screen.feed) after(nav, () => postPurchaseFeed(env, s, screen.feed));
+    return res;
   }
 
   // keypad: kp:<digits> (live edit), kpok:<digits> (confirm)
@@ -1225,13 +1281,23 @@ async function handleCallback(env, query, s) {
       return;
     }
     await ensureUser(env, user.id, user.username);
-    out = (await route(env, s, user, nav, data)) || {};
+    const priv = query.message?.chat?.type === "private";
+    if (priv && (data === "jg" || data.startsWith("jg:"))) {
+      out = (await joinedFlow(env, s, user, nav, data.slice(3))) || {};
+    } else if (priv && !gateFree(data) && !(await canUseShop(env, s, user.id, { admin: isAdmin(env, user.id) }))) {
+      // Community group required (src/group.js): show the invitation instead of the screen.
+      await show(env, nav, joinPromptScreen(s));
+      out = { toast: "👥 Join our group to use the shop" };
+    } else {
+      out = (await route(env, s, user, nav, data)) || {};
+    }
   } catch (err) {
     console.error("callback error", err && err.stack ? err.stack : err);
     out = { toast: "⚠️ Something went wrong. Please try again.", alert: true };
   } finally {
     // Always answer so the button spinner never hangs.
     if (!nav.answered) await answerCallback(env, query.id, out.toast, out.alert);
+    await runAfter(nav);
   }
 }
 
@@ -1248,8 +1314,21 @@ async function handleCommand(env, message, s) {
   // amounts ("25") and the keypad flow are never confused with them.
   const kbTarget = !cmd.startsWith("/") && message.chat?.type === "private" ? keyboardTarget(text) : null;
 
+  // The bot only talks in private chats. Once it is in the community group, commands sent there (e.g. /start@bot)
+  // must not post menus, balances or licenses in the group.
+  if (message.chat?.type !== "private") return;
+
   if (s.maintenance_mode === "1" && !admin && cmd !== "/whoami") {
     if (cmd.startsWith("/") || kbTarget) await sendMessage(env, chatId, maintenanceText(s));
+    return;
+  }
+
+  // Community group required (src/group.js): anything (even /start) shows the invitation until the user joins.
+  // Admins are never blocked; /whoami stays available.
+  if (cmd !== "/whoami" && gateActive(s) && !(await canUseShop(env, s, user.id, { admin }))) {
+    await ensureUser(env, user.id, user.username);
+    await show(env, nav, joinPromptScreen(s, cmd === "/start" ? parseArgs(text)[0] || "" : ""));
+    if (kbTarget) await deleteMessageQuiet(env, chatId, message.message_id);
     return;
   }
 
@@ -1268,10 +1347,7 @@ async function handleCommand(env, message, s) {
     await ensureKeyboard(env, nav, { force: true });
     // Deep links: t.me/<bot>?start=topup | shop | licenses | profile | support | topup_25
     const payload = (parseArgs(text)[0] || "").toLowerCase();
-    let m;
-    if ((m = /^topup_(\d{1,7})$/.exec(payload))) return route(env, s, user, nav, `tuc:${m[1]}`);
-    if (DEEP_LINKS.has(payload)) return route(env, s, user, nav, payload);
-    await show(env, nav, await screenHome(env, s, user));
+    await startRoute(env, s, user, nav, payload);
     return;
   }
 
@@ -1458,6 +1534,11 @@ export async function handleTelegramUpdate(env, update) {
       await handleCallback(env, update.callback_query, s);
       return;
     }
+    // Community group: membership changes refresh the gate cache; the bot losing admin rights alerts the admins.
+    if (update.chat_member) return void (await onChatMemberUpdate(env, s, update.chat_member));
+    if (update.my_chat_member) return void (await onMyChatMember(env, s, update.my_chat_member));
+    // Basic group upgraded to a supergroup: keep the configured chat id in sync.
+    if (update.message?.migrate_to_chat_id) return void (await migrateGroup(env, s, update.message.chat?.id, update.message.migrate_to_chat_id));
     // Any incoming message in a private chat makes the current menu "not the latest" any more.
     if (update.message?.chat?.type === "private" && update.message.message_id) {
       await noteMessage(env, update.message.chat.id, update.message.message_id);

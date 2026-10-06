@@ -89,6 +89,14 @@ export const SETTING_DEFAULTS = {
   stripe_min: "5",
   stripe_max: "500",
   stripe_webhook_id: "",
+  // Community group (src/group.js), like @LiveiraStore_bot: nothing is required while group_chat_id is empty.
+  // group_gate: users must be in the group to use the bot (admins exempt); feed_purchases: "🛍 New purchase!" posts.
+  // group_title is filled by the panel's "Verificar grupo" check (informational).
+  group_chat_id: "",
+  group_invite_link: "",
+  group_title: "",
+  group_gate: "1",
+  feed_purchases: "1",
 };
 
 export const EDITABLE_SETTINGS = [
@@ -112,6 +120,10 @@ export const EDITABLE_SETTINGS = [
   "binance_pay_id",
   "binance_currencies",
   "binance_max",
+  "group_chat_id",
+  "group_invite_link",
+  "group_gate",
+  "feed_purchases",
 ];
 
 /* ─── Accepted payment coins (setting "accepted_currencies", e.g. "USDT" or "USDT,BTC") ───

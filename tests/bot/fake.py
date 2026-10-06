@@ -27,6 +27,11 @@ SP_DOC = {'mode', 'payment_method_types[0]', 'line_items[0][quantity]', 'line_it
           'metadata[topup_id]', 'metadata[telegram_user_id]', 'metadata[source]', 'payment_intent_data[metadata][topup_id]',
           'payment_intent_data[metadata][telegram_user_id]', 'payment_intent_data[metadata][source]', 'payment_intent_data[description]',
           'submit_type', 'success_url', 'cancel_url', 'expires_at'}
+# Telegram groups: getChatMember / getChat; membership per (chat, user) — default 'left' (never joined)
+GROUPS = {'-1001234567890': {'title': 'Liveira Test Group', 'type': 'supergroup'}, '-1009876543210': {'title': 'Liveira Test Group', 'type': 'supergroup'}}
+MEMBERS = {}  # (chat, user) -> {'status': ..., 'is_member': ...}
+TG_MODE = {'member': 'ok', 'groupsend': 'ok'}  # member: ok | 500 | notfound ; groupsend: ok | 403
+MIGRATED = {}  # old chat id -> new chat id (basic group upgraded to supergroup)
 ALLOWED_TAGS = {'b','strong','i','em','u','ins','s','strike','del','span','tg-spoiler','a','tg-emoji','tg-time','code','pre','blockquote'}
 BTN_ACTIONS = {'url','callback_data','web_app','login_url','switch_inline_query','switch_inline_query_current_chat','switch_inline_query_chosen_chat','copy_text','callback_game','pay','disabled'}
 
@@ -265,6 +270,17 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith('/_bn/mode/'):
             parts = self.path.split('/'); BN_MODE['status'] = int(parts[3]); BN_MODE['retry_after'] = int(parts[4]) if len(parts) > 4 else None
             return self._send({'ok': True})
+        if self.path.startswith('/_tg/member/'):  # /_tg/member/<chat>/<user>/<status>[/<is_member 0|1>]
+            parts = self.path.split('/'); m = {'status': parts[5]}
+            if len(parts) > 6: m['is_member'] = parts[6] == '1'
+            MEMBERS[(parts[3], parts[4])] = m; return self._send({'ok': True})
+        if self.path.startswith('/_tg/mode/'):
+            _, _, _, k, v = self.path.split('/'); TG_MODE[k] = v; return self._send({'ok': True})
+        if self.path.startswith('/_tg/migrate/'):
+            _, _, _, old, new = self.path.split('/')
+            if new == '0': MIGRATED.pop(old, None)
+            else: MIGRATED[old] = int(new)
+            return self._send({'ok': True})
         if self.path.startswith('/_status/'):
             _, _, tid, st = self.path.split('/'); STATUS[tid] = st; return self._send({'ok': True})
         if self.path.startswith('/bot'):
@@ -276,6 +292,32 @@ class H(BaseHTTPRequestHandler):
             if viol: log({'violation': viol, 'method': method, 'body': d})
             if method == 'getMe':
                 log(entry); return self._send({'ok': True, 'result': {'id': 1, 'is_bot': True, 'username': 'liveira_test_bot'}})
+            cid = str(d.get('chat_id', ''))
+            if cid in MIGRATED and method in ('sendMessage', 'getChatMember', 'getChat'):
+                entry['error'] = 'migrated'; log(entry)
+                return self._send({'ok': False, 'error_code': 400, 'description': 'Bad Request: group chat was upgraded to a supergroup chat', 'parameters': {'migrate_to_chat_id': MIGRATED[cid]}}, 400)
+            if method == 'getChatMember':
+                if not isinstance(d.get('user_id'), int): log({'violation': ['getChatMember user_id not int'], 'method': method, 'body': d})
+                if TG_MODE['member'] == '500':
+                    entry['error'] = '500'; log(entry); return self._send({'ok': False, 'error_code': 500, 'description': 'Internal Server Error'}, 500)
+                if cid not in GROUPS:
+                    entry['error'] = 'chat not found'; log(entry); return self._send({'ok': False, 'error_code': 400, 'description': 'Bad Request: chat not found'}, 400)
+                if d.get('user_id') == 123:  # the bot itself (BOT_TOKEN=123:fake): admin
+                    log(entry); return self._send({'ok': True, 'result': {'user': {'id': 123, 'is_bot': True}, 'status': 'administrator', 'can_invite_users': True, 'can_delete_messages': True}})
+                if TG_MODE['member'] == 'notfound' and (cid, str(d.get('user_id'))) not in MEMBERS:
+                    entry['error'] = 'not found'; log(entry); return self._send({'ok': False, 'error_code': 400, 'description': 'Bad Request: PARTICIPANT_ID_INVALID'}, 400)
+                m = MEMBERS.get((cid, str(d.get('user_id'))), {'status': 'left'})
+                log(entry); return self._send({'ok': True, 'result': {'user': {'id': d.get('user_id'), 'is_bot': False, 'first_name': 'x'}, **m}})
+            if method == 'getChat':
+                if cid not in GROUPS:
+                    entry['error'] = 'chat not found'; log(entry); return self._send({'ok': False, 'error_code': 400, 'description': 'Bad Request: chat not found'}, 400)
+                log(entry); return self._send({'ok': True, 'result': {'id': int(cid), **GROUPS[cid]}})
+            if method == 'sendMessage' and cid.startswith('-'):
+                if TG_MODE['groupsend'] == '403':
+                    entry['error'] = 'kicked'; log(entry)
+                    return self._send({'ok': False, 'error_code': 403, 'description': 'Forbidden: bot was kicked from the supergroup chat'}, 403)
+                mid = next(mid_counter); entry['mid'] = mid; log(entry)
+                return self._send({'ok': True, 'result': {'message_id': mid, 'chat': {'id': d.get('chat_id'), 'type': 'supergroup'}, 'text': d.get('text')}})
             if method == 'sendMessage':
                 if SLOW_SEND.get(str(d.get('chat_id'))): time.sleep(SLOW_SEND[str(d.get('chat_id'))])
                 mid = next(mid_counter); MSGS[(str(d.get('chat_id')), mid)] = (d.get('text'), json.dumps(d.get('reply_markup'), sort_keys=True))

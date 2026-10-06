@@ -10,3 +10,8 @@ signature with the fake secret, signature last, timestamp window; `/_bn/tx` adds
 simulates 451/429/5xx). `run.sh` appends fake `BINANCE_*` values to `.dev.vars` (cache TTL 1 s), starts wrangler with
 `--test-scheduled` (cron via `/__scheduled`) and a second instance on :8798 (`tests/bot/nosecrets/`) without the Binance
 secrets, to check the option stays hidden.
+
+Community group (`src/group.js`): `fake.py` serves `getChatMember` / `getChat` for the fake groups `-1001234567890` and
+`-1009876543210` (membership via `/_tg/member/<chat>/<user>/<status>[/<is_member>]`, default `left`; the bot `123` is an
+admin), `/_tg/mode/member/{ok,500,notfound}`, `/_tg/mode/groupsend/{ok,403}` and `/_tg/migrate/<old>/<new|0>`
+(basic group upgraded to a supergroup).

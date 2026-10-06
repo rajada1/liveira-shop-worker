@@ -25,6 +25,7 @@ import { noteMessages } from "./chatnav.js";
 import { binanceConfigured, binanceStatus, binanceDiag, refreshHistory, verifyClaim, approveClaim, notifyClaim } from "./binance.js";
 import { npConfig, npConfigured, npStatus, npCheck, npApiStatus, refreshNpMin, createNpInvoice, ipnUrl } from "./nowpayments.js";
 import { spConfig, spConfigured, spStatus, spCheck, spAccount, createSpSession, expireSpSession, webhookUrl, spWebhookEndpoint } from "./stripe.js";
+import { checkGroup, validInviteLink } from "./group.js";
 
 const COOKIE = "__Host-lv_admin";
 const SESSION_TTL = 12 * 3600; // seconds
@@ -412,6 +413,13 @@ async function route(ctx, method, api) {
   if (api === "/webhook/reset" && method === "POST") return webhookReset(ctx);
   if (api === "/bot/setup" && method === "POST") return botSetup(ctx);
   if (api === "/oxapay/accepted" && method === "GET") return oxapayAccepted(ctx);
+  // Community group: getChat + the bot's own getChatMember (title, admin rights); also refreshes group_title
+  if (api === "/group/check" && method === "POST") {
+    if (!env.BOT_TOKEN) throw new HttpError(503, "BOT_TOKEN não configurado");
+    const r = await checkGroup(env, ctx.settings);
+    await audit(env, ctx.actor, "group_check", { ok: r.ok, reason: r.reason || null, bot_status: r.bot_status || null });
+    return aj(r);
+  }
   if (api === "/sessions/revoke-all" && method === "POST") {
     const next = String((parseInt(ctx.settings.session_epoch, 10) || 1) + 1);
     await setSetting(env, "session_epoch", next);
@@ -1061,6 +1069,7 @@ function publicInfo(ctx) {
 async function getSettingsApi(ctx) {
   const out = {};
   for (const k of EDITABLE_SETTINGS) out[k] = ctx.settings[k];
+  out.group_title = ctx.settings.group_title || "";
   return aj({ settings: out, info: publicInfo(ctx) });
 }
 
@@ -1125,7 +1134,13 @@ async function putSettings({ request, env, settings, actor }) {
     } else if (k === "nowpayments_min") {
       const raw = String(b[k]).trim().replace(",", ".");
       v = raw === "" || raw === "0" ? "" : String(round2(num(raw, "Mínimo NOWPayments", { min: 1, max: 100000 })));
-    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled" || k === "binance_enabled" || k === "nowpayments_enabled" || k === "stripe_enabled") {
+    } else if (k === "group_chat_id") {
+      v = String(b[k]).trim();
+      if (v && !/^-\d{5,20}$/.test(v)) throw new HttpError(400, "ID do grupo: número negativo do Telegram (ex.: -1001234567890) ou vazio para desligar");
+    } else if (k === "group_invite_link") {
+      v = String(b[k]).trim();
+      if (v && !validInviteLink(v)) throw new HttpError(400, "Link de convite: use um link https://t.me/... (ex.: https://t.me/+AbCdEf123)");
+    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled" || k === "binance_enabled" || k === "nowpayments_enabled" || k === "stripe_enabled" || k === "group_gate" || k === "feed_purchases") {
       v = b[k] === true || b[k] === "1" || b[k] === 1 ? "1" : "0";
     } else {
       v = String(b[k]).replace(/\r\n/g, "\n");
@@ -1173,7 +1188,8 @@ async function webhookReset(ctx) {
   const url = `${ctx.url.origin}/telegram`;
   const body = {
     url,
-    allowed_updates: ["message", "callback_query"],
+    // chat_member / my_chat_member: community group joins/leaves refresh the membership cache (src/group.js)
+    allowed_updates: ["message", "callback_query", "chat_member", "my_chat_member"],
     drop_pending_updates: false,
     max_connections: 40,
   };

@@ -1,5 +1,41 @@
 # Deploy notes (owner)
 
+## 2026-10-06 — Grupo da comunidade: participação obrigatória + aviso de compras (igual ao @LiveiraStore_bot) — NÃO PUBLICADO
+
+Código: `src/group.js` (+ ganchos em `src/bot.js`, painel em `src/admin.js` / `src/admin/app.js.txt`). Mesmo modelo do Store
+(`src/services/group.ts` lá), com os textos em inglês como o resto do Shop.
+
+- **Trava (gate):** com `group_chat_id` preenchido e `group_gate = 1` (padrão), quem não está no grupo vê
+  "👥 To use the shop, join our group" com **👥 Join the group** (link de convite) e **✅ I've joined** (reconsulta sem cache
+  e segue para o destino do deep link `/start <payload>`). Vale para comandos, botões do teclado fixo, texto digitado e
+  botões inline no privado. Liberado sempre: admins (`ADMIN_IDS`), `/whoami`, ações em faturas já criadas
+  (`tuchk:` / `tux:` / `bnchk:`). `getChatMember`: member / administrator / creator, ou restricted com `is_member`.
+  Cache no D1 (`group_members`): 10 min dentro, 30 s fora; atualizado pelos updates `chat_member`. Erro inesperado do
+  Telegram → acesso liberado (fail-open, não trava vendas), sem cache.
+- **Aviso de compra:** cada compra de licença (`confirm:` → `doPurchase`) posta no grupo, em silêncio, depois do recibo e
+  da resposta ao botão:
+  `🛍 New purchase!` · `🔑 Product: Liveira Access` · `⏳ Plan: 7 days` · `👤 By: 555***90` (ID do Telegram mascarado,
+  3 primeiros + *** + 2 últimos, mesma regra do Store) · `📈 Total purchases: N` + botão **🛒 Open shop** (`?start=shop`).
+  Nunca vai: chave, preço, saldo, @usuário/nome, IDs de pagamento/pedido. Recargas **não** são postadas (o Store tem
+  um feed de recargas separado; aqui não foi pedido). Falha ao postar → só `audit_log` `group_feed_failed`, a compra segue.
+- **Grupo:** o bot só responde no privado; comandos enviados dentro do grupo são ignorados (antes ele responderia lá).
+  Grupo comum que vira supergrupo (`migrate_to_chat_id`) → ID atualizado sozinho. Bot removido/rebaixado no grupo
+  (`my_chat_member`) → aviso aos admins.
+- **Painel** → Configurações → "Grupo da comunidade (Telegram)": ID do grupo, link de convite, as duas opções e
+  **Verificar grupo** (`getChat` + `getChatMember` do próprio bot: título, tipo, se é admin, se pode convidar).
+
+**Para ativar (nesta ordem):**
+1. Adicionar o `@liveirashop_bot` ao grupo como **administrador** (o Telegram só garante `getChatMember` de outros
+   usuários para admins, e só admins recebem `chat_member`). Nenhuma permissão especial além do padrão.
+2. Migração: `npx wrangler d1 execute liveira-shop --remote --file migrations/0011_group.sql` (idempotente; sem ela a
+   trava funciona, mas consulta o Telegram a cada mensagem).
+3. `npx wrangler deploy`.
+4. Painel: preencher ID do grupo + link de convite, Salvar, **Verificar grupo** e depois **Reconfigurar webhook** (passa a
+   assinar `chat_member` e `my_chat_member`).
+Sem o passo 4 o grupo continua desligado (nada é exigido, nada é postado).
+
+Testes locais: `tests/bot/run.sh` (fake `getChatMember` / `getChat` / migração / falha de envio em `fake.py`).
+
 ## 2026-10-05 — Binance Pay DESATIVADO no Shop (movido para @LiveiraStore_bot)
 
 A conta Binance (Pay ID 290455535) passou a ser verificada automaticamente **só pelo @LiveiraStore_bot** (carteiras US$).
