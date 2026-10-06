@@ -22,6 +22,7 @@
  */
 import { nowIso, generateToken, money, audit, getSettings, setSetting, tgEsc as e } from "./util.js";
 import { sendMessage, editOrSend, invoiceCard, HOME, kb } from "./ui.js";
+import { t, getUserLang } from "./i18n.js";
 import { hmacSha512Hex, notifyCredit, topupConfig, round2, expireStale, botUsername, PUBLIC_BASE_URL } from "./oxapay.js";
 
 const DEFAULT_API = "https://api.nowpayments.io/v1";
@@ -607,14 +608,15 @@ export async function handleNpIpn(request, env, ctx) {
 
 /* ─── notifications ─── */
 
-function supportLineFor(s) {
-  return s.support_contact ? `💬 Support: ${e(s.support_contact)}` : "💬 Please contact the shop admin.";
+function supportLineFor(s, L = "en") {
+  return s.support_contact ? t(L, "support.line", { contact: e(s.support_contact) }) : t(L, "support.none_please");
 }
 
 async function refreshCard(env, s, id) {
   const pay = await getNpPayment(env, id);
   if (!pay?.message_id) return;
-  const card = invoiceCard(pay, s, supportLineFor(s));
+  const L = await getUserLang(env, pay.telegram_user_id);
+  const card = invoiceCard(pay, s, supportLineFor(s, L), L);
   await editOrSend(env, pay.chat_id || pay.telegram_user_id, pay.message_id, card.text, { reply_markup: card.reply_markup }, { fallback: false });
 }
 
@@ -623,14 +625,17 @@ async function notifyUserNp(env, s, pay, kind, p) {
   await refreshCard(env, s, pay.id).catch(() => {});
   const amt = e(money(pay.amount_usd, cur));
   const coin = p.pay_currency ? ` ${e(String(p.pay_currency).toUpperCase())}` : "";
-  const text = {
-    underpaid: `⚠️ Your payment for the ${amt} top-up arrived only partially (${e(String(p.actually_paid ?? "?"))} of ${e(String(p.pay_amount ?? "?"))}${coin}), so it was not credited automatically.\n${supportLineFor(s)}`,
-    failed: `❌ Your NOWPayments payment for the ${amt} top-up failed and was not credited.\n${supportLineFor(s)}`,
-    refunded: `↩️ Your NOWPayments payment for the ${amt} top-up was refunded.\n${supportLineFor(s)}`,
-  }[kind];
-  if (!text) return;
+  if (!["underpaid", "failed", "refunded"].includes(kind)) return;
+  const L = await getUserLang(env, pay.telegram_user_id);
+  const text = t(L, `notify.np_${kind}`, {
+    amt,
+    paid: e(String(p.actually_paid ?? "?")),
+    due: e(String(p.pay_amount ?? "?")),
+    coin,
+    support: supportLineFor(s, L),
+  });
   try {
-    await sendMessage(env, pay.chat_id || pay.telegram_user_id, text, { reply_markup: kb([[HOME()]]) });
+    await sendMessage(env, pay.chat_id || pay.telegram_user_id, text, { reply_markup: kb([[HOME(L)]]) });
   } catch (err) {
     console.error("notify failed", err);
   }

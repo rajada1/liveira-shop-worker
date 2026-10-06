@@ -135,6 +135,8 @@
       el("thead", null, el("tr", null, headers.map(function (h) { return el("th", { class: h.cls || null }, h.t || h); }))),
       el("tbody", null, rows)));
   }
+  /** Order price cell: "Grátis" badge for free trial orders (orders.kind = 'free_trial'). */
+  function priceCell(o) { return o.kind === "free_trial" ? el("span", { class: "badge ok" }, "Grátis") : money(o.price); }
   function loadProducts(force) {
     if (PRODUCTS_CACHE && !force) return Promise.resolve(PRODUCTS_CACHE);
     return api("GET", "/products").then(function (d) { PRODUCTS_CACHE = d.products; ME.files_enabled = d.files_enabled; return d.products; });
@@ -229,21 +231,22 @@
       var rows = (d.recent || []).map(function (o) {
         return el("tr", { class: "click", onclick: function () { location.hash = "#/usuarios/" + o.user_id; } },
           el("td", null, "#" + o.id), el("td", null, fmtDate(o.created_at)), el("td", null, userLabel(o.user_id, o.username)),
-          el("td", null, o.product_name), el("td", { class: "hide-m" }, (o.duration_days || "—") + " d"), el("td", null, money(o.price)));
+          el("td", null, o.product_name), el("td", { class: "hide-m" }, (o.duration_days || "—") + " d"), el("td", null, priceCell(o)));
       });
       clear(main).append(
         el("h1", null, "Painel"),
         el("div", { class: "grid" },
           stat("Usuários", String(s.users || 0), "+" + (s.new_users_7d || 0) + " em 7 dias"),
-          stat("Receita total", money(s.revenue), (s.orders_total || 0) + " pedidos"),
+          stat("Receita total", money(s.revenue), (s.orders_total || 0) + " pedidos pagos"),
           stat("Pedidos hoje", String(s.today_n || 0), money(s.today_rev)),
           stat("Pedidos 7 dias", String(s.d7_n || 0), money(s.d7_rev)),
           stat("Pedidos 30 dias", String(s.d30_n || 0), money(s.d30_rev)),
           stat("Tokens ativos", String(s.active_tokens || 0)),
           stat("Saldo em carteiras", money(s.balances)),
           stat("Recargas OxaPay 30 dias", money(s.crypto_30d_sum), (s.crypto_30d_n || 0) + " pagamento(s)"),
-          stat("Produtos ativos", String(s.active_products || 0))),
-        el("div", { class: "card" }, el("h2", null, "Receita — últimos 14 dias"), bars, labels),
+          stat("Produtos ativos", String(s.active_products || 0)),
+          stat("Testes grátis", String(s.free_total || 0), (s.free_7d || 0) + " em 7 dias · " + (s.free_30d || 0) + " em 30 dias (fora da receita e dos pedidos)")),
+        el("div", { class: "card" }, el("h2", null, "Receita — últimos 14 dias (sem testes grátis)"), bars, labels),
         el("div", { class: "card" }, el("h2", null, "Pedidos recentes"),
           table(["#", "Data", "Usuário", "Produto", { t: "Dias", cls: "hide-m" }, "Preço"], rows, "Nenhum pedido ainda.")),
         el("div", { class: "muted small" }, "Horários em America/Sao_Paulo (BRT)."));
@@ -381,10 +384,13 @@
       var rows = d.users.map(function (u) {
         return el("tr", { class: "click", onclick: function () { location.hash = "#/usuarios/" + u.user_id; } },
           el("td", { class: "mono" }, String(u.user_id)), el("td", null, u.username ? "@" + u.username : "—"), el("td", null, money(u.balance)),
-          el("td", { class: "hide-m" }, String(u.orders_count)), el("td", { class: "hide-m" }, money(u.spent)), el("td", { class: "hide-m" }, fmtDate(u.created_at)));
+          el("td", { class: "hide-m" }, String(u.orders_count)), el("td", { class: "hide-m" }, money(u.spent)),
+          el("td", { class: "hide-m" }, u.free_product ? el("span", { class: "badge ok", title: "Resgatado em " + fmtDate(u.free_claimed_at) }, "Grátis · " + u.free_product) : "—"),
+          el("td", { class: "hide-m" }, u.lang ? (u.lang === "pt" ? "PT" : "EN") + (u.lang_chosen ? "" : " (não escolheu)") : "—"),
+          el("td", { class: "hide-m" }, fmtDate(u.created_at)));
       });
       clear(main).append(el("h1", null, "Usuários"), form, el("div", { class: "card" },
-        table(["ID", "Username", "Saldo", { t: "Pedidos", cls: "hide-m" }, { t: "Gasto", cls: "hide-m" }, { t: "Criado", cls: "hide-m" }], rows),
+        table(["ID", "Username", "Saldo", { t: "Pedidos pagos", cls: "hide-m" }, { t: "Gasto", cls: "hide-m" }, { t: "Teste grátis", cls: "hide-m" }, { t: "Idioma", cls: "hide-m" }, { t: "Criado", cls: "hide-m" }], rows),
         pager(d.total, d.page, d.page_size, function (pg) { uState.page = pg; router(); })));
     });
   };
@@ -410,7 +416,7 @@
       var tabs = [
         ["Pedidos (" + d.orders.length + ")", function () {
           return table(["#", "Data", "Produto", "Dias", "Preço", { t: "Token", cls: "hide-m" }], d.orders.map(function (o) {
-            return el("tr", null, el("td", null, "#" + o.id), el("td", null, fmtDate(o.created_at)), el("td", null, o.product_name), el("td", null, String(o.duration_days || "—")), el("td", null, money(o.price)), el("td", { class: "mono hide-m" }, o.token));
+            return el("tr", null, el("td", null, "#" + o.id), el("td", null, fmtDate(o.created_at)), el("td", null, o.product_name), el("td", null, String(o.duration_days || "—")), el("td", null, priceCell(o)), el("td", { class: "mono hide-m" }, o.token));
           }), "Sem pedidos.");
         }],
         ["Saldo (" + d.topups.length + ")", function () {
@@ -436,7 +442,10 @@
         el("div", { class: "row f" }, el("a", { href: "#/usuarios", class: "btn s" }, "‹ Voltar"), el("h1", { class: "grow" }, userLabel(u.user_id, u.username))),
         el("div", { class: "grid" },
           el("div", { class: "stat" }, el("div", { class: "k" }, "Saldo"), el("div", { class: "v" }, money(u.balance))),
-          el("div", { class: "stat" }, el("div", { class: "k" }, "Pedidos"), el("div", { class: "v" }, String(sm.orders_count || 0))),
+          el("div", { class: "stat" }, el("div", { class: "k" }, "Pedidos pagos"), el("div", { class: "v" }, String(sm.orders_count || 0))),
+          el("div", { class: "stat" }, el("div", { class: "k" }, "Teste grátis"), el("div", { class: "v" }, d.free_claim ? d.free_claim.product_name || d.free_claim.product_id : "não usou"),
+            d.free_claim ? el("div", { class: "x" }, "Resgatado em " + fmtDate(d.free_claim.claimed_at) + " · expira " + fmtDate(d.free_claim.expires_at)) : null),
+          el("div", { class: "stat" }, el("div", { class: "k" }, "Idioma do bot"), el("div", { class: "v" }, u.lang === "pt" ? "Português" : u.lang === "en" ? "English" : "—")),
           el("div", { class: "stat" }, el("div", { class: "k" }, "Total gasto"), el("div", { class: "v" }, money(sm.spent))),
           el("div", { class: "stat" }, el("div", { class: "k" }, "Total creditado"), el("div", { class: "v" }, money(sm.credited)))),
         el("div", { class: "card" }, el("h2", null, "Ajustar saldo"), bform),
@@ -447,23 +456,25 @@
   }
 
   /* ───────── Pedidos ───────── */
-  var oState = { product: "", user: "", from: "", to: "", page: 1 };
+  var oState = { product: "", user: "", from: "", to: "", kind: "", page: 1 };
   VIEWS.pedidos = function (main) {
     return loadProducts().then(function () { return api("GET", "/orders" + qs(oState)); }).then(function (d) {
       var ps = productSelect(oState.product, "Todos os produtos");
       var us = el("input", { placeholder: "ID ou @username", value: oState.user });
       var fr = el("input", { type: "date", value: oState.from });
       var to = el("input", { type: "date", value: oState.to });
+      var kd = el("select", null, el("option", { value: "" }, "Todos"), el("option", { value: "paid" }, "Pagos"), el("option", { value: "free_trial" }, "Grátis (teste)"));
+      kd.value = oState.kind || "";
       var form = el("form", { class: "card" },
         el("div", { class: "row" }, el("div", { class: "grow" }, field("Produto", ps)), el("div", { class: "grow" }, field("Usuário", us))),
-        el("div", { class: "row" }, el("div", { class: "grow" }, field("De", fr)), el("div", { class: "grow" }, field("Até", to))),
+        el("div", { class: "row" }, el("div", { class: "grow" }, field("De", fr)), el("div", { class: "grow" }, field("Até", to)), el("div", { class: "grow" }, field("Tipo", kd))),
         el("div", { class: "row" }, el("button", { class: "btn p", type: "submit" }, "Filtrar"),
-          el("button", { class: "btn", type: "button", onclick: function () { oState = { product: "", user: "", from: "", to: "", page: 1 }; router(); } }, "Limpar")));
-      form.addEventListener("submit", function (e) { e.preventDefault(); oState = { product: ps.value, user: us.value.trim(), from: fr.value, to: to.value, page: 1 }; router(); });
+          el("button", { class: "btn", type: "button", onclick: function () { oState = { product: "", user: "", from: "", to: "", kind: "", page: 1 }; router(); } }, "Limpar")));
+      form.addEventListener("submit", function (e) { e.preventDefault(); oState = { product: ps.value, user: us.value.trim(), from: fr.value, to: to.value, kind: kd.value, page: 1 }; router(); });
       var rows = d.orders.map(function (o) {
         return el("tr", null, el("td", null, "#" + o.id), el("td", null, fmtDate(o.created_at)),
           el("td", null, el("a", { href: "#/usuarios/" + encodeURIComponent(o.user_id) }, userLabel(o.user_id, o.username))),
-          el("td", null, o.product_name), el("td", { class: "hide-m" }, String(o.duration_days || "—")), el("td", null, money(o.price)),
+          el("td", null, o.product_name), el("td", { class: "hide-m" }, String(o.duration_days || "—")), el("td", null, priceCell(o)),
           el("td", { class: "mono hide-m" }, o.token), el("td", { class: "hide-m" }, fmtDate(o.expires_at)));
       });
       clear(main).append(el("h1", null, "Pedidos"), form, el("div", { class: "card" },
@@ -620,17 +631,21 @@
       var s = d.settings, info = d.info;
       var shop = el("input", { value: s.shop_name, maxlength: 64 });
       var welcome = el("textarea", { maxlength: 3000 }); welcome.value = s.welcome_text;
+      var welcomePt = el("textarea", { maxlength: 3000 }); welcomePt.value = s.welcome_text_pt || "";
       var support = el("input", { value: s.support_contact, maxlength: 200, placeholder: "@usuario_suporte" });
       var curr = el("input", { value: s.currency_symbol, maxlength: 5 });
       var maint = el("input", { type: "checkbox", checked: s.maintenance_mode === "1" });
       var mtext = el("textarea", { maxlength: 500 }); mtext.value = s.maintenance_text;
       var save = el("button", { class: "btn p", type: "submit" }, "Salvar");
       var form = el("form", { class: "card" }, el("h2", null, "Loja"),
-        field("Nome da loja", shop), field("Mensagem de boas-vindas (/start) — use {coins} para mostrar as moedas aceitas", welcome), field("Contato de suporte", support), field("Símbolo da moeda", curr),
+        field("Nome da loja", shop),
+        field("Mensagem de boas-vindas em Português (clientes com idioma PT) — use {coins} para mostrar as moedas aceitas; vazio = usa a versão em inglês", welcomePt),
+        field("Mensagem de boas-vindas em Inglês (clientes com idioma EN) — use {coins} para mostrar as moedas aceitas", welcome),
+        field("Contato de suporte", support), field("Símbolo da moeda", curr),
         el("label", { class: "chk" }, maint, "Modo manutenção (bot responde só aos admins)"), field("Mensagem de manutenção", mtext), save);
       form.addEventListener("submit", function (e) {
         e.preventDefault(); save.disabled = true;
-        api("PUT", "/settings", { shop_name: shop.value, welcome_text: welcome.value, support_contact: support.value, currency_symbol: curr.value, maintenance_mode: maint.checked ? "1" : "0", maintenance_text: mtext.value })
+        api("PUT", "/settings", { shop_name: shop.value, welcome_text: welcome.value, welcome_text_pt: welcomePt.value, support_contact: support.value, currency_symbol: curr.value, maintenance_mode: maint.checked ? "1" : "0", maintenance_text: mtext.value })
           .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); ME.currency_symbol = curr.value; ME.shop_name = shop.value; save.disabled = false; },
             function (e2) { toast(e2.message, "bad"); save.disabled = false; });
       });
@@ -838,7 +853,7 @@
       var gform = el("form", { class: "card" }, el("h2", null, "Grupo da comunidade (Telegram)"),
         el("div", { class: "kv f" }, el("div", null, "Grupo atual"), el("div", null, s.group_chat_id ? (s.group_title || "sem nome") + " (" + s.group_chat_id + ")" : "nenhum")),
         field("ID do grupo (número negativo, ex.: -1001234567890) — vazio = desligado", gId),
-        field("Link de convite (botão \"👥 Join the group\")", gLink),
+        field("Link de convite (botão \"👥 Entrar no grupo\" / \"👥 Join the group\")", gLink),
         el("label", { class: "chk" }, gGate, "Exigir participação no grupo para usar o bot (admins nunca são bloqueados)"),
         el("label", { class: "chk" }, gFeed, "Postar \"🛍 New purchase!\" no grupo a cada compra"),
         el("div", { class: "muted small f" }, "Adicione o bot ao grupo como ADMINISTRADOR (o Telegram só garante a consulta de participantes para admins). Quem não está no grupo vê o convite com \"👥 Join the group\" e \"✅ I've joined\"; a consulta fica em cache por 10 min (30 s para quem ainda não entrou). Se o Telegram falhar, o acesso é liberado para não travar vendas. O aviso de compra mostra só o produto, o plano, o ID do comprador mascarado (ex.: 555***02) e o total de compras — nunca a chave, o preço, o saldo, o @usuário ou IDs de pagamento. Depois de configurar, use \"Reconfigurar webhook\" abaixo para o bot receber entradas/saídas do grupo na hora."),
@@ -848,6 +863,35 @@
         api("PUT", "/settings", { group_chat_id: gId.value, group_invite_link: gLink.value, group_gate: gGate.checked ? "1" : "0", feed_purchases: gFeed.checked ? "1" : "0" })
           .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); gSave.disabled = false; router(); },
             function (e2) { toast(e2.message, "bad"); gSave.disabled = false; });
+      });
+      // Teste grátis: 1 resgate por conta do Telegram, para sempre (tabela free_claims)
+      var ftOn = el("input", { type: "checkbox", checked: s.free_trial_enabled === "1" });
+      var ftDays = el("input", { type: "number", min: 1, max: 30, step: 1, value: s.free_trial_days || "1", inputmode: "numeric" });
+      var ftSel = String(s.free_trial_products || "").split(",").filter(Boolean);
+      var ftBox = el("div", { class: "f" });
+      var ftChecks = [];
+      loadProducts().then(function (list) {
+        list.filter(function (p) { return p.active; }).forEach(function (p) {
+          var c = el("input", { type: "checkbox", checked: ftSel.indexOf(p.id) >= 0, value: p.id });
+          ftChecks.push(c);
+          ftBox.appendChild(el("label", { class: "chk" }, c, p.name + " (" + p.id + ")"));
+        });
+        if (!ftChecks.length) ftBox.appendChild(el("div", { class: "muted small" }, "Nenhum produto ativo."));
+      }, function () {});
+      var ftSave = el("button", { class: "btn p", type: "submit" }, "Salvar");
+      var ftform = el("form", { class: "card" }, el("h2", null, "Teste grátis"),
+        el("label", { class: "chk" }, ftOn, "Ativar o teste grátis (botão \"🎁 Teste grátis\" no menu do bot e /free)"),
+        field("Duração do teste (dias)", ftDays),
+        el("div", { class: "muted small f" }, "Produtos que podem ser testados (nenhum marcado = todos os produtos ativos com preço):"),
+        ftBox,
+        el("div", { class: "muted small f" }, "Cada conta do Telegram pode resgatar UM teste grátis, de um produto à escolha, uma única vez — sair e voltar ao grupo ou trocar o @usuário não libera outro. Se houver grupo da comunidade configurado, o cliente precisa estar no grupo na hora do resgate (consulta ao vivo). O resgate cria um pedido de $0 marcado como \"Grátis\" (fora da receita e da contagem de pedidos), uma chave igual à de uma compra e posta \"🛍 New purchase!\" no grupo (se o aviso de compras estiver ligado). Quando o teste acaba, o bot avisa o cliente uma vez, com um botão para comprar o plano de 3 dias do mesmo produto."),
+        ftSave);
+      ftform.addEventListener("submit", function (e) {
+        e.preventDefault(); ftSave.disabled = true;
+        var ids = ftChecks.filter(function (c) { return c.checked; }).map(function (c) { return c.value; });
+        api("PUT", "/settings", { free_trial_enabled: ftOn.checked ? "1" : "0", free_trial_days: ftDays.value, free_trial_products: ids.join(",") })
+          .then(function (r) { toast(r.changed.length ? "Salvo (" + r.changed.length + " alteração(ões))" : "Nada alterado", "ok"); ftSave.disabled = false; router(); },
+            function (e2) { toast(e2.message, "bad"); ftSave.disabled = false; });
       });
       var whBox = el("div", { class: "f" });
       function showWh(wi) {
@@ -889,7 +933,7 @@
             if (ok) api("POST", "/sessions/revoke-all").then(function () { ME = null; renderLogin("Todas as sessões foram encerradas."); }, function (e) { toast(e.message, "bad"); });
           });
         } }, "Encerrar todas as sessões"));
-      clear(main).append(el("h1", null, "Configurações"), form, gform, cform, bform, nform, sform, wh, apiCard, sys);
+      clear(main).append(el("h1", null, "Configurações"), form, ftform, gform, cform, bform, nform, sform, wh, apiCard, sys);
     });
   };
 

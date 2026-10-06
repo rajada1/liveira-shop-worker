@@ -62,6 +62,10 @@ export const SETTING_DEFAULTS = {
   welcome_text:
     "Get your Liveira license in seconds.\n" +
     "Top up with {coins} — your balance is credited automatically.",
+  // Portuguese variant shown to users with lang=pt (src/i18n.js); empty → falls back to welcome_text.
+  welcome_text_pt:
+    "Pegue sua licença Liveira em segundos.\n" +
+    "Recarregue com {coins} — seu saldo é creditado automaticamente.",
   support_contact: "",
   currency_symbol: "$",
   maintenance_mode: "0",
@@ -97,11 +101,17 @@ export const SETTING_DEFAULTS = {
   group_title: "",
   group_gate: "1",
   feed_purchases: "1",
+  // Free trial (src/freetrial.js): one free claim per Telegram account, ever (table free_claims, migration 0013).
+  // free_trial_products: comma-separated product ids ("" = every active product with a price).
+  free_trial_enabled: "1",
+  free_trial_days: "1",
+  free_trial_products: "",
 };
 
 export const EDITABLE_SETTINGS = [
   "shop_name",
   "welcome_text",
+  "welcome_text_pt",
   "support_contact",
   "currency_symbol",
   "maintenance_mode",
@@ -124,6 +134,9 @@ export const EDITABLE_SETTINGS = [
   "group_invite_link",
   "group_gate",
   "feed_purchases",
+  "free_trial_enabled",
+  "free_trial_days",
+  "free_trial_products",
 ];
 
 /* ─── Accepted payment coins (setting "accepted_currencies", e.g. "USDT" or "USDT,BTC") ───
@@ -144,15 +157,15 @@ export function acceptedCoins(s) {
   return l.length ? l.slice(0, 12) : ["USDT"];
 }
 
-/** "USDT" · "USDT or BTC" · "USDT, BTC or ETH" (plain text, safe for HTML: symbols are [A-Z0-9]). */
-export function coinsLabel(s, { bold = false } = {}) {
+/** "USDT" · "USDT or BTC" · "USDT, BTC or ETH" (plain text, safe for HTML: symbols are [A-Z0-9]). lang "pt" → "ou". */
+export function coinsLabel(s, { bold = false, lang = "en" } = {}) {
   const l = acceptedCoins(s).map((c) => (bold ? `<b>${c}</b>` : c));
-  return l.length === 1 ? l[0] : `${l.slice(0, -1).join(", ")} or ${l[l.length - 1]}`;
+  return l.length === 1 ? l[0] : `${l.slice(0, -1).join(", ")} ${lang === "pt" ? "ou" : "or"} ${l[l.length - 1]}`;
 }
 
 /** Welcome/admin texts may contain the placeholder {coins}. */
-export function fillCoins(text, s) {
-  return String(text ?? "").replace(/\{coins\}/g, coinsLabel(s));
+export function fillCoins(text, s, lang = "en") {
+  return String(text ?? "").replace(/\{coins\}/g, coinsLabel(s, { lang }));
 }
 
 export async function getSettings(env) {

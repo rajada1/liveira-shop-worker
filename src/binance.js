@@ -13,6 +13,7 @@
  */
 import { nowIso, generateToken, money, audit, tgEsc as e, parseCoinList, getSettings } from "./util.js";
 import { btn, copyBtn, kb, HOME, editOrSend, sendMessage } from "./ui.js";
+import { t, DICT, getUserLang } from "./i18n.js";
 
 const DEFAULT_API = "https://api.binance.com";
 const HISTORY_PATH = "/sapi/v1/pay/transactions";
@@ -25,7 +26,9 @@ const RATE_HOUR = 10; // … and at most 10 per hour
 const MAX_OPEN_CLAIMS = 5; // pending claims per user
 const ORDER_TYPES = new Set(["C2C", "PAY"]); // transfers / payments to us (not red packets, refunds, payouts)
 const TXID_RE = /^[A-Za-z0-9_-]{6,64}$/;
-export const BINANCE_PROMPT = "🟡 Paste your Binance Pay transaction ID below:";
+export const BINANCE_PROMPT = t("en", "bn.prompt");
+/** The ForceReply prompt in every language (a reply to any of them is a transaction ID). */
+export const BINANCE_PROMPTS = Object.values(DICT).map((d) => d["bn.prompt"]);
 const enc = new TextEncoder();
 
 /* ─── config ─── */
@@ -61,9 +64,9 @@ function coinsOf(s) {
   return { currencies: c.length ? c : ["USDT"] };
 }
 
-export function binanceCoinsLabel(bc, { bold = false } = {}) {
+export function binanceCoinsLabel(bc, { bold = false, lang = "en" } = {}) {
   const l = bc.currencies.map((c) => (bold ? `<b>${c}</b>` : c));
-  return l.length === 1 ? l[0] : `${l.slice(0, -1).join(", ")} or ${l[l.length - 1]}`;
+  return l.length === 1 ? l[0] : `${l.slice(0, -1).join(", ")} ${lang === "pt" ? "ou" : "or"} ${l[l.length - 1]}`;
 }
 
 function cacheTtlMs(env) {
@@ -560,112 +563,92 @@ export async function approveClaim(env, s, pay, actor) {
   return { ok: true, payment: fresh, newBalance: r.newBalance, amount: ev.credit };
 }
 
-/* ─── texts ─── */
+/* ─── texts (customer-facing: lang L, src/i18n.js) ─── */
 
-function supportLineFor(s) {
-  return s.support_contact ? `💬 Support: ${e(s.support_contact)}` : "💬 Contact the shop admin.";
+function supportLineFor(s, L = "en") {
+  return s.support_contact ? t(L, "support.line", { contact: e(s.support_contact) }) : t(L, "support.none");
 }
 
-const REJECT_TEXT = {
-  outgoing: "This transaction is not an incoming payment to the shop.",
-  type: "This type of Binance Pay transaction can't be used for top-ups.",
-  too_small: "The amount is too small to be credited.",
-  duplicate: "This transaction was already submitted from another account.",
-};
+const REJECT_KEYS = { outgoing: "bn.rej_outgoing", type: "bn.rej_type", too_small: "bn.rej_too_small", duplicate: "bn.rej_duplicate" };
 
-export function binanceScreen(s, bc) {
+export function binanceScreen(s, bc, L = "en") {
   const cur = s.currency_symbol || "$";
-  const coins = binanceCoinsLabel(bc, { bold: true });
-  const text =
-    "🟡 <b>Binance Pay</b>\n\n" +
-    `Send any amount of ${coins} via Binance Pay to this Pay ID, then paste the transaction ID here.\n\n` +
-    `Pay ID: <code>${e(bc.payId)}</code>\n\n` +
-    "<blockquote><b>How it works</b>\n" +
-    "1. Binance app → <b>Pay</b> → <b>Send</b> → enter the Pay ID above.\n" +
-    `2. Send ${coins} — any amount (1 ${bc.currencies[0]} = ${e(money(1, cur))}).\n` +
-    "3. Open the transfer details, copy the <b>transaction ID</b> (Order ID) and paste it in this chat.\n" +
-    "4. Your balance is credited automatically with the amount received.</blockquote>";
+  const coins = binanceCoinsLabel(bc, { bold: true, lang: L });
+  const text = t(L, "bn.screen", { coins, id: e(bc.payId), coin1: bc.currencies[0], one: e(money(1, cur)) });
   return {
     text,
     reply_markup: kb([
-      [copyBtn("📋 Copy Pay ID", bc.payId)],
-      [btn("✏️ Enter transaction ID", "bnp", "success")],
-      [btn("⬅️ Back", "topup"), HOME()],
+      [copyBtn(t(L, "btn.copy_payid"), bc.payId)],
+      [btn(t(L, "btn.enter_tx"), "bnp", "success")],
+      [btn(t(L, "btn.back"), "topup"), HOME(L)],
     ]),
   };
 }
 
-export function binanceUnavailable(s) {
+export function binanceUnavailable(s, L = "en") {
   return {
-    text: `🟡 <b>Binance Pay</b>\n\nBinance Pay top-ups are currently unavailable.\n\n${supportLineFor(s)}`,
-    reply_markup: kb([[btn("⬅️ Back", "topup"), HOME()]]),
+    text: t(L, "bn.unavailable", { support: supportLineFor(s, L) }),
+    reply_markup: kb([[btn(t(L, "btn.back"), "topup"), HOME(L)]]),
   };
 }
 
-export function binanceNotice(s, kind, extra = {}) {
+export function binanceNotice(s, kind, extra = {}, L = "en") {
   const rows = [];
-  let text = "🟡 <b>Binance Pay</b>\n\n";
+  let text = t(L, "bn.head");
   if (kind === "invalid") {
-    text += "⚠️ That doesn't look like a Binance Pay transaction ID.\n\nOpen the transfer in Binance (Pay → transaction details), copy the <b>transaction ID</b> and paste it here.";
-    rows.push([btn("✏️ Enter transaction ID", "bnp", "success")]);
+    text += t(L, "bn.invalid");
+    rows.push([btn(t(L, "btn.enter_tx"), "bnp", "success")]);
   } else if (kind === "other") {
-    text += `⚠️ This transaction ID was already submitted from another account.\n\nIf it's yours, please contact support.\n${supportLineFor(s)}`;
+    text += t(L, "bn.other", { support: supportLineFor(s, L) });
   } else if (kind === "rate") {
-    text += extra.hourly ? "⏳ Too many checks in the last hour. Please try again later." : `⏳ Please wait ${extra.wait || 20} s before checking another transaction.`;
-    rows.push([btn("✏️ Enter transaction ID", "bnp")]);
+    text += extra.hourly ? t(L, "bn.rate_hour") : t(L, "bn.rate_wait", { s: extra.wait || 20 });
+    rows.push([btn(t(L, "btn.enter_tx"), "bnp")]);
   } else if (kind === "too_many") {
-    text += "⏳ You already have several transactions waiting to be found. Please wait until they are processed.";
+    text += t(L, "bn.too_many");
   }
-  rows.push([btn("⬅️ Back", "bn"), HOME()]);
+  rows.push([btn(t(L, "btn.back"), "bn"), HOME(L)]);
   return { text, reply_markup: kb(rows) };
 }
 
 /** The claim card (a record: never deleted or reused as the menu). */
-export function claimCard(pay, s, { apiError = null, newBalance = null } = {}) {
+export function claimCard(pay, s, { apiError = null, newBalance = null } = {}, L = "en") {
   const cur = s.currency_symbol || "$";
   const d = claimDetails(pay);
   const txid = txidOf(pay);
-  const idLine = `Transaction ID: <code>${e(txid)}</code>`;
+  const idline = t(L, "bn.idline", { tx: e(txid) });
   const rows = [];
   let text;
   if (pay.credited) {
     text =
-      "✅ <b>Binance Pay top-up received!</b>\n\n" +
-      `+<b>${e(money(pay.amount_usd, cur))}</b> added to your balance` +
-      (d.amount && d.currency ? ` (${e(String(d.amount))} ${e(String(d.currency))})` : "") +
-      ".\n" +
-      (newBalance !== null ? `💰 New balance: <b>${e(money(newBalance, cur))}</b>\n` : "") +
-      `\n${idLine}`;
-    rows.push([btn("🛒 Shop", "shop", "primary"), btn("👤 Profile", "profile")]);
+      t(L, "bn.credited", {
+        amt: e(money(pay.amount_usd, cur)),
+        orig: d.amount && d.currency ? ` (${e(String(d.amount))} ${e(String(d.currency))})` : "",
+      }) +
+      (newBalance !== null ? t(L, "bn.newbal", { bal: e(money(newBalance, cur)) }) : "") +
+      `\n${idline}`;
+    rows.push([btn(t(L, "btn.shop"), "shop", "primary"), btn(t(L, "btn.profile"), "profile")]);
   } else if (pay.status === "pending") {
-    text =
-      "🟡 <b>Binance Pay · checking</b>\n\n" +
-      `${idLine}\nStatus: <b>⏳ Not found yet</b>\n\n` +
-      `Binance can take a minute to show a new transfer. We'll keep checking automatically for ${CLAIM_WINDOW_MIN} minutes and message you as soon as it's credited.` +
-      (apiError ? "\n\n<i>Binance is not reachable right now — we'll retry automatically.</i>" : "");
-    rows.push([btn("🔄 Check again", `bnchk:${pay.id}`, "primary")]);
+    text = t(L, "bn.pending", { idline, min: CLAIM_WINDOW_MIN }) + (apiError ? t(L, "bn.api_err") : "");
+    rows.push([btn(t(L, "btn.check_again"), `bnchk:${pay.id}`, "primary")]);
   } else if (pay.status === "expired" || pay.status === "canceled") {
-    text =
-      "⌛ <b>Binance Pay · not found</b>\n\n" +
-      `${idLine}\n\nWe couldn't find this transaction in the shop's Binance Pay history. Double-check the ID (Binance → Pay → transaction details) and try again.\n\n${supportLineFor(s)}`;
-    rows.push([btn("🔄 Check again", `bnchk:${pay.id}`, "primary")], [btn("✏️ Enter another ID", "bnp")]);
+    text = t(L, "bn.notfound", { idline, support: supportLineFor(s, L) });
+    rows.push([btn(t(L, "btn.check_again"), `bnchk:${pay.id}`, "primary")], [btn(t(L, "btn.enter_other_tx"), "bnp")]);
   } else if (pay.status === "review") {
     text =
-      "🟠 <b>Binance Pay · under review</b>\n\n" +
-      `${idLine}\n` +
-      (d.amount && d.currency ? `Received: <b>${e(String(d.amount))} ${e(String(d.currency))}</b>\n` : "") +
-      "\nYour transfer needs a quick manual review by the shop. You'll be notified as soon as it's credited.";
+      t(L, "bn.review", { idline }) +
+      (d.amount && d.currency ? t(L, "bn.received", { amt: `${e(String(d.amount))} ${e(String(d.currency))}` }) : "") +
+      t(L, "bn.review_tail");
   } else {
     const reason = pay.last_status;
     const msg =
       reason === "currency"
-        ? `This transfer was made in <b>${e(String(d.currency || "?"))}</b>. Only ${binanceCoinsLabel(coinsOf(s), { bold: true })} can be credited automatically.`
-        : REJECT_TEXT[reason] || "This transaction can't be credited.";
-    text = `❌ <b>Binance Pay · not credited</b>\n\n${idLine}\n\n${msg}\n\n${supportLineFor(s)}`;
-    rows.push([btn("🟡 Binance Pay", "bn")]);
+        ? t(L, "bn.rej_currency", { cur: e(String(d.currency || "?")), coins: binanceCoinsLabel(coinsOf(s), { bold: true, lang: L }) })
+        : t(L, REJECT_KEYS[reason] || "bn.rej_default");
+    text = t(L, "bn.rejected", { idline, msg, support: supportLineFor(s, L) });
+    rows.push([btn(t(L, "btn.binance"), "bn")]);
   }
   text += `\nRef: <code>${e(pay.id)}</code>`;
-  rows.push([HOME()]);
+  rows.push([HOME(L)]);
   return { text, reply_markup: kb(rows) };
 }
 
@@ -703,19 +686,15 @@ async function notifyAdmins(env, s, pay, kind, { tx, newBalance, reason } = {}) 
 export async function notifyClaim(env, s, pay, r) {
   const cur = s.currency_symbol || "$";
   const chatId = pay.chat_id || pay.telegram_user_id;
-  const card = claimCard(pay, s, { newBalance: r.newBalance ?? null });
+  const L = await getUserLang(env, pay.telegram_user_id);
+  const card = claimCard(pay, s, { newBalance: r.newBalance ?? null }, L);
   let edited = false;
   if (pay.message_id) {
     const res = await editOrSend(env, chatId, pay.message_id, card.text, { reply_markup: card.reply_markup }, { fallback: false });
     edited = !!res.ok;
   }
-  const line = {
-    credited: `✅ Binance Pay top-up confirmed, +${money(pay.amount_usd, cur)} added. New balance: ${money(r.newBalance ?? 0, cur)}`,
-    rejected: "❌ Your Binance Pay transaction could not be credited automatically — see the details above.",
-    review: "🟠 Your Binance Pay transfer was found and is under review by the shop.",
-    expired: `⌛ We couldn't find your Binance Pay transaction ${txidOf(pay)} yet. Double-check the ID or contact support.`,
-  }[r.action];
-  if (!line) return;
+  if (!["credited", "rejected", "review", "expired"].includes(r.action)) return;
+  const line = t(L, `bn.n_${r.action}`, { amt: money(pay.amount_usd, cur), bal: money(r.newBalance ?? 0, cur), tx: txidOf(pay) });
   try {
     await sendMessage(
       env,

@@ -17,6 +17,7 @@
  */
 import { nowIso, generateToken, money, audit, getSettings, tgEsc as e } from "./util.js";
 import { sendMessage, editOrSend, invoiceCard, HOME, kb } from "./ui.js";
+import { t, getUserLang } from "./i18n.js";
 import { notifyCredit, topupConfig, round2, expireStale, botUsername, PUBLIC_BASE_URL } from "./oxapay.js";
 
 const DEFAULT_API = "https://api.stripe.com/v1";
@@ -691,14 +692,15 @@ export async function handleStripeWebhook(request, env) {
 
 /* ─── notifications ─── */
 
-function supportLineFor(s) {
-  return s.support_contact ? `💬 Support: ${e(s.support_contact)}` : "💬 Please contact the shop admin.";
+function supportLineFor(s, L = "en") {
+  return s.support_contact ? t(L, "support.line", { contact: e(s.support_contact) }) : t(L, "support.none_please");
 }
 
 async function refreshCard(env, s, id) {
   const pay = await getSpPayment(env, id);
   if (!pay?.message_id) return;
-  const card = invoiceCard(pay, s, supportLineFor(s));
+  const L = await getUserLang(env, pay.telegram_user_id);
+  const card = invoiceCard(pay, s, supportLineFor(s, L), L);
   await editOrSend(env, pay.chat_id || pay.telegram_user_id, pay.message_id, card.text, { reply_markup: card.reply_markup }, { fallback: false });
 }
 
@@ -706,13 +708,11 @@ async function notifyUserSp(env, s, pay, kind, { debited, balance } = {}) {
   const cur = s.currency_symbol || "$";
   if (kind === "failed") await refreshCard(env, s, pay.id).catch(() => {});
   const amt = e(money(pay.amount_usd, cur));
-  const text = {
-    failed: `❌ Your card payment for the ${amt} top-up failed and was not credited.\n${supportLineFor(s)}`,
-    refunded: `↩️ Your card payment for the ${amt} top-up was refunded, so ${e(money(debited, cur))} was deducted from your balance. New balance: ${e(money(balance, cur))}.\n${supportLineFor(s)}`,
-  }[kind];
-  if (!text) return;
+  if (kind !== "failed" && kind !== "refunded") return;
+  const L = await getUserLang(env, pay.telegram_user_id);
+  const text = t(L, `notify.sp_${kind}`, { amt, debited: e(money(debited, cur)), bal: e(money(balance, cur)), support: supportLineFor(s, L) });
   try {
-    await sendMessage(env, pay.chat_id || pay.telegram_user_id, text, { reply_markup: kb([[HOME()]]) });
+    await sendMessage(env, pay.chat_id || pay.telegram_user_id, text, { reply_markup: kb([[HOME(L)]]) });
   } catch (err) {
     console.error("notify failed", err);
   }

@@ -1,5 +1,6 @@
 /* Shared Telegram UI building blocks (HTML parse mode, inline keyboards, BRT time). */
 import { tgEsc as e, money, tgApi, acceptedCoins, coinsLabel } from "./util.js";
+import { t, DICT } from "./i18n.js";
 
 /* ─── buttons ─── */
 
@@ -16,9 +17,9 @@ export function urlBtn(text, url, style) {
 export function copyBtn(text, copy) {
   return { text, copy_text: { text: String(copy).slice(0, 256) } };
 }
-export const HOME = () => btn("🏠 Home", "home");
-export function navRow(back) {
-  return back && back !== "home" ? [btn("⬅️ Back", back), HOME()] : [HOME()];
+export const HOME = (L = "en") => btn(t(L, "btn.home"), "home");
+export function navRow(back, L = "en") {
+  return back && back !== "home" ? [btn(t(L, "btn.back"), back), HOME(L)] : [HOME(L)];
 }
 export function kb(rows) {
   return { inline_keyboard: rows.filter((r) => r && r.length) };
@@ -63,17 +64,17 @@ export function tgRelTime(iso, fallback) {
   return `<tg-time unix="${Math.floor(t / 1000)}" format="r">${e(fallback || fmtTimeBrt(iso))}</tg-time>`;
 }
 
-export function daysLeftLabel(expiresAt) {
+export function daysLeftLabel(expiresAt, L = "en") {
   const ms = Date.parse(expiresAt) - Date.now();
-  if (Number.isNaN(ms) || ms <= 0) return "expired";
+  if (Number.isNaN(ms) || ms <= 0) return t(L, "left.expired");
   const h = ms / 3600000;
-  if (h < 24) return `${Math.max(1, Math.ceil(h))} h left`;
+  if (h < 24) return t(L, "left.hours", { n: Math.max(1, Math.ceil(h)) });
   const d = Math.ceil(h / 24);
-  return d === 1 ? "1 day left" : `${d} days left`;
+  return d === 1 ? t(L, "left.one_day") : t(L, "left.days", { n: d });
 }
 
-export function formatDuration(days) {
-  return Number(days) === 1 ? "1 day" : `${days} days`;
+export function formatDuration(days, L = "en") {
+  return Number(days) === 1 ? t(L, "dur.one") : t(L, "dur.many", { n: days });
 }
 
 /* ─── messaging ─── */
@@ -109,59 +110,32 @@ export async function editOrSend(env, chatId, messageId, text, extra = {}, { fal
 
 /* ─── invoice cards (used by the bot and by the OxaPay callback) ─── */
 
-const STATUS_LINE = {
-  creating: "⏳ Creating invoice…",
-  pending: "🟡 Waiting for payment",
-  paying: "🔵 Payment detected — waiting for blockchain confirmation",
-  underpaid: "🟠 Underpaid — not credited automatically",
-  expired: "⌛ Expired",
-  canceled: "❌ Canceled",
-  refunding: "↩️ Being refunded",
-  refunded: "↩️ Refunded",
-  error: "⚠️ Could not be created",
-  failed: "❌ Payment failed",
-  review: "🟠 Under review by the shop — not credited automatically",
-};
-
-const SP_STATUS_LINE = {
-  pending: "🟡 Waiting for card payment",
-  paying: "🔵 Payment processing",
-  expired: "⌛ Payment link expired — your card was not charged",
-};
+const STATUS_KEYS = ["creating", "pending", "paying", "underpaid", "expired", "canceled", "refunding", "refunded", "error", "failed", "review"];
+const SP_STATUS_KEYS = ["pending", "paying", "expired"];
+function statusLine(st, sp, L) {
+  if (sp && SP_STATUS_KEYS.includes(st)) return t(L, `card.sp.${st}`);
+  return STATUS_KEYS.includes(st) ? t(L, `card.st.${st}`) : e(st);
+}
 
 /** Short network hint for the accepted coins ("" if nothing useful to add). */
-export function networkHint(s) {
-  return acceptedCoins(s).includes("USDT") ? " — pick your network on the page (e.g. TRC20 or BEP20)" : "";
+export function networkHint(s, L = "en") {
+  return acceptedCoins(s).includes("USDT") ? t(L, "card.net_hint") : "";
 }
 
 /** "How it works" hint; texts adapt to the accepted_currencies setting. */
-export function howItWorks(s, { pickAmount = false } = {}) {
-  return (
-    "<blockquote><b>How it works</b>\n" +
-    `1. ${pickAmount ? "Pick an amount, tap" : "Tap"} <b>💳 Pay now</b> and pay with ${coinsLabel(s, { bold: true })}${networkHint(s)}.\n` +
-    "2. Send the exact amount shown on the secure OxaPay page.\n" +
-    "3. Your balance is credited automatically — usually within a few minutes.</blockquote>"
-  );
+export function howItWorks(s, { pickAmount = false } = {}, L = "en") {
+  const vars = { coins: coinsLabel(s, { bold: true, lang: L }), net: networkHint(s, L) };
+  return t(L, "how.title") + t(L, pickAmount ? "how.ox1_pick" : "how.ox1", vars) + t(L, "how.ox2") + t(L, "how.ox3");
 }
 
 /** "How it works" for Stripe card payments (hosted Checkout page). */
-export function howItWorksSp() {
-  return (
-    "<blockquote><b>How it works</b>\n" +
-    "1. Tap <b>💳 Pay by card</b> and enter your card on the secure Stripe page.\n" +
-    "2. Your balance is credited automatically right after the payment is approved.\n" +
-    "<i>Charged in US dollars — your bank may add a foreign-currency fee.</i></blockquote>"
-  );
+export function howItWorksSp(L = "en") {
+  return t(L, "how.title") + t(L, "how.sp1") + t(L, "how.sp2") + t(L, "how.sp3");
 }
 
 /** "How it works" for NOWPayments invoices (the customer chooses coin and network on the hosted page). */
-export function howItWorksNp() {
-  return (
-    "<blockquote><b>How it works</b>\n" +
-    "1. Tap <b>💳 Pay now</b> and choose any coin and network on the secure NOWPayments page.\n" +
-    "2. Send the exact amount shown there.\n" +
-    "3. Your balance is credited automatically once the network confirms the payment.</blockquote>"
-  );
+export function howItWorksNp(L = "en") {
+  return t(L, "how.title") + t(L, "how.np1") + t(L, "how.np2") + t(L, "how.np3");
 }
 
 export function resumeParts(resume) {
@@ -169,88 +143,96 @@ export function resumeParts(resume) {
   return m ? { pid: m[1], days: Number(m[2]) } : null;
 }
 
-export function invoiceCard(pay, s, supportLine) {
+export function invoiceCard(pay, s, supportLine, L = "en") {
   const cur = s.currency_symbol || "$";
   const st = pay.status;
   const open = st === "pending" || st === "paying";
   const np = pay.provider === "nowpayments";
   const sp = pay.provider === "stripe";
-  let text = `🧾 <b>Top-up invoice · ${e(money(pay.amount_usd, cur))}</b>${np ? " · NOWPayments" : sp ? " · Card (Stripe)" : ""}\n\n`;
-  text += `Status: <b>${(sp && SP_STATUS_LINE[st]) || STATUS_LINE[st] || e(st)}</b>\n`;
+  let text = t(L, "card.title", { amt: e(money(pay.amount_usd, cur)), sfx: np ? " · NOWPayments" : sp ? t(L, "card.sfx_sp") : "" });
+  text += t(L, "card.status", { st: statusLine(st, sp, L) });
   if (open && pay.expires_at) {
+    const at = e(fmtTimeBrt(pay.expires_at));
     text += np
-      ? `⏳ Open until <b>${e(fmtTimeBrt(pay.expires_at))}</b> (${tgRelTime(pay.expires_at, "24 h")})\n`
-      : `⏳ ${sp ? "Payment link valid until" : "Expires at"} <b>${e(fmtTimeBrt(pay.expires_at))}</b> (${tgRelTime(pay.expires_at, "60 min")})\n`;
+      ? t(L, "card.np_open", { at, rel: tgRelTime(pay.expires_at, "24 h") })
+      : t(L, sp ? "card.sp_open" : "card.ox_open", { at, rel: tgRelTime(pay.expires_at, "60 min") });
   }
   text += "\n";
-  if (open) text += (np ? howItWorksNp() : sp ? howItWorksSp() : howItWorks(s)) + "\n";
-  if (st === "canceled") text += sp ? "<i>The payment link was closed — your card was not charged.</i>\n\n" : "<i>If you already sent a payment, it will still be credited automatically.</i>\n\n";
+  if (open) text += (np ? howItWorksNp(L) : sp ? howItWorksSp(L) : howItWorks(s, {}, L)) + "\n";
+  if (st === "canceled") text += t(L, sp ? "card.sp_canceled" : "card.canceled");
   if (["underpaid", "refunding", "refunded", "failed", "review"].includes(st)) text += `${supportLine}\n\n`;
   text += `Ref: <code>${e(pay.id)}</code>`;
   const rows = [];
-  if (open && pay.pay_link) rows.push([urlBtn(sp ? "💳 Pay by card" : "💳 Pay now", pay.pay_link, "success")]);
-  if (open || (st === "canceled" && !sp)) rows.push([btn("🔄 I've paid · Check status", `tuchk:${pay.id}`, "primary")]);
-  if (st === "pending") rows.push([btn("❌ Cancel", `tux:${pay.id}`, "danger")]);
-  if (["expired", "canceled", "error", "failed"].includes(st)) rows.push([btn("💰 New top-up", "topup", "success")]);
-  rows.push([HOME()]);
+  if (open && pay.pay_link) rows.push([urlBtn(t(L, sp ? "btn.pay_card" : "btn.pay_now"), pay.pay_link, "success")]);
+  if (open || (st === "canceled" && !sp)) rows.push([btn(t(L, "btn.check"), `tuchk:${pay.id}`, "primary")]);
+  if (st === "pending") rows.push([btn(t(L, "btn.cancel"), `tux:${pay.id}`, "danger")]);
+  if (["expired", "canceled", "error", "failed"].includes(st)) rows.push([btn(t(L, "btn.new_topup"), "topup", "success")]);
+  rows.push([HOME(L)]);
   return { text, reply_markup: kb(rows) };
 }
 
-export function paidCard(pay, s, newBalance) {
+export function paidCard(pay, s, newBalance, L = "en") {
   const cur = s.currency_symbol || "$";
-  const text =
-    "✅ <b>Payment received!</b>\n\n" +
-    `+<b>${e(money(pay.amount_usd, cur))}</b> added to your balance.\n` +
-    `💰 New balance: <b>${e(money(newBalance, cur))}</b>\n\n` +
-    `Ref: <code>${e(pay.id)}</code>`;
+  const text = t(L, "paid.text", { amt: e(money(pay.amount_usd, cur)), bal: e(money(newBalance, cur)), ref: e(pay.id) });
   const rows = [];
   const r = resumeParts(pay.resume);
-  if (r) rows.push([btn("🛒 Continue purchase", `days:${r.pid}:${r.days}`, "success")]);
-  rows.push([btn("🛒 Shop", "shop"), btn("👤 Profile", "profile")]);
-  rows.push([HOME()]);
+  if (r) rows.push([btn(t(L, "btn.continue_purchase"), `days:${r.pid}:${r.days}`, "success")]);
+  rows.push([btn(t(L, "btn.shop"), "shop"), btn(t(L, "btn.profile"), "profile")]);
+  rows.push([HOME(L)]);
   return { text, reply_markup: kb(rows) };
 }
 
 /* ─── persistent reply keyboard (ReplyKeyboardMarkup) ─── */
 
-/** Bump when the layout changes: chats with an older version get the new keyboard on their next message. */
-export const REPLY_KB_VERSION = 1;
+/** Bump when the layout changes: chats with an older version get the new keyboard on their next message.
+ * The stored chat_nav.kb_version also encodes the language (kbVersion), so switching language refreshes it. */
+export const REPLY_KB_VERSION = 2;
+export function kbVersion(L = "en") {
+  return REPLY_KB_VERSION * 10 + (L === "pt" ? 1 : 0); // 20 = English, 21 = Português
+}
 
-/** [label, route target, style] — same sections as the inline home grid. */
+/** [label key, route target, style] — same sections as the inline home grid. */
 export const REPLY_KB_SECTIONS = [
-  ["🛒 Shop", "shop", "primary"],
-  ["💰 Top up", "topup", "success"],
-  ["🔑 My licenses", "licenses"],
-  ["📥 Downloads", "downloads"],
-  ["👤 Profile", "profile"],
-  ["💬 Support", "support"],
+  ["btn.shop", "shop", "primary"],
+  ["btn.topup", "topup", "success"],
+  ["btn.licenses", "licenses"],
+  ["btn.downloads", "downloads"],
+  ["btn.profile", "profile"],
+  ["btn.support", "support"],
 ];
 
-export const REPLY_KB_TEXT = "⌨️ Your menu is pinned below the chat — tap a section anytime.";
+export function replyKeyboardText(L = "en") {
+  return t(L, "kb.text");
+}
 
-export function replyKeyboard() {
-  const buttons = REPLY_KB_SECTIONS.map(([text, , style]) => (style ? { text, style } : { text }));
+export function replyKeyboard(L = "en") {
+  const buttons = REPLY_KB_SECTIONS.map(([key, , style]) => (style ? { text: t(L, key), style } : { text: t(L, key) }));
   return {
     keyboard: grid(buttons, 2),
     is_persistent: true,
     resize_keyboard: true,
-    input_field_placeholder: "Pick a section or type an amount",
+    input_field_placeholder: t(L, "kb.placeholder"),
   };
 }
 
-const normLabel = (t) =>
-  String(t || "")
+const normLabel = (x) =>
+  String(x || "")
     .replace(/[\uFE0E\uFE0F\u200D]/g, "")
     .trim()
     .replace(/\s+/g, " ")
     .toLowerCase();
 
+// Labels of BOTH languages are recognised: a chat may still show the keyboard of the previous language.
 const KB_LOOKUP = new Map();
-for (const [text, target] of REPLY_KB_SECTIONS) {
-  KB_LOOKUP.set(normLabel(text), target); // exact button text
-  KB_LOOKUP.set(normLabel(text.replace(/^\S+\s+/, "")), target); // same label typed without the emoji
+for (const dict of Object.values(DICT)) {
+  for (const [key, target] of REPLY_KB_SECTIONS) {
+    const text = dict[key];
+    KB_LOOKUP.set(normLabel(text), target); // exact button text
+    KB_LOOKUP.set(normLabel(text.replace(/^\S+\s+/, "")), target); // same label typed without the emoji
+  }
 }
 KB_LOOKUP.set("licenses", "licenses");
+KB_LOOKUP.set("licenças", "licenses");
 KB_LOOKUP.set("top-up", "topup");
 KB_LOOKUP.set("topup", "topup");
 

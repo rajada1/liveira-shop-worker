@@ -31,9 +31,20 @@ def callback(payload, key=KEY, sig=None):
     raw = json.dumps(payload).encode()
     return req('POST', '/oxapay/callback', raw=raw, headers={'HMAC': sig if sig is not None else sign(raw, key)})
 
+SEEDED = set()
+def seed_lang(uid, lang='en', state='/tmp/lvtest/state'):
+    """Users created by the existing tests already chose English (migration 0012: otherwise the first contact shows the
+    language picker). Inserted before the user's first message, like the production backfill of existing users."""
+    sql(f"INSERT INTO users (user_id, username, balance, created_at, lang, lang_chosen) VALUES ({uid}, NULL, 0, '2026-01-01T00:00:00Z', '{lang}', 1) "
+        f"ON CONFLICT(user_id) DO UPDATE SET lang='{lang}', lang_chosen=1", state)
+    SEEDED.add((state, uid))
+
 class User:
-    def __init__(self, uid, first, username):
+    state = '/tmp/lvtest/state'
+    def __init__(self, uid, first, username, lang='en'):
+        """lang='en'/'pt': language already chosen (seeded); lang=None: brand-new user (first contact → language picker)."""
         self.uid, self.first, self.username = uid, first, username; self.mid = None
+        if lang and (self.state, uid) not in SEEDED: seed_lang(uid, lang, self.state)
     def frm(self): return {'id': self.uid, 'is_bot': False, 'first_name': self.first, 'username': self.username}
     base = None
     def upd(self, obj): return req('POST', '/telegram', obj, {'X-Telegram-Bot-Api-Secret-Token': 'whs_local'}, base=self.base)
@@ -86,8 +97,8 @@ check('home: greeting with first name, bold balance, active licenses', 'Hi, <b>T
 check('home: welcome text (new default) in blockquote', '<blockquote>Get your Liveira license in seconds.' in t and 'credited by the shop admin' not in t, t)
 check('home: default welcome {coins} → "Top up with USDT", tip mentions USDT, no generic crypto', 'Top up with USDT — your balance is credited automatically.' in t and '{coins}' not in t and 'add funds with USDT' in t and 'crypto' not in t.lower(), t)
 cbs = cbdata(home); rows = home['body']['reply_markup']['inline_keyboard']
-check('home grid 3x2: Shop/Top up/Licenses/Downloads/Profile/Support', [len(r) for r in rows] == [2, 2, 2] and cbs == ['shop', 'topup', 'licenses', 'downloads', 'profile', 'support'], cbs)
-check('home: button labels with emoji', [b['text'] for b in buttons(home)] == ['🛒 Shop', '💰 Top up', '🔑 My licenses', '📥 Downloads', '👤 Profile', '💬 Support'])
+check('home grid: Shop/Top up, 🎁 free trial, Licenses/Downloads, Profile/Support, 🌐 Language', [len(r) for r in rows] == [2, 1, 2, 2, 1] and cbs == ['shop', 'topup', 'free', 'licenses', 'downloads', 'profile', 'support', 'lang'], cbs)
+check('home: button labels with emoji', [b['text'] for b in buttons(home)] == ['🛒 Shop', '💰 Top up', '🎁 Free 1-day trial', '🔑 My licenses', '📥 Downloads', '👤 Profile', '💬 Support', '🌐 Language'], [b['text'] for b in buttons(home)])
 check('home: styled buttons (primary/success)', buttons(home)[0].get('style') == 'primary' and buttons(home)[1].get('style') == 'success')
 
 # ───── navigation, every screen edits the same message
@@ -282,7 +293,11 @@ m = mark(); s_, body, _ = req('POST', '/admin/api/bot/setup', None, AH); ev = si
 check('admin bot setup → ok', s_ == 200 and d['ok'] is True, body)
 cmds = tg(ev, 'setMyCommands')
 check('setMyCommands default + admin chat scope', any(c['body']['scope']['type'] == 'default' for c in cmds) and any(c['body']['scope'] == {'type': 'chat', 'chat_id': 1} for c in cmds) and
-      [c['command'] for c in cmds[0]['body']['commands']] == ['start', 'menu', 'shop', 'topup', 'licenses', 'downloads', 'profile', 'support'])
+      [c['command'] for c in cmds[0]['body']['commands']] == ['start', 'menu', 'shop', 'topup', 'free', 'licenses', 'downloads', 'profile', 'support', 'language'])
+pt_cmds = [c for c in cmds if c['body'].get('language_code') == 'pt']
+check('setMyCommands for Portuguese apps (language_code pt): /free + /idioma, pt descriptions', pt_cmds and pt_cmds[0]['body']['scope'] == {'type': 'default'} and
+      [c['command'] for c in pt_cmds[0]['body']['commands']] == ['start', 'menu', 'shop', 'topup', 'free', 'licenses', 'downloads', 'profile', 'support', 'idioma']
+      and any(c['description'] == '🎁 Teste grátis' for c in pt_cmds[0]['body']['commands']), pt_cmds and pt_cmds[0]['body'])
 check('/menu in the command list with a short description', [c for c in cmds[0]['body']['commands'] if c['command'] == 'menu' and 0 < len(c['description']) <= 256])
 check('setChatMenuButton commands + descriptions', tg(ev, 'setChatMenuButton')[0]['body']['menu_button'] == {'type': 'commands'} and tg(ev, 'setMyDescription') and tg(ev, 'setMyShortDescription'))
 desc = tg(ev, 'setMyDescription')[0]['body']['description']; short = tg(ev, 'setMyShortDescription')[0]['body']['short_description']
@@ -322,7 +337,7 @@ check('/start: persistent reply keyboard sent (is_persistent, resize_keyboard, p
 check('reply keyboard: 6 sections with emoji, 2 columns', [[b['text'] for b in r] for r in rm.get('keyboard', [])] == [['🛒 Shop', '💰 Top up'], ['🔑 My licenses', '📥 Downloads'], ['👤 Profile', '💬 Support']], rm)
 check('/start: keyboard message first, home card (inline) last at the bottom', k and sends[-1]['body']['text'].startswith('👋 Hi, <b>Carla</b>') and sends.index(k[0]) == 0 and 'inline_keyboard' in sends[-1]['body']['reply_markup'], [x['body']['text'][:30] for x in sends])
 KB1, H1 = k[0]['mid'], sends[-1]['mid']
-r = navrow(C); check('chat_nav stores menu, keyboard message, version, last id', r['menu_msg_id'] == H1 and r['kb_msg_id'] == KB1 and r['kb_version'] == 1 and r['last_msg_id'] == H1, r)
+r = navrow(C); check('chat_nav stores menu, keyboard message, version, last id', r['menu_msg_id'] == H1 and r['kb_msg_id'] == KB1 and r['kb_version'] == 20 and r['last_msg_id'] == H1, r)
 nav(C, 'shop', 'latest message tapped → edited in place', ['🛒 <b>Shop</b>'])
 ev, ans = C.cb('shop'); check('latest tap, same screen → "not modified" tolerated, no new message', len(ans) == 1 and not tg(ev, 'sendMessage') and not tg(ev, 'deleteMessage'))
 for label, want in [('🛒 Shop', '🛒 <b>Shop</b>'), ('💰 Top up', '💰 <b>Top up balance</b>'), ('🔑 My licenses', 'No licenses yet'), ('📥 Downloads', 'No downloads yet'), ('👤 Profile', '👤 <b>Profile</b>'), ('💬 Support', '💬 <b>Support</b>'), ('shop', '🛒 <b>Shop</b>')]:
@@ -1055,7 +1070,7 @@ def gsetting(k): r = sql(f"SELECT value FROM settings WHERE key='{k}'"); return 
 s_, body, _ = req('GET', '/admin/api/settings', None, AH); d = json.loads(body)['settings']
 check('group settings: defaults (no group = off, gate + purchase feed on)', d.get('group_chat_id') == '' and d.get('group_invite_link') == '' and d.get('group_gate') == '1' and d.get('feed_purchases') == '1', d)
 GA = User(555090, 'Gabriel', 'gabriel_secret')
-sql(f"INSERT OR REPLACE INTO users (user_id, username, balance, created_at) VALUES ({GA.uid}, 'gabriel_secret', 50, '2026-10-06T00:00:00Z')")
+sql(f"INSERT OR REPLACE INTO users (user_id, username, balance, created_at, lang, lang_chosen) VALUES ({GA.uid}, 'gabriel_secret', 50, '2026-10-06T00:00:00Z', 'en', 1)")
 ev = GA.msg('/start'); GA.mid = last_screen(ev)['mid']
 ev, ans, scr = nav(GA, 'confirm:liveira_access:3', 'no group configured: purchase works', ['Purchase successful'], ['licenses'])
 check('no group configured → no getChatMember, no group post', not gcm(ev) and not [x for x in tg(ev, 'sendMessage') if str(x['body']['chat_id']).startswith('-')], [e.get('tg') for e in ev])
@@ -1168,10 +1183,276 @@ s_, body, _ = req('GET', '/admin/app.js', None); check('panel app.js: community 
 s_, body, _ = req('PUT', '/admin/api/settings', {'group_chat_id': ''}, AH)
 u = User(555103, 'After', 'after'); ev = u.msg('/start'); check('group id cleared → nothing required any more', s_ == 200 and last_screen(ev) and 'Hi, <b>After</b>' in last_screen(ev)['body']['text'] and not gcm(ev))
 
+# ───── language (pt / en): bilingual picker on first contact, switching, every screen in both languages
+I18N = json.loads(subprocess.run(['node', '-e', 'import("./src/i18n.js").then(m => console.log(JSON.stringify(m.DICT)))'], cwd='/workspace/liveira-shop-worker', capture_output=True, text=True).stdout)
+EN_D, PT_D = I18N['en'], I18N['pt']
+def ph(v): return sorted(set(re.findall(r'\{(\w+)\}', v)))
+check('i18n: en and pt have exactly the same keys (no missing translation)', set(EN_D) == set(PT_D) and len(EN_D) > 300, (sorted(set(EN_D) ^ set(PT_D)), len(EN_D)))
+check('i18n: every key uses the same {placeholders} in both languages', not [k for k in EN_D if ph(EN_D[k]) != ph(PT_D.get(k, ''))], [k for k in EN_D if ph(EN_D[k]) != ph(PT_D.get(k, ''))][:5])
+check('i18n: no empty strings', not [k for d in (EN_D, PT_D) for k, v in d.items() if not str(v).strip()])
+DOTKEYS = [k for k in EN_D if '.' in k]
+def leaks(entry):
+    """Raw i18n artefacts in a rendered message: unreplaced {placeholders}, key names, 'undefined'/'null'."""
+    if not entry: return ['<no screen>']
+    parts = [entry['body'].get('text') or ''] + [b.get('text', '') for b in buttons(entry)]
+    rm = entry['body'].get('reply_markup') or {}
+    parts += [b.get('text', '') for row in rm.get('keyboard', []) for b in row]
+    bad = []
+    for p in parts:
+        if re.search(r'\{\w+\}', p): bad.append('placeholder: ' + p[:80])
+        if 'undefined' in p or 'NaN' in p or re.search(r'\bnull\b', p): bad.append('undefined/null: ' + p[:80])
+        bad += ['key: ' + k for k in DOTKEYS if k in p]
+    return bad
+
+req('PUT', '/admin/api/settings', {'group_chat_id': str(GRP), 'group_invite_link': INVITE, 'group_gate': '1'}, AH)
+LA = User(555110, 'Lara', 'lara', lang=None)
+ev = LA.msg('/start topup_25'); scr = last_screen(ev)
+check('first contact (/start topup_25) → bilingual language picker, nothing else', scr and scr['body']['text'] == PT_D['lang.first'] and 'Escolha o idioma / Choose your language' in scr['body']['text']
+      and cbdata(scr) == ['lg:pt:topup_25', 'lg:en:topup_25'] and [b['text'] for b in buttons(scr)] == ['🇧🇷 Português', '🇺🇸 English'], scr and (scr['body']['text'], buttons(scr)))
+check('picker comes BEFORE the group gate (no getChatMember, no join screen, no reply keyboard yet)', not gcm(ev) and not is_gate(scr) and not kbmsgs(ev), [e.get('tg') for e in ev])
+check('new user stored with lang_chosen=0', (r := sql(f'SELECT lang, lang_chosen FROM users WHERE user_id={LA.uid}')) and r[0]['lang_chosen'] == 0, r)
+ev = LA.msg('🛒 Shop'); scr = last_screen(ev)
+check('first contact via a keyboard label → picker again, the press is deleted', scr and scr['body']['text'] == PT_D['lang.first'] and any(x['body']['message_id'] == LA.last_in for x in tg(ev, 'deleteMessage')))
+ev, ans = LA.cb('shop'); scr = last_screen(ev)
+check('first contact via an old button (shop) → picker (keeps the target), answered once', scr and scr['body']['text'] == PT_D['lang.first'] and cbdata(scr) == ['lg:pt:shop', 'lg:en:shop'] and len(ans) == 1, scr and cbdata(scr))
+ev = LA.msg('/whoami'); check('/whoami works before choosing a language', any(str(LA.uid) in x['body']['text'] for x in tg(ev, 'sendMessage')))
+ev, ans = LA.cb('lg:pt:topup_25'); scr = last_screen(ev)
+check('picks 🇧🇷 Português while not in the group → join screen IN PORTUGUESE, deep link kept (jg:topup_25)', scr and 'Para usar a loja, entre no nosso grupo' in scr['body']['text'] and 'jg:topup_25' in cbdata(scr)
+      and [b['text'] for b in buttons(scr)] == ['👥 Entrar no grupo', '✅ Já entrei'] and len(ans) == 1 and ans[0]['body'].get('text') == '✅ Idioma alterado para Português', (ans, scr and scr['body']['text']))
+check('choice stored: lang=pt, lang_chosen=1', (r := sql(f'SELECT lang, lang_chosen FROM users WHERE user_id={LA.uid}')) and r[0]['lang'] == 'pt' and r[0]['lang_chosen'] == 1, r)
+ev, ans = LA.cb('jg:topup_25'); check('"✅ Já entrei" while still out → alert in Portuguese', len(ans) == 1 and 'Ainda não vemos você no grupo' in ans[0]['body'].get('text', ''), ans)
+member(LA.uid, 'member')
+ev, ans = LA.cb('jg:topup_25'); scr = last_screen(ev); kbs = kbmsgs(ev)
+check('joins → "Tudo certo" + the deep link target (top-up $25 confirm) in Portuguese', len(ans) == 1 and 'Tudo certo' in ans[0]['body'].get('text', '') and scr and '💰 <b>Confirmar recarga</b>' in scr['body']['text'] and 'Valor: <b>$25.00</b>' in scr['body']['text'], (ans, scr and scr['body']['text']))
+check('Portuguese reply keyboard sent (🛒 Loja / 💰 Recarregar / 🔑 Minhas licenças / …), kb_version 21', kbs and [b['text'] for row in kbs[-1]['body']['reply_markup']['keyboard'] for b in row] == ['🛒 Loja', '💰 Recarregar', '🔑 Minhas licenças', '📥 Downloads', '👤 Perfil', '💬 Suporte']
+      and kbs[-1]['body']['text'] == PT_D['kb.text'] and kbs[-1]['body']['reply_markup']['input_field_placeholder'] == PT_D['kb.placeholder'] and navrow(LA)['kb_version'] == 21, kbs and kbs[-1]['body'])
+req('PUT', '/admin/api/settings', {'group_chat_id': ''}, AH)
+
+LB = User(555111, 'Bruno', 'bruno', lang=None)
+ev = LB.msg('/start'); scr = last_screen(ev); check('first /start without payload → picker with lg:pt / lg:en', scr and cbdata(scr) == ['lg:pt', 'lg:en'], scr and cbdata(scr))
+ev, ans = LB.cb('lg:en'); scr = last_screen(ev); kbs = kbmsgs(ev)
+check('picks 🇺🇸 English → toast, English keyboard (kb_version 20) and English home', len(ans) == 1 and ans[0]['body'].get('text') == '✅ Language set to English' and kbs and '🛒 Shop' in json.dumps(kbs[-1]['body'], ensure_ascii=False)
+      and scr and scr['body']['text'].startswith('👋 Hi, <b>Bruno</b>') and navrow(LB)['kb_version'] == 20 and 'lang' in cbdata(scr), (ans, scr and scr['body']['text']))
+if scr and scr['tg'] == 'sendMessage': LB.mid = scr['mid']
+ev = LB.msg('/start'); check('second /start → no picker any more (home)', last_screen(ev) and last_screen(ev)['body']['text'].startswith('👋 Hi, <b>Bruno</b>'))
+ev = LB.msg('/idioma'); scr = last_screen(ev)
+check('/idioma → language screen (current English, ✅ on English, 🏠 Home)', scr and 'Current: <b>🇺🇸 English</b>' in scr['body']['text'] and cbdata(scr) == ['lgs:pt', 'lgs:en', 'home'] and buttons(scr)[1].get('style') == 'success', scr and (scr['body']['text'], cbdata(scr)))
+ev = LB.msg('/language'); check('/language → same screen', last_screen(ev) and 'lgs:pt' in cbdata(last_screen(ev)))
+ev, ans = LB.cb('lgs:pt'); scr = last_screen(ev); kbs = kbmsgs(ev)
+check('switch to Português → toast, home in Portuguese', len(ans) == 1 and ans[0]['body'].get('text') == '✅ Idioma alterado para Português' and scr and scr['body']['text'].startswith('👋 Olá, <b>Bruno</b>! Bem-vindo(a) à'), (ans, scr and scr['body']['text']))
+check('…reply keyboard re-sent with Portuguese labels (kb_version 21)', kbs and '🔑 Minhas licenças' in json.dumps(kbs[-1]['body'], ensure_ascii=False) and navrow(LB)['kb_version'] == 21, kbs and kbs[-1]['body'])
+check('…home buttons in Portuguese', scr and [b['text'] for b in buttons(scr)] == ['🛒 Loja', '💰 Recarregar', '🎁 Teste grátis de 1 dia', '🔑 Minhas licenças', '📥 Downloads', '👤 Perfil', '💬 Suporte', '🌐 Idioma'], scr and [b['text'] for b in buttons(scr)])
+if scr and scr['tg'] == 'sendMessage': LB.mid = scr['mid']
+ev = LB.msg('🛒 Loja'); check('Portuguese keyboard label "🛒 Loja" → shop in Portuguese', last_screen(ev) and '🛒 <b>Loja</b>' in last_screen(ev)['body']['text'] and 'Escolha um produto' in last_screen(ev)['body']['text'])
+ev = LB.msg('🛒 Shop'); check('old English label still routed after switching (stale keyboard) → shop in Portuguese', last_screen(ev) and '🛒 <b>Loja</b>' in last_screen(ev)['body']['text'])
+ev = LB.msg('/whoami'); check('/whoami in Portuguese', any('Seu ID do Telegram' in x['body']['text'] for x in tg(ev, 'sendMessage')), [x['body']['text'] for x in tg(ev, 'sendMessage')])
+check('every message to the Portuguese user so far: no raw keys / placeholders', not [l for x in tg(since(0), 'sendMessage') + tg(since(0), 'editMessageText') if (x.get('body') or {}).get('chat_id') in (LA.uid, LB.uid) for l in leaks(x)])
+
+# every customer screen in both languages
+def screens_for(u):
+    out = {}
+    ev = u.msg('/menu'); out['home'] = last_screen(ev)
+    for d in ['shop', 'buy:liveira_access', 'days:liveira_access:3', 'licenses', 'downloads', 'profile', 'support', 'topup', 'kp:', 'kp:12', 'tuc:10', 'np', 'npc:20', 'sp', 'spc:10', 'bn', 'free', 'ft:liveira_access', 'lang']:
+        ev, ans = u.cb(d); out[d] = last_screen(ev)
+        if out[d] and out[d]['tg'] == 'sendMessage': u.mid = out[d]['mid']
+    return out
+EX = User(555112, 'Ellen', 'ellen'); EX.msg('/start')
+SCR_EN = screens_for(EX); SCR_PT = screens_for(LB)
+PT_EXPECT = {'home': '👋 Olá', 'shop': '🛒 <b>Loja</b>', 'buy:liveira_access': 'Escolha a duração', 'days:liveira_access:3': '🧾 <b>Confirmar compra</b>', 'licenses': '🔑 <b>Minhas licenças</b>',
+             'downloads': '📥 <b>Downloads</b>', 'profile': '👤 <b>Perfil</b>', 'support': '💬 <b>Suporte</b>', 'topup': '💰 <b>Recarregar saldo</b>', 'kp:': '✏️ <b>Outro valor', 'kp:12': '✏️ <b>Outro valor',
+             'tuc:10': '💰 <b>Confirmar recarga</b>', 'np': '🪙 <b>Pagar com cripto (NOWPayments)</b>', 'npc:20': '🪙 <b>Confirmar recarga</b>', 'sp': '💳 <b>Pagar no cartão (Stripe)</b>', 'spc:10': '💳 <b>Confirmar recarga no cartão</b>',
+             'bn': '🟡 <b>Binance Pay</b>', 'free': '🎁 <b>Teste grátis · 1 dia</b>', 'ft:liveira_access': '🎁 <b>Confirmar teste grátis</b>', 'lang': '🌐 <b>Idioma / Language</b>'}
+for k, want in PT_EXPECT.items():
+    s_pt, s_en = SCR_PT.get(k), SCR_EN.get(k)
+    check(f'screen {k}: Portuguese ({want[:28]}…) and English versions differ, no raw keys/placeholders in either',
+          s_pt and want in s_pt['body']['text'] and s_en and s_en['body']['text'] != s_pt['body']['text'] and not leaks(s_pt) and not leaks(s_en), (k, s_pt and s_pt['body']['text'][:200], leaks(s_pt), leaks(s_en)))
+check('Portuguese screens keep the same buttons/callbacks as English (only labels change)', all(cbdata(SCR_PT[k]) == cbdata(SCR_EN[k]) for k in PT_EXPECT if k not in ('home', 'licenses', 'downloads', 'profile')),
+      [(k, cbdata(SCR_PT[k]), cbdata(SCR_EN[k])) for k in PT_EXPECT if cbdata(SCR_PT[k]) != cbdata(SCR_EN[k])][:3])
+check('profile shows the language + 🌐 button', '🌐 Idioma: <b>🇧🇷 Português</b>' in SCR_PT['profile']['body']['text'] and 'lang' in cbdata(SCR_PT['profile']) and '🌐 Language: <b>🇺🇸 English</b>' in SCR_EN['profile']['body']['text'])
+# invoice card + payment notice + purchase receipt in Portuguese
+ev, ans = LB.cb('tun:10'); card = last_screen(ev)
+pay = sql(f"SELECT * FROM payments WHERE telegram_user_id={LB.uid} AND provider='oxapay' ORDER BY created_at DESC LIMIT 1")
+check('OxaPay invoice card in Portuguese (🧾 Fatura de recarga · $10.00, Status, Como funciona, 💳 Pagar agora)', card and '🧾 <b>Fatura de recarga · $10.00</b>' in card['body']['text'] and 'Como funciona' in card['body']['text'] and not leaks(card) and pay, card and card['body']['text'])
+if pay:
+    m = mark(); callback({'track_id': pay[0]['track_id'], 'status': 'Paid', 'type': 'invoice', 'amount': 10, 'currency': 'USDT', 'order_id': pay[0]['id']}); time.sleep(0.5); ev = since(m)
+    um = [x for x in tg(ev, 'sendMessage') + tg(ev, 'editMessageText') if x['body'].get('chat_id') == LB.uid]
+    check('payment confirmed → paid card + notice in Portuguese ("Pagamento recebido" / "Pagamento confirmado, +$10.00 adicionado")', any('✅ <b>Pagamento recebido!</b>' in x['body']['text'] for x in um) and any('Pagamento confirmado, +$10.00 adicionado' in x['body']['text'] for x in um) and not [l for x in um for l in leaks(x)], [x['body']['text'][:80] for x in um])
+ev = LB.msg('/menu'); ev, ans = LB.cb('confirm:liveira_access:3'); rec = last_screen(ev)
+check('purchase receipt in Portuguese (✅ Compra concluída!, Expira em, 📋 copy, 📥 download)', rec and '✅ <b>Compra concluída!</b>' in rec['body']['text'] and 'Expira em:' in rec['body']['text'] and len(ans) == 1 and ans[0]['body'].get('text') == '✅ Compra concluída!'
+      and 'dl:liveira_access' in cbdata(rec) and not leaks(rec), rec and rec['body']['text'])
+LB_KEY = re.search(r'<code>([^<]+)</code>', rec['body']['text']).group(1) if rec else ''
+ev = LB.msg('/start'); h = last_screen(ev)
+check('welcome text: Portuguese variant (welcome_text_pt) on the pt home, English on the en home', h and 'Pegue sua licença Liveira em segundos' in h['body']['text'] and 'Get your Liveira license in seconds' in SCR_EN['home']['body']['text'], h and h['body']['text'])
+s_, body, _ = req('PUT', '/admin/api/settings', {'welcome_text_pt': 'Bem-vindo ao teste pt com {coins}'}, AH)
+ev = LB.msg('/menu'); h = last_screen(ev); ev2 = EX.msg('/menu'); h2 = last_screen(ev2)
+check('admin edits welcome_text_pt → only the Portuguese home changes ({coins} filled in pt)', s_ == 200 and h and 'Bem-vindo ao teste pt com USDT' in h['body']['text'] and '{coins}' not in h['body']['text'] and h2 and 'Bem-vindo' not in h2['body']['text'], (s_, h and h['body']['text']))
+req('PUT', '/admin/api/settings', {'welcome_text_pt': ''}, AH)
+ev = LB.msg('/menu'); h = last_screen(ev)
+check('welcome_text_pt empty → Portuguese home falls back to welcome_text (en), still greets in Portuguese', h and h['body']['text'].startswith('👋 Olá, <b>Bruno</b>') and 'Get your Liveira license in seconds' in h['body']['text'], h and h['body']['text'])
+# admin panel stays pt-BR; admin bot commands untouched
+s_, body, _ = req('GET', '/admin/app.js', None)
+check('panel app.js: welcome pt/en, free trial card, Grátis markers, language column', 'welcome_text_pt' in body and 'Teste grátis' in body and 'Grátis' in body and 'Idioma' in body and 'free_trial_days' in body)
+
+# ───── free trial (one free license per Telegram account, forever)
+sql("INSERT OR REPLACE INTO products (id, name, description, active, sort, file_key, file_name, file_size, file_tg_id, created_at, updated_at) VALUES ('cheat_fatal', 'Cheat Fatal Chase', 'x', 1, 5, 'products/cheat_fatal/x', 'fatal.zip', 1024, 'CACHEDFATAL', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')")
+sql("INSERT OR REPLACE INTO product_prices (product_id, days, price) VALUES ('cheat_fatal', 3, 1.0), ('cheat_fatal', 7, 2.0), ('cheat_fatal', 30, 5.0)")
+s_, body, _ = req('GET', '/admin/api/settings', None, AH); d = json.loads(body)['settings']
+check('free trial settings: defaults enabled, 1 day, every product', d.get('free_trial_enabled') == '1' and d.get('free_trial_days') == '1' and d.get('free_trial_products') == '', d)
+def uscreen(ev, u): return last_screen([x for x in ev if (x.get('body') or {}).get('chat_id') == u.uid])
+def fclaims(uid): return sql(f'SELECT * FROM free_claims WHERE telegram_user_id={uid}')
+def forders(uid): return sql(f"SELECT * FROM orders WHERE user_id={uid} AND kind='free_trial'")
+def ftokens(uid): return sql(f'SELECT * FROM tokens WHERE telegram_user_id={uid}')
+FA = User(555120, 'Felipe', 'felipe'); ev = FA.msg('/start'); h = last_screen(ev); FA.mid = h['mid']
+check('home shows "🎁 Free 1-day trial" (free) before claiming', 'free' in cbdata(h) and '🎁 Free 1-day trial' in [b['text'] for b in buttons(h)])
+ev, ans, scr = nav(FA, 'free', 'free trial screen', ['🎁 <b>Free trial · 1 day</b>', 'Only one free trial per account, ever'], ['ft:liveira_access', 'ft:cheat_fatal'])
+ev, ans, scr = nav(FA, 'ft:cheat_fatal', 'free trial confirm', ['🎁 <b>Confirm free trial</b>', 'Cheat Fatal Chase', 'Price: <b>Free</b>'], ['ftok:cheat_fatal'], must_home=False)
+b0 = FA.bal(); n_orders0 = sql('SELECT COUNT(*) AS n FROM orders')[0]['n']
+ev, ans = FA.cb('ftok:cheat_fatal'); rec = last_screen(ev)
+key = re.search(r'<code>([^<]+)</code>', rec['body']['text']).group(1) if rec and '<code>' in rec['body']['text'] else None
+check('claim → receipt "🎁 Free trial activated!" with the key, 1 day, expiry, toast, answered once', rec and '🎁 <b>Free trial activated!</b>' in rec['body']['text'] and 'Duration: <b>1 day</b>' in rec['body']['text'] and key and len(ans) == 1 and ans[0]['body'].get('text') == '🎁 Free trial activated!', (ans, rec and rec['body']['text']))
+check('receipt buttons: 📋 copy key, 📥 Download (dl:cheat_fatal), licenses, home', rec and buttons(rec)[0].get('copy_text', {}).get('text') == key and 'dl:cheat_fatal' in cbdata(rec) and 'licenses' in cbdata(rec) and 'home' in cbdata(rec), rec and buttons(rec))
+c = fclaims(FA.uid); o = forders(FA.uid); tk = ftokens(FA.uid)
+check('DB: one free_claims row (product, token, 1 day), one $0 order kind=free_trial, one active 1-day token', len(c) == 1 and c[0]['product_id'] == 'cheat_fatal' and c[0]['token'] == key and c[0]['days'] == 1 and c[0]['reminder_sent_at'] in (None, 'null')
+      and len(o) == 1 and o[0]['price'] == 0 and o[0]['token'] == key and o[0]['duration_days'] == 1 and len(tk) == 1 and tk[0]['token'] == key and tk[0]['status'] == 'active'
+      and 86000000 < iso_ms(tk[0]['expires_at']) - iso_ms(tk[0]['created_at']) <= 86400000, (c, o, tk))
+check('no balance debit, no topup rows', FA.bal() == b0 and not sql(f'SELECT id FROM topups WHERE user_id={FA.uid}'), (FA.bal(), b0))
+check('claim audited (free_trial_claimed)', sql(f"SELECT 1 FROM audit_log WHERE action='free_trial_claimed' AND actor='tg:{FA.uid}'"))
+ev, ans = FA.cb('dl:cheat_fatal', mid=rec['mid'] if rec.get('mid') else None)
+check('📥 download works with the trial license', tg(ev, 'sendDocument') and tg(ev, 'sendDocument')[0]['body'].get('document') == 'CACHEDFATAL', [e.get('tg') for e in ev])
+ev = FA.msg('/menu'); h = last_screen(ev)
+check('after claiming: 🎁 button hidden on home, licenses count 1', h and 'free' not in cbdata(h) and '🔑 Active licenses: <b>1</b>' in h['body']['text'], h and (cbdata(h), h['body']['text']))
+ev, ans, scr = nav(FA, 'licenses', 'licenses list shows the trial key', [key[-4:]], [])
+FA.msg('/menu')
+for how_, act in [('/free', lambda: FA.msg('/free')), ('/start free', lambda: FA.msg('/start free')), ('callback free', lambda: FA.cb('free')[0])]:
+    if how_ == 'callback free': FA.msg('/menu')
+    ev = act(); scr = last_screen(ev)
+    check(f'already claimed → {how_} shows "already used your free trial" (product, date), no second claim', scr and "You've already used your free trial: <b>Cheat Fatal Chase</b> (1 day)" in scr['body']['text'] and 'ft:' not in json.dumps(cbdata(scr)), scr and scr['body']['text'])
+time.sleep(1)
+ev, ans = FA.cb('ftok:liveira_access'); scr = last_screen(ev)
+check('already claimed → trying ANOTHER product (ftok:liveira_access) refused: already-claimed screen + toast, nothing written', len(ans) == 1 and ans[0]['body'].get('text') == "You've already used your free trial"
+      and len(fclaims(FA.uid)) == 1 and len(forders(FA.uid)) == 1 and len(ftokens(FA.uid)) == 1, (ans, scr and scr['body']['text']))
+check('admins see a paid-license holder can still claim: profile lists the trial as "🎁 free trial"', '🎁 free trial' in (last_screen(FA.cb('profile')[0]) or {'body': {'text': ''}})['body']['text'])
+# user with paid licenses can still claim (GA bought several earlier)
+ev = GA.msg('/menu'); h = last_screen(ev)
+check('user with paid licenses still sees the free trial button', h and 'free' in cbdata(h))
+# double tap (concurrent): exactly one claim / order / token / receipt
+FD = User(555121, 'Duda', 'duda'); FD.msg('/start'); FD.cb('free'); FD.cb('ft:liveira_access')
+m = mark(); q0 = []
+def tapc(data): return FD.cb(data)
+with cf.ThreadPoolExecutor(4) as ex: res = list(ex.map(tapc, ['ftok:liveira_access', 'ftok:liveira_access', 'ftok:cheat_fatal', 'ftok:liveira_access']))
+time.sleep(0.5); ev = since(m)
+recs = [x for x in tg(ev, 'sendMessage') + tg(ev, 'editMessageText') if x['body'].get('chat_id') == FD.uid and '🎁 <b>Free trial activated!</b>' in (x['body'].get('text') or '')]
+check('4 concurrent claim taps (2 products) → exactly 1 claim row, 1 free order, 1 token, 1 receipt; every tap answered once', len(fclaims(FD.uid)) == 1 and len(forders(FD.uid)) == 1 and len(ftokens(FD.uid)) == 1 and len(recs) == 1
+      and all(len(a) == 1 for _, a in res) and fclaims(FD.uid)[0]['token'] == ftokens(FD.uid)[0]['token'] == forders(FD.uid)[0]['token'], (len(fclaims(FD.uid)), len(forders(FD.uid)), len(ftokens(FD.uid)), len(recs), [len(a) for _, a in res]))
+# group configured: live membership check at claim time (with the gate OFF and ON), leave → rejoin → retry
+req('PUT', '/admin/api/settings', {'group_chat_id': str(GRP), 'group_invite_link': INVITE, 'group_gate': '0', 'feed_purchases': '1'}, AH)
+FC = User(555122, 'Caio', 'caio'); ev = FC.msg('/start'); FC.mid = last_screen(ev)['mid']
+check('gate off + group set: non-member uses the bot (no getChatMember on /start)', last_screen(ev) and 'Hi, <b>Caio</b>' in last_screen(ev)['body']['text'] and not gcm(ev))
+FC.cb('free'); FC.cb('ft:cheat_fatal')
+ev, ans = FC.cb('ftok:cheat_fatal'); scr = last_screen(ev)
+check('group required: non-member claim → "Join our group to get the free trial" (👥 Join + ✅ I\'ve joined retries ftok), toast, nothing written', scr and 'Join our group to get the free trial' in scr['body']['text']
+      and buttons(scr)[0].get('url') == INVITE and 'ftok:cheat_fatal' in cbdata(scr) and len(ans) == 1 and ans[0]['body'].get('text') == '👥 Join our group first' and not fclaims(FC.uid) and not forders(FC.uid), (ans, scr and scr['body']['text']))
+check('…membership asked live (one getChatMember)', len(gcm(ev)) == 1 and gcm(ev)[0]['body'] == {'chat_id': GRP, 'user_id': FC.uid}, gcm(ev))
+member(FC.uid, 'member')
+ev, ans = FC.cb('ftok:cheat_fatal'); rec = uscreen(ev, FC); posts = gposts(ev); pt = posts[0]['body']['text'] if posts else ''
+norders = sql('SELECT COUNT(*) AS n FROM orders')[0]['n']
+check('after joining, "✅ I\'ve joined" → claimed (receipt + 1 claim row)', rec and '🎁 <b>Free trial activated!</b>' in rec['body']['text'] and len(fclaims(FC.uid)) == 1, rec and rec['body']['text'])
+check('feed: same "🛍 New purchase!" post as a purchase (product, ⏳ Plan: 1 day, masked id, total), silent, Open shop', len(posts) == 1 and '<b>🛍 New purchase!</b>' in pt and '🔑 <b>Product:</b> Cheat Fatal Chase' in pt and '⏳ <b>Plan:</b> 1 day' in pt
+      and '👤 <b>By:</b> <code>555***22</code>' in pt and f'📈 <b>Total purchases:</b> {norders}' in pt and posts[0]['body'].get('disable_notification') is True and buttons(posts[0])[0]['text'] == '🛒 Open shop', pt)
+check('feed post: no key, no price, no username; sent after the receipt and the answer', posts and fclaims(FC.uid)[0]['token'] not in pt and '$' not in pt and 'caio' not in pt.lower() and ev.index(posts[0]) > ev.index(rec) and ev.index(posts[0]) > ev.index(tg(ev, 'answerCallbackQuery')[0]), pt)
+member(FC.uid, 'left'); chat_member(FC.uid, 'member', 'left'); time.sleep(0.3)
+member(FC.uid, 'member'); chat_member(FC.uid, 'left', 'member'); time.sleep(0.3)
+FC.username = 'caio_new'; FC.first = 'Caio2'
+ev = FC.msg('/menu'); h = last_screen(ev)
+ev, ans = FC.cb('ftok:liveira_access'); scr = last_screen(ev)
+check('leave → rejoin → new username → retry another product: still refused (claim keyed by Telegram id), 1 claim / 1 free order / 1 token', len(fclaims(FC.uid)) == 1 and len(forders(FC.uid)) == 1 and len(ftokens(FC.uid)) == 1
+      and fclaims(FC.uid)[0]['product_id'] == 'cheat_fatal' and h and 'free' not in cbdata(h) and len(ans) == 1 and ans[0]['body'].get('text') == "You've already used your free trial", (fclaims(FC.uid), ans))
+req('PUT', '/admin/api/settings', {'group_gate': '1'}, AH)
+FG = User(555123, 'Gui', 'gui'); member(FG.uid, 'member'); ev = FG.msg('/start'); FG.mid = last_screen(ev)['mid']
+FG.cb('free'); FG.cb('ft:cheat_fatal')
+member(FG.uid, 'left')  # left without a chat_member update: the gate cache still says "member"
+ev, ans = FG.cb('ftok:cheat_fatal'); scr = uscreen(ev, FG)
+check('gate on: cached "member" but actually left → claim blocked by the LIVE check (no stale cache), nothing written', scr and 'Join our group to get the free trial' in scr['body']['text'] and len(gcm(ev)) == 1 and not fclaims(FG.uid), (scr and scr['body']['text'], len(gcm(ev))))
+member(FG.uid, 'member'); req('PUT', '/admin/api/settings', {'feed_purchases': '0'}, AH)
+ev, ans = FG.cb('ftok:cheat_fatal'); rec = uscreen(ev, FG)
+check('feed_purchases=0 → "✅ I\'ve joined" on the free-trial screen right after joining (gate cache still says out) → claimed, no group post', rec and '🎁 <b>Free trial activated!</b>' in rec['body']['text'] and not gposts(ev))
+req('PUT', '/admin/api/settings', {'feed_purchases': '1'}, AH)
+FH = User(555124, 'Heitor', 'heitor'); member(FH.uid, 'member'); ev = FH.msg('/start'); FH.mid = last_screen(ev)['mid']; FH.cb('free'); FH.cb('ft:liveira_access')
+fpost('/_tg/mode/groupsend/403'); ev, ans = FH.cb('ftok:liveira_access'); fpost('/_tg/mode/groupsend/ok'); rec = uscreen(ev, FH)
+check('group post fails (bot kicked) → claim still delivered (receipt, 1 claim, 1 token), answered once', rec and '🎁 <b>Free trial activated!</b>' in rec['body']['text'] and len(fclaims(FH.uid)) == 1 and len(ftokens(FH.uid)) == 1 and len(ans) == 1)
+fpost('/_tg/mode/member/500'); FM = User(555125, 'Mel', 'mel'); member(FM.uid, 'member'); ev = FM.msg('/start'); FM.mid = last_screen(ev)['mid'] if last_screen(ev) else None
+FM.cb('free'); FM.cb('ft:cheat_fatal'); ev, ans = FM.cb('ftok:cheat_fatal'); fpost('/_tg/mode/member/ok')
+check('Telegram error on the live check → fail-open (claimed), like the gate', len(fclaims(FM.uid)) == 1, last_screen(ev) and last_screen(ev)['body']['text'][:80])
+ev, ans = User(1, 'Admin', 'admin').cb('free'); check('admin (not in the group) → free trial screen, never blocked', last_screen(ev) and ('Free trial' in last_screen(ev)['body']['text']), last_screen(ev) and last_screen(ev)['body']['text'][:80])
+req('PUT', '/admin/api/settings', {'group_chat_id': ''}, AH)
+# no group configured: works without the membership check
+FN = User(555126, 'Nina', 'nina'); ev = FN.msg('/start'); FN.mid = last_screen(ev)['mid']
+FN.cb('free'); FN.cb('ft:liveira_access'); ev, ans = FN.cb('ftok:liveira_access'); check('no group configured → claim works, no getChatMember, no group post', last_screen(ev) and '🎁 <b>Free trial activated!</b>' in last_screen(ev)['body']['text'] and not gcm(ev) and not gposts(ev))
+# Portuguese user: claim + already-claimed in Portuguese
+ev = LB.msg('/start free'); scr = last_screen(ev)
+check('/start free (pt) → free trial screen in Portuguese', scr and '🎁 <b>Teste grátis · 1 dia</b>' in scr['body']['text'] and 'Só um teste grátis por conta, para sempre' in scr['body']['text'] and not leaks(scr), scr and scr['body']['text'])
+LB.cb('ft:cheat_fatal'); ev, ans = LB.cb('ftok:cheat_fatal'); rec_pt = last_screen(ev)
+check('pt claim → "🎁 Teste grátis ativado!" receipt in Portuguese', rec_pt and '🎁 <b>Teste grátis ativado!</b>' in rec_pt['body']['text'] and 'Duração: <b>1 dia</b>' in rec_pt['body']['text'] and ans[0]['body'].get('text') == '🎁 Teste grátis ativado!' and not leaks(rec_pt), rec_pt and rec_pt['body']['text'])
+ev = LB.msg('/free'); already_pt = last_screen(ev)
+check('pt already claimed → "Você já usou o seu teste grátis"', already_pt and 'Você já usou o seu teste grátis: <b>Cheat Fatal Chase</b> (1 dia)' in already_pt['body']['text'] and not leaks(already_pt), already_pt and already_pt['body']['text'])
+# expiry reminder (cron): once, in the user's language, with a button to the same product's 3-day plan
+sql(f"UPDATE free_claims SET expires_at='2026-01-01T00:00:00.000Z' WHERE telegram_user_id IN ({FA.uid}, {LB.uid})")
+ev = cron(); rem = [x for x in tg(ev, 'sendMessage') if x['body']['chat_id'] in (FA.uid, LB.uid)]
+r_en = [x for x in rem if x['body']['chat_id'] == FA.uid]; r_pt = [x for x in rem if x['body']['chat_id'] == LB.uid]
+check('cron: trial ended → one reminder to each expired user (nobody else)', len(r_en) == 1 and len(r_pt) == 1 and not [x for x in tg(ev, 'sendMessage') if 'free trial has ended' in x['body']['text'] and x['body']['chat_id'] not in (FA.uid, LB.uid)], [x['body']['chat_id'] for x in rem])
+check('reminder (en): "Your free trial has ended", button "🛒 Buy 3 days · $1.00" → days:cheat_fatal:3', r_en and '⌛ <b>Your free trial has ended</b>' in r_en[0]['body']['text'] and buttons(r_en[0])[0] == {'text': '🛒 Buy 3 days · $1.00', 'callback_data': 'days:cheat_fatal:3', 'style': 'success'}, r_en and (r_en[0]['body']['text'], buttons(r_en[0])))
+check('reminder (pt): "Seu teste grátis acabou", "🛒 Comprar 3 dias · $1.00"', r_pt and '⌛ <b>Seu teste grátis acabou</b>' in r_pt[0]['body']['text'] and buttons(r_pt[0])[0]['text'] == '🛒 Comprar 3 dias · $1.00' and not leaks(r_pt[0]), r_pt and r_pt[0]['body']['text'])
+check('reminder_sent_at stored', all(fclaims(u)[0]['reminder_sent_at'] for u in (FA.uid, LB.uid)))
+ev = cron(); check('second cron run → no second reminder', not [x for x in tg(ev, 'sendMessage') if x['body']['chat_id'] in (FA.uid, LB.uid)])
+REM_PT = r_pt[0]['body']['text'] if r_pt else ''
+LB.mid = r_pt[0]['mid'] if r_pt else LB.mid
+ev, ans = LB.cb('days:cheat_fatal:3'); scr = last_screen(ev)
+check('reminder button → purchase confirmation of the 3-day plan (pt)', scr and '🧾 <b>Confirmar compra</b>' in scr['body']['text'] and 'Cheat Fatal Chase' in scr['body']['text'] and 'confirm:cheat_fatal:3' in cbdata(scr), scr and scr['body']['text'])
+ev = LB.msg('/start buy_cheat_fatal_7'); scr = last_screen(ev)
+check('deep link start=buy_<pid>_<days> → purchase confirmation', scr and '🧾 <b>Confirmar compra</b>' in scr['body']['text'] and 'confirm:cheat_fatal:7' in cbdata(scr), scr and scr['body']['text'])
+check('claims are never deleted (rows still there after expiry + reminder)', len(fclaims(FA.uid)) == 1 and len(fclaims(LB.uid)) == 1)
+# settings: disabled / eligible products / days
+s_, body, _ = req('PUT', '/admin/api/settings', {'free_trial_enabled': '0'}, AH)
+FX = User(555127, 'Xavi', 'xavi'); ev = FX.msg('/start'); h = last_screen(ev); FX.mid = h['mid']
+check('free_trial_enabled=0 → no 🎁 button on home', s_ == 200 and h and 'free' not in cbdata(h), cbdata(h))
+ev, ans = FX.cb('ftok:cheat_fatal'); check('free_trial_enabled=0 → claim refused ("not available"), nothing written', last_screen(ev) and 'The free trial is not available right now' in last_screen(ev)['body']['text'] and not fclaims(FX.uid))
+ev = FX.msg('/free'); check('free_trial_enabled=0 → /free says not available', last_screen(ev) and 'not available' in last_screen(ev)['body']['text'])
+for bad in [{'free_trial_days': '0'}, {'free_trial_days': '31'}, {'free_trial_days': 'x'}, {'free_trial_products': 'nope_product'}]:
+    s_, body, _ = req('PUT', '/admin/api/settings', bad, AH); check(f'settings validation {bad} → 400', s_ == 400, (s_, body))
+s_, body, _ = req('PUT', '/admin/api/settings', {'free_trial_enabled': '1', 'free_trial_days': '2', 'free_trial_products': 'cheat_fatal'}, AH)
+ev = FX.msg('/menu'); h = last_screen(ev); FX.mid = h['mid']
+check('free_trial_days=2 → home button "🎁 Free 2-day trial"', s_ == 200 and h and '🎁 Free 2-day trial' in [b['text'] for b in buttons(h)], (s_, body, h and [b['text'] for b in buttons(h)]))
+ev, ans = FX.cb('free'); scr = last_screen(ev)
+check('free_trial_products=cheat_fatal → only that product offered', scr and 'ft:cheat_fatal' in cbdata(scr) and 'ft:liveira_access' not in cbdata(scr) and '2 days' in scr['body']['text'], scr and cbdata(scr))
+ev, ans = FX.cb('ftok:liveira_access'); check('not-eligible product → refused, nothing written', last_screen(ev) and 'not part of the free trial' in last_screen(ev)['body']['text'] and not fclaims(FX.uid))
+ev, ans = FX.cb('ftok:cheat_fatal'); tk = ftokens(FX.uid)
+check('claim with free_trial_days=2 → 2-day license', len(tk) == 1 and tk[0]['duration_days'] == 2 and fclaims(FX.uid)[0]['days'] == 2 and 'Duration: <b>2 days</b>' in last_screen(ev)['body']['text'], tk)
+req('PUT', '/admin/api/settings', {'free_trial_days': '1', 'free_trial_products': ''}, AH)
+# admin panel: trials are not sales
+s_, body, _ = req('GET', '/admin/api/dashboard', None, AH); st = json.loads(body)['stats']
+paid_n = sql("SELECT COUNT(*) AS n, COALESCE(SUM(price),0) AS s FROM orders WHERE kind <> 'free_trial'")[0]; free_n = sql('SELECT COUNT(*) AS n FROM free_claims')[0]['n']
+check('dashboard: orders_total / revenue count paid orders only; free trials reported apart', st['orders_total'] == paid_n['n'] and abs(st['revenue'] - paid_n['s']) < 1e-9 and st['free_total'] == free_n and free_n >= 8, (st, paid_n, free_n))
+check('dashboard recent orders carry kind (Grátis marker)', any(o.get('kind') == 'free_trial' for o in json.loads(body)['recent']), json.loads(body)['recent'][:2])
+s_, body, _ = req('GET', '/admin/api/orders?kind=free_trial', None, AH); d = json.loads(body)
+check('orders filter kind=free_trial → only $0 trials', s_ == 200 and d['orders'] and all(o['kind'] == 'free_trial' and o['price'] == 0 for o in d['orders']) and d['total'] == free_n, (s_, d.get('total'), free_n))
+s_, body, _ = req('GET', '/admin/api/orders?kind=paid', None, AH); d = json.loads(body)
+check('orders filter kind=paid → no trials', s_ == 200 and d['total'] == paid_n['n'] and all(o['kind'] != 'free_trial' for o in d['orders']))
+s_, body, _ = req('GET', f'/admin/api/users?q={FA.uid}', None, AH); us = json.loads(body)['users']
+check('users list: free trial product + language columns', us and us[0]['free_product'] == 'Cheat Fatal Chase' and us[0]['lang'] == 'en' and us[0]['orders_count'] == 0, us)
+s_, body, _ = req('GET', f'/admin/api/users/{FA.uid}', None, AH); ud = json.loads(body)
+check('user detail: free_claim', ud.get('free_claim') and ud['free_claim']['product_id'] == 'cheat_fatal', ud.get('free_claim'))
+print('SAMPLE PT LANGUAGE PICKER:', PT_D['lang.first'].replace('\n', ' | '))
+print('SAMPLE PT FREE TRIAL SCREEN:', (SCR_PT['free']['body']['text'] if SCR_PT.get('free') else '').replace('\n', ' | '))
+print('SAMPLE PT CLAIM RECEIPT:', (rec_pt['body']['text'] if rec_pt else '').replace('\n', ' | '))
+print('SAMPLE PT ALREADY CLAIMED:', (already_pt['body']['text'] if already_pt else '').replace('\n', ' | '))
+print('SAMPLE PT EXPIRY REMINDER:', REM_PT.replace('\n', ' | '), '| BUTTONS:', r_pt and [b['text'] for b in buttons(r_pt[0])])
+
+
 # second Worker instance WITHOUT BINANCE_API_KEY / BINANCE_API_SECRET → option hidden, nothing happens
 BASE2 = 'http://127.0.0.1:8798'
 class User2(User):
     base = BASE2
+    state = '/tmp/lvtest/state2'
     def bal(self):
         r = sql(f'SELECT balance FROM users WHERE user_id={self.uid}', state='/tmp/lvtest/state2'); return r[0]['balance'] if r else None
 P = User2(555040, 'Pia', 'pia')

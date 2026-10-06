@@ -9,6 +9,7 @@
  */
 import { nowIso, generateToken, money, audit, tgApi, getSettings, tgEsc } from "./util.js";
 import { invoiceCard, paidCard, editOrSend, sendMessage as uiSend, HOME } from "./ui.js";
+import { t, getUserLang } from "./i18n.js";
 
 export const PUBLIC_BASE_URL = "https://liveira-shop.kelumayou.workers.dev";
 const DEFAULT_API = "https://api.oxapay.com/v1";
@@ -383,8 +384,8 @@ export async function cancelPayment(env, id, userId) {
   return r.meta?.changes === 1;
 }
 
-function supportLineFor(s) {
-  return s.support_contact ? `💬 Support: ${tgEsc(s.support_contact)}` : "💬 Please contact the shop admin.";
+function supportLineFor(s, L = "en") {
+  return s.support_contact ? t(L, "support.line", { contact: tgEsc(s.support_contact) }) : t(L, "support.none_please");
 }
 
 /** After a successful credit: turn the invoice card into a ✅ paid card, and send a notification. */
@@ -392,7 +393,8 @@ export async function notifyCredit(env, pay, r) {
   const s = await getSettings(env);
   const cur = s.currency_symbol || "$";
   const chatId = pay.chat_id || pay.telegram_user_id;
-  const card = paidCard(pay, s, r.newBalance);
+  const L = await getUserLang(env, pay.telegram_user_id);
+  const card = paidCard(pay, s, r.newBalance, L);
   let edited = false;
   if (pay.message_id) {
     const res = await editOrSend(env, chatId, pay.message_id, card.text, { reply_markup: card.reply_markup }, { fallback: false });
@@ -402,7 +404,7 @@ export async function notifyCredit(env, pay, r) {
     await uiSend(
       env,
       chatId,
-      `✅ Payment confirmed, +${money(r.amount, cur)} added. New balance: ${money(r.newBalance, cur)}`,
+      t(L, "notify.credit", { amt: money(r.amount, cur), bal: money(r.newBalance, cur) }),
       edited
         ? { reply_parameters: { message_id: pay.message_id, allow_sending_without_reply: true } }
         : { reply_markup: card.reply_markup }
@@ -415,15 +417,16 @@ export async function notifyCredit(env, pay, r) {
 async function notifyUnderpaid(env, pay) {
   const s = await getSettings(env);
   const chatId = pay.chat_id || pay.telegram_user_id;
+  const L = await getUserLang(env, pay.telegram_user_id);
   if (pay.message_id) {
-    const card = invoiceCard({ ...pay, status: "underpaid" }, s, supportLineFor(s));
+    const card = invoiceCard({ ...pay, status: "underpaid" }, s, supportLineFor(s, L), L);
     await editOrSend(env, chatId, pay.message_id, card.text, { reply_markup: card.reply_markup }, { fallback: false });
   }
   await notifyUser(
     env,
     chatId,
-    `⚠️ Your payment for the ${money(pay.amount_usd, s.currency_symbol || "$")} top-up was underpaid, so it was not credited automatically.\n${supportLineFor(s)}`,
-    { reply_markup: { inline_keyboard: [[HOME()]] } }
+    t(L, "notify.ox_underpaid", { amt: money(pay.amount_usd, s.currency_symbol || "$"), support: supportLineFor(s, L) }),
+    { reply_markup: { inline_keyboard: [[HOME(L)]] } }
   );
 }
 

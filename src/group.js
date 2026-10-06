@@ -12,6 +12,7 @@
 import { tgEsc as e, tgApi, setSetting, audit } from "./util.js";
 import { btn, urlBtn, kb, formatDuration, sendMessage } from "./ui.js";
 import { botUsername } from "./oxapay.js";
+import { t } from "./i18n.js";
 
 export const MEMBER_TTL_MS = 10 * 60_000;
 export const NON_MEMBER_TTL_MS = 30_000;
@@ -95,12 +96,13 @@ const NOT_IN_GROUP = /user not found|participant_id_invalid|member not found|use
 /**
  * May this user use the shop? true when no group is configured, the gate is off, the user is an admin
  * (opts.admin) or is in the group. Cached (10 min positive / 30 s negative). opts.fresh skips the cache
- * ("✅ I've joined"). Unexpected Telegram errors → true (fail-open), not cached.
+ * ("✅ I've joined", free trial claim). opts.ignoreGate: check membership even when group_gate is off (free trial).
+ * Unexpected Telegram errors → true (fail-open), not cached.
  */
 export async function canUseShop(env, s, userId, opts = {}) {
   if (opts.admin) return true;
   const cfg = groupConfig(s);
-  if (cfg.chatId === null || !cfg.gate) return true;
+  if (cfg.chatId === null || (!cfg.gate && !opts.ignoreGate)) return true;
   const chatId = cfg.chatId;
   if (!opts.fresh) {
     const c = await cachedMember(env, chatId, userId);
@@ -164,8 +166,8 @@ export async function onMyChatMember(env, s, upd) {
 
 /* ─── gate screen ─── */
 
-export const GATE_NOT_YET = "😕 We still don't see you in the group. Join via “Join the group”, then tap “I've joined” again.";
-export const GATE_OK = "✅ All set — welcome!";
+export const gateNotYet = (L = "en") => t(L, "gate.not_yet");
+export const gateOk = (L = "en") => t(L, "gate.ok");
 
 /** Deep-link payload kept through the gate (/start <payload> → jg:<payload>); [a-z0-9_], ≤ 40 chars. */
 export function safePayload(p) {
@@ -173,19 +175,14 @@ export function safePayload(p) {
   return /^[a-z0-9_]{1,40}$/.test(x) ? x : "";
 }
 
-export function joinPromptScreen(s, payload = "") {
+export function joinPromptScreen(s, payload = "", L = "en") {
   const cfg = groupConfig(s);
   const p = safePayload(payload);
   const rows = [];
-  if (cfg.inviteLink) rows.push([urlBtn("👥 Join the group", cfg.inviteLink, "primary")]);
-  rows.push([btn("✅ I've joined", p ? `jg:${p}` : "jg", "success")]);
+  if (cfg.inviteLink) rows.push([urlBtn(t(L, "gate.btn_join"), cfg.inviteLink, "primary")]);
+  rows.push([btn(t(L, "gate.btn_joined"), p ? `jg:${p}` : "jg", "success")]);
   return {
-    text:
-      "👥 <b>To use the shop, join our group</b>\n\n" +
-      "There you'll get news, updates and live purchases.\n\n" +
-      (cfg.inviteLink
-        ? "Tap <b>👥 Join the group</b> and then <b>✅ I've joined</b>."
-        : "Ask support for the group link, then tap <b>✅ I've joined</b>."),
+    text: t(L, "gate.title") + t(L, cfg.inviteLink ? "gate.with_link" : "gate.no_link"),
     reply_markup: kb(rows),
   };
 }
@@ -255,7 +252,7 @@ export async function checkGroup(env, s) {
   const warnings = [];
   if (!admin) warnings.push("O bot precisa ser ADMINISTRADOR do grupo (para conferir quem participa e ver quem entra/sai).");
   if (status === "left" || status === "kicked" || status === "unknown") warnings.push("O bot não está no grupo: adicione-o.");
-  if (!cfg.inviteLink) warnings.push("Sem link de convite: o cliente não terá o botão \"Join the group\".");
+  if (!cfg.inviteLink) warnings.push("Sem link de convite: o cliente não terá o botão \"Entrar no grupo\" (\"Join the group\").");
   return {
     ok: true,
     id: cfg.chatId,

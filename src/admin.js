@@ -442,42 +442,76 @@ async function route(ctx, method, api) {
 
 /* ─── dashboard ─── */
 
+/* Free trial orders (orders.kind = 'free_trial', $0, migration 0012) are excluded from sales counts and revenue and
+ * reported apart. Before the migration (no kind column / no free_claims table) the queries fall back to the old ones. */
+const PAID = "COALESCE(kind,'paid') <> 'free_trial'";
+const isSchemaErr = (err) => /no such (column|table)/i.test(String(err?.message || err));
+async function withFallback(run, legacy) {
+  try {
+    return await run();
+  } catch (err) {
+    if (!isSchemaErr(err)) throw err;
+    return legacy();
+  }
+}
+
 async function dashboard({ env }) {
   const t0 = spDayStartIso(0);
   const t7 = spDayStartIso(6);
   const t30 = spDayStartIso(29);
   const t14 = spDayStartIso(13);
   const now = nowIso();
-  const stats = await env.DB.prepare(
+  const statsSql = (paid, free) =>
     `SELECT
       (SELECT COUNT(*) FROM users) AS users,
       (SELECT COALESCE(SUM(balance),0) FROM users) AS balances,
-      (SELECT COUNT(*) FROM orders) AS orders_total,
-      (SELECT COALESCE(SUM(price),0) FROM orders) AS revenue,
-      (SELECT COUNT(*) FROM orders WHERE created_at >= ?1) AS today_n,
-      (SELECT COALESCE(SUM(price),0) FROM orders WHERE created_at >= ?1) AS today_rev,
-      (SELECT COUNT(*) FROM orders WHERE created_at >= ?2) AS d7_n,
-      (SELECT COALESCE(SUM(price),0) FROM orders WHERE created_at >= ?2) AS d7_rev,
-      (SELECT COUNT(*) FROM orders WHERE created_at >= ?3) AS d30_n,
-      (SELECT COALESCE(SUM(price),0) FROM orders WHERE created_at >= ?3) AS d30_rev,
+      (SELECT COUNT(*) FROM orders WHERE ${paid}) AS orders_total,
+      (SELECT COALESCE(SUM(price),0) FROM orders WHERE ${paid}) AS revenue,
+      (SELECT COUNT(*) FROM orders WHERE created_at >= ?1 AND ${paid}) AS today_n,
+      (SELECT COALESCE(SUM(price),0) FROM orders WHERE created_at >= ?1 AND ${paid}) AS today_rev,
+      (SELECT COUNT(*) FROM orders WHERE created_at >= ?2 AND ${paid}) AS d7_n,
+      (SELECT COALESCE(SUM(price),0) FROM orders WHERE created_at >= ?2 AND ${paid}) AS d7_rev,
+      (SELECT COUNT(*) FROM orders WHERE created_at >= ?3 AND ${paid}) AS d30_n,
+      (SELECT COALESCE(SUM(price),0) FROM orders WHERE created_at >= ?3 AND ${paid}) AS d30_rev,
       (SELECT COUNT(*) FROM tokens WHERE status='active' AND expires_at > ?4) AS active_tokens,
       (SELECT COUNT(*) FROM products WHERE active=1) AS active_products,
       (SELECT COUNT(*) FROM users WHERE created_at >= ?2) AS new_users_7d,
       (SELECT COUNT(*) FROM payments WHERE credited=1 AND paid_at >= ?3) AS crypto_30d_n,
-      (SELECT COALESCE(SUM(amount_usd),0) FROM payments WHERE credited=1 AND paid_at >= ?3) AS crypto_30d_sum`
-  )
-    .bind(t0, t7, t30, now)
-    .first();
-  const { results: recent } = await env.DB.prepare(
-    `SELECT o.id, o.user_id, u.username, o.product_name, o.price, o.duration_days, o.created_at
-       FROM orders o LEFT JOIN users u ON u.user_id=o.user_id ORDER BY o.id DESC LIMIT 10`
-  ).all();
-  const { results: daily } = await env.DB.prepare(
+      (SELECT COALESCE(SUM(amount_usd),0) FROM payments WHERE credited=1 AND paid_at >= ?3) AS crypto_30d_sum,
+      ${free}`;
+  const stats = await withFallback(
+    () =>
+      env.DB.prepare(
+        statsSql(
+          PAID,
+          `(SELECT COUNT(*) FROM free_claims) AS free_total,
+           (SELECT COUNT(*) FROM free_claims WHERE claimed_at >= ?2) AS free_7d,
+           (SELECT COUNT(*) FROM free_claims WHERE claimed_at >= ?3) AS free_30d`
+        )
+      )
+        .bind(t0, t7, t30, now)
+        .first(),
+    () => env.DB.prepare(statsSql("1=1", "0 AS free_total, 0 AS free_7d, 0 AS free_30d")).bind(t0, t7, t30, now).first()
+  );
+  const { results: recent } = await withFallback(
+    () =>
+      env.DB.prepare(
+        `SELECT o.id, o.user_id, u.username, o.product_name, o.price, o.duration_days, o.created_at, o.kind
+           FROM orders o LEFT JOIN users u ON u.user_id=o.user_id ORDER BY o.id DESC LIMIT 10`
+      ).all(),
+    () =>
+      env.DB.prepare(
+        `SELECT o.id, o.user_id, u.username, o.product_name, o.price, o.duration_days, o.created_at
+           FROM orders o LEFT JOIN users u ON u.user_id=o.user_id ORDER BY o.id DESC LIMIT 10`
+      ).all()
+  );
+  const dailySql = (paid) =>
     `SELECT substr(datetime(created_at, '-3 hours'), 1, 10) AS d, COUNT(*) AS n, COALESCE(SUM(price),0) AS rev
-       FROM orders WHERE created_at >= ? GROUP BY d ORDER BY d`
-  )
-    .bind(t14)
-    .all();
+       FROM orders WHERE created_at >= ? AND ${paid} GROUP BY d ORDER BY d`;
+  const { results: daily } = await withFallback(
+    () => env.DB.prepare(dailySql(PAID)).bind(t14).all(),
+    () => env.DB.prepare(dailySql("1=1")).bind(t14).all()
+  );
   return aj({ stats, recent: recent || [], daily: daily || [], since: { today: t0, d7: t7, d30: t30, d14: t14 } });
 }
 
@@ -667,34 +701,49 @@ async function listUsers({ env, url }) {
   const where = q ? "WHERE CAST(u.user_id AS TEXT) LIKE ?1 ESCAPE '\\' OR lower(COALESCE(u.username,'')) LIKE ?1 ESCAPE '\\'" : "";
   const binds = q ? [like] : [];
   const total = await env.DB.prepare(`SELECT COUNT(*) AS n FROM users u ${where}`).bind(...binds).first();
-  const { results } = await env.DB.prepare(
+  const usersSql = (paid, extra) =>
     `SELECT u.user_id, u.username, u.balance, u.created_at,
-       (SELECT COUNT(*) FROM orders o WHERE o.user_id=u.user_id) AS orders_count,
-       (SELECT COALESCE(SUM(price),0) FROM orders o WHERE o.user_id=u.user_id) AS spent
-     FROM users u ${where} ORDER BY u.created_at DESC LIMIT ${limit} OFFSET ${offset}`
-  )
-    .bind(...binds)
-    .all();
+       (SELECT COUNT(*) FROM orders o WHERE o.user_id=u.user_id AND ${paid}) AS orders_count,
+       (SELECT COALESCE(SUM(price),0) FROM orders o WHERE o.user_id=u.user_id) AS spent${extra}
+     FROM users u ${where} ORDER BY u.created_at DESC LIMIT ${limit} OFFSET ${offset}`;
+  const { results } = await withFallback(
+    () =>
+      env.DB.prepare(
+        usersSql(
+          PAID,
+          `, u.lang, u.lang_chosen,
+       (SELECT product_name FROM free_claims f WHERE f.telegram_user_id=u.user_id) AS free_product,
+       (SELECT claimed_at FROM free_claims f WHERE f.telegram_user_id=u.user_id) AS free_claimed_at`
+        )
+      )
+        .bind(...binds)
+        .all(),
+    () => env.DB.prepare(usersSql("1=1", "")).bind(...binds).all()
+  );
   return aj({ users: results || [], total: total?.n || 0, page, page_size: limit });
 }
 
 async function userDetail({ env }, id) {
   const user = await env.DB.prepare("SELECT * FROM users WHERE user_id=?").bind(id).first();
   if (!user) throw new HttpError(404, "Usuário não encontrado");
+  const sumsSql = (paid) =>
+    `SELECT (SELECT COUNT(*) FROM orders WHERE user_id=?1 AND ${paid}) AS orders_count, (SELECT COALESCE(SUM(price),0) FROM orders WHERE user_id=?1) AS spent, (SELECT COALESCE(SUM(amount),0) FROM topups WHERE user_id=?1 AND amount>0) AS credited`;
   const [orders, topups, tokens, sums] = await env.DB.batch([
     env.DB.prepare("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 100").bind(id),
     env.DB.prepare("SELECT * FROM topups WHERE user_id=? ORDER BY id DESC LIMIT 100").bind(id),
     env.DB.prepare("SELECT * FROM tokens WHERE telegram_user_id=? ORDER BY created_at DESC LIMIT 100").bind(id),
-    env.DB.prepare(
-      "SELECT (SELECT COUNT(*) FROM orders WHERE user_id=?1) AS orders_count, (SELECT COALESCE(SUM(price),0) FROM orders WHERE user_id=?1) AS spent, (SELECT COALESCE(SUM(amount),0) FROM topups WHERE user_id=?1 AND amount>0) AS credited"
-    ).bind(id),
+    env.DB.prepare(sumsSql("1=1")).bind(id),
   ]);
+  // Free trial (migration 0012/0013): paid order count + the claim, when the schema has them.
+  const paidSums = await withFallback(() => env.DB.prepare(sumsSql(PAID)).bind(id).first(), () => null);
+  const freeClaim = await withFallback(() => env.DB.prepare("SELECT * FROM free_claims WHERE telegram_user_id=?").bind(id).first(), () => null);
   return aj({
     user,
     orders: orders.results || [],
     topups: topups.results || [],
     tokens: (tokens.results || []).map((t) => ({ ...t, computed_status: tokenStatus(t) })),
-    summary: sums.results?.[0] || {},
+    summary: paidSums || sums.results?.[0] || {},
+    free_claim: freeClaim || null,
   });
 }
 
@@ -745,6 +794,10 @@ async function listOrders({ env, url }) {
     conds.push("o.created_at < ?");
     binds.push(spDateToIso(to, 1));
   }
+  // kind=paid | free_trial (Grátis); needs migration 0012 (orders.kind)
+  const kind = (url.searchParams.get("kind") || "").trim();
+  if (kind === "free_trial") conds.push("o.kind = 'free_trial'");
+  else if (kind === "paid") conds.push("COALESCE(o.kind,'paid') <> 'free_trial'");
   const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
   const base = `FROM orders o LEFT JOIN users u ON u.user_id=o.user_id ${where}`;
   const agg = await env.DB.prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(o.price),0) AS sum ${base}`).bind(...binds).first();
@@ -1078,6 +1131,7 @@ async function putSettings({ request, env, settings, actor }) {
   const limits = {
     shop_name: 64,
     welcome_text: 3000,
+    welcome_text_pt: 3000,
     support_contact: 200,
     currency_symbol: 5,
     maintenance_text: 500,
@@ -1140,17 +1194,28 @@ async function putSettings({ request, env, settings, actor }) {
     } else if (k === "group_invite_link") {
       v = String(b[k]).trim();
       if (v && !validInviteLink(v)) throw new HttpError(400, "Link de convite: use um link https://t.me/... (ex.: https://t.me/+AbCdEf123)");
-    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled" || k === "binance_enabled" || k === "nowpayments_enabled" || k === "stripe_enabled" || k === "group_gate" || k === "feed_purchases") {
+    } else if (k === "free_trial_days") {
+      v = String(num(String(b[k]).trim(), "Dias do teste grátis", { min: 1, max: 30, int: true }));
+    } else if (k === "free_trial_products") {
+      const ids = [...new Set(String(b[k]).toLowerCase().split(/[\s,;]+/).filter(Boolean))];
+      if (ids.length > 50) throw new HttpError(400, "Teste grátis: máximo de 50 produtos");
+      for (const id of ids) {
+        if (!/^[a-z0-9_-]{1,32}$/.test(id) || !(await env.DB.prepare("SELECT 1 AS ok FROM products WHERE id=?").bind(id).first())) {
+          throw new HttpError(400, `Teste grátis: produto "${id.slice(0, 40)}" não existe`);
+        }
+      }
+      v = ids.join(",");
+    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled" || k === "binance_enabled" || k === "nowpayments_enabled" || k === "stripe_enabled" || k === "group_gate" || k === "feed_purchases" || k === "free_trial_enabled") {
       v = b[k] === true || b[k] === "1" || b[k] === 1 ? "1" : "0";
     } else {
       v = String(b[k]).replace(/\r\n/g, "\n");
-      v = k === "welcome_text" || k === "maintenance_text" ? v.trim() : v.trim();
+      v = v.trim();
       if (v.length > limits[k]) throw new HttpError(400, `${k}: máximo ${limits[k]} caracteres`);
       if ((k === "shop_name" || k === "currency_symbol") && !v) throw new HttpError(400, `${k} não pode ficar vazio`);
     }
     if (v !== settings[k]) {
       await setSetting(env, k, v);
-      changed[k] = k === "welcome_text" || k === "maintenance_text" ? "changed" : [settings[k], v];
+      changed[k] = k === "welcome_text" || k === "welcome_text_pt" || k === "maintenance_text" ? "changed" : [settings[k], v];
     }
   }
   if (Object.keys(changed).length) await audit(env, actor, "settings_update", changed);
@@ -1207,10 +1272,25 @@ const USER_COMMANDS = [
   { command: "menu", description: "🏠 Main menu (brings it to the bottom)" },
   { command: "shop", description: "🛒 Browse products" },
   { command: "topup", description: "💰 Top up balance (crypto)" },
+  { command: "free", description: "🎁 Free trial" },
   { command: "licenses", description: "🔑 My licenses" },
   { command: "downloads", description: "📥 Downloads" },
   { command: "profile", description: "👤 Profile & history" },
   { command: "support", description: "💬 Help & support" },
+  { command: "language", description: "🌐 Language / Idioma" },
+];
+// Same commands for Telegram apps set to Portuguese (setMyCommands language_code "pt").
+const USER_COMMANDS_PT = [
+  { command: "start", description: "🏠 Início" },
+  { command: "menu", description: "🏠 Menu principal (traz para o fim do chat)" },
+  { command: "shop", description: "🛒 Ver produtos" },
+  { command: "topup", description: "💰 Recarregar saldo (cripto)" },
+  { command: "free", description: "🎁 Teste grátis" },
+  { command: "licenses", description: "🔑 Minhas licenças" },
+  { command: "downloads", description: "📥 Downloads" },
+  { command: "profile", description: "👤 Perfil e histórico" },
+  { command: "support", description: "💬 Ajuda e suporte" },
+  { command: "idioma", description: "🌐 Idioma / Language" },
 ];
 const ADMIN_COMMANDS = [
   ...USER_COMMANDS,
@@ -1252,6 +1332,7 @@ async function botSetup({ env, settings, actor }) {
     results[name] = r.ok ? "ok" : r.description || "erro";
   };
   await call("commands", "setMyCommands", { commands: USER_COMMANDS, scope: { type: "default" } });
+  await call("commands_pt", "setMyCommands", { commands: USER_COMMANDS_PT, scope: { type: "default" }, language_code: "pt" });
   await call("menu_button", "setChatMenuButton", { menu_button: { type: "commands" } });
   await call("description", "setMyDescription", { description: t.description });
   await call("short_description", "setMyShortDescription", { short_description: t.short_description });

@@ -6,7 +6,8 @@
  * - OxaPay payment callback (POST /oxapay/callback)
  * - NOWPayments IPN (POST /nowpayments/ipn, HMAC-SHA512 with the IPN secret; src/nowpayments.js)
  * - Stripe webhook (POST /stripe/webhook, Stripe-Signature HMAC-SHA256; src/stripe.js)
- * - Cron (every minute): re-check pending Binance Pay claims (src/binance.js), NOWPayments payments and Stripe sessions
+ * - Cron (every minute): re-check pending Binance Pay claims (src/binance.js), NOWPayments payments and Stripe sessions;
+ *   free trial "ended" reminders (src/freetrial.js)
  */
 import { CORS_HEADERS, json } from "./util.js";
 import { handleTelegramUpdate } from "./bot.js";
@@ -15,6 +16,7 @@ import { handleOxapayCallback } from "./oxapay.js";
 import { binanceCron } from "./binance.js";
 import { handleNpIpn, npCron } from "./nowpayments.js";
 import { handleStripeWebhook, spCron } from "./stripe.js";
+import { freeTrialCron } from "./freetrial.js";
 
 function unauthorized() {
   return json({ error: "Unauthorized" }, 401);
@@ -150,6 +152,11 @@ export default {
       await spCron(env);
     } catch (err) {
       console.error("stripe cron error", err && err.stack ? err.stack : err);
+    }
+    try {
+      await freeTrialCron(env);
+    } catch (err) {
+      console.error("free trial cron error", err && err.stack ? err.stack : err);
     }
   },
 

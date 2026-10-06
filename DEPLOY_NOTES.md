@@ -1,5 +1,60 @@
 # Deploy notes (owner)
 
+## 2026-10-06 — Idioma por usuário (pt / en) + teste grátis de 1 dia — NÃO PUBLICADO
+
+Código: `src/i18n.js` (dicionário pt/en, `t(lang, chave, vars)`), `src/freetrial.js` (teste grátis + cron do lembrete),
+ganchos em `src/bot.js`, `src/ui.js`, `src/group.js`, `src/oxapay.js`, `src/nowpayments.js`, `src/stripe.js`,
+`src/binance.js`, painel em `src/admin.js` / `src/admin/app.js.txt`. Testes: `tests/bot/run.sh`.
+
+**Idioma**
+- Todo texto para o cliente existe em **pt-BR** e **en** (telas, botões, teclado fixo, toasts, faturas, recibos, avisos de
+  pagamento OxaPay / NOWPayments / Stripe / Binance, tela do grupo, lembrete do teste grátis). O inglês ficou idêntico ao
+  texto anterior. Painel e comandos de admin (`/addbal` etc.) continuam em pt-BR / como estavam. O aviso de compras no grupo
+  continua em inglês.
+- Primeiro contato (usuário novo): tela bilíngue "🌐 Escolha o idioma / Choose your language" com 🇧🇷 Português / 🇺🇸 English
+  **antes** da trava do grupo; depois da escolha o bot segue para o deep link do `/start` (ex.: `?start=topup_25`). `/whoami`
+  e comandos de admin não passam pela escolha.
+- Trocar depois: botão **🌐 Idioma / 🌐 Language** na tela inicial e no perfil, comandos `/idioma`, `/language` (e `/lang`).
+  A troca reenvia o teclado fixo no novo idioma (versão do teclado sobe: 20 = en, 21 = pt; todo mundo recebe o teclado novo
+  na próxima mensagem). Rótulos antigos do teclado continuam funcionando nos dois idiomas.
+- Texto de boas-vindas: `welcome_text` (en) + novo `welcome_text_pt` (pt; vazio → texto padrão pt).
+- `/start` → comandos do menu do Telegram: lista em inglês (padrão) + lista em português (`language_code: pt`, com `/idioma`
+  e `/free`). Precisa clicar **Configurar comandos/descrição** no painel depois do deploy para publicar as novas listas.
+
+**Teste grátis**
+- Botão **🎁 Teste grátis de 1 dia / 🎁 Free 1-day trial** na tela inicial (some depois do resgate), `/free` e deep link
+  `?start=free`. O cliente escolhe um cheat ativo → confirma → recebe a chave + botão de download, igual a uma compra.
+- **Um teste por ID do Telegram, para sempre:** tabela `free_claims` (PRIMARY KEY `telegram_user_id`), gravada na MESMA
+  transação (batch D1) que o pedido de $0 (`orders.kind = 'free_trial'`) e o token. Linhas nunca são apagadas: sair/voltar do
+  grupo, trocar @usuário ou tocar duas vezes não gera segunda chave. Sem débito de saldo. Quem já tem licença paga pode resgatar.
+- Com `group_chat_id` preenchido: no resgate o bot consulta o Telegram **na hora** (`getChatMember`, sem cache), mesmo com
+  `group_gate = 0`. Erro inesperado do Telegram → libera (fail-open, igual à trava). Admins sempre liberados. Sem grupo
+  configurado → sem checagem.
+- Aviso no grupo no mesmo formato de uma compra (`🛍 New purchase!` · produto · `⏳ Plan: 1 day` · ID mascarado · total),
+  respeita `feed_purchases`; falha ao postar nunca quebra o resgate. O "Total purchases" conta também os testes.
+- Lembrete (cron de 1 min): quando o teste vence, mensagem única no idioma do cliente ("⌛ Seu teste grátis acabou") com
+  botão para comprar o plano de 3 dias do mesmo produto (`days:<produto>:3`; sem plano de 3 dias → o mais curto). Marcado
+  como enviado antes de enviar (nunca duplica, mesmo se o envio falhar).
+- Painel → Configurações → card **Teste grátis**: ativar (`free_trial_enabled`, padrão 1), dias (`free_trial_days`, 1–30,
+  padrão 1) e produtos elegíveis (`free_trial_products`, vazio = todos os ativos com preço). Pedidos/Usuários marcam
+  **Grátis**, filtro "Tipo" em Pedidos, colunas "Teste grátis" e "Idioma" em Usuários. O dashboard conta vendas/receita só de
+  pedidos pagos e mostra "Testes grátis" à parte.
+
+**Migrações (ainda NÃO aplicadas em produção):**
+- `migrations/0012_lang.sql` — **não é idempotente** (rodar UMA vez): `users.lang` (padrão 'pt'), `users.lang_chosen`
+  (padrão 0), marca **todos os usuários atuais como en / já escolhido** (não veem a tela de idioma, continuam em inglês) e
+  `orders.kind` (padrão 'paid'). Uma segunda execução falha no primeiro ALTER sem mudar nada.
+- `migrations/0013_free_trial.sql` — idempotente: tabela `free_claims` + índice do lembrete.
+- Sem as migrações o código não quebra (cai para inglês, sem tela de idioma; teste grátis responde erro e nada é gravado),
+  mas as duas precisam estar aplicadas antes de anunciar.
+
+**Para publicar (nesta ordem):**
+1. (Se ainda não feito — entrada do grupo logo abaixo, também NÃO PUBLICADA) `migrations/0011_group.sql`.
+2. `npx wrangler d1 execute liveira-shop --remote --file migrations/0012_lang.sql` (uma vez só).
+3. `npx wrangler d1 execute liveira-shop --remote --file migrations/0013_free_trial.sql`.
+4. `npx wrangler deploy` (publica junto a trava do grupo da entrada abaixo).
+5. Painel → **Configurar comandos/descrição** (novos comandos en/pt) e conferir o card **Teste grátis**.
+
 ## 2026-10-06 — Grupo da comunidade: participação obrigatória + aviso de compras (igual ao @LiveiraStore_bot) — NÃO PUBLICADO
 
 Código: `src/group.js` (+ ganchos em `src/bot.js`, painel em `src/admin.js` / `src/admin/app.js.txt`). Mesmo modelo do Store
