@@ -1,5 +1,20 @@
 # Deploy notes (owner)
 
+## 2026-10-05 — Binance Pay DESATIVADO no Shop (movido para @LiveiraStore_bot)
+
+A conta Binance (Pay ID 290455535) passou a ser verificada automaticamente **só pelo @LiveiraStore_bot** (carteiras US$).
+Como a proteção contra ID duplicado é por banco, dois bots verificando a mesma conta poderiam creditar a mesma transferência
+duas vezes — por isso o Shop desliga a Binance:
+
+- `wrangler.toml` `[vars] BINANCE_DISABLED = "1"` → `binanceConfigured()` responde false: opção 🟡 Binance Pay oculta,
+  `/binance` responde indisponível, cron/recheck/painel não chamam a Binance. Código mantido (nada apagado).
+- Setting `binance_enabled = 0` no D1 (aplicado antes do deploy, para fechar a janela imediatamente).
+- Pendentes no momento da troca: **0** (nenhum pagamento Binance jamais foi criado no Shop).
+- Secrets `BINANCE_API_KEY/SECRET` e o binding `BINANCE_EGRESS` continuam no Worker (inofensivos com a flag).
+- Para reativar no Shop: primeiro desligar o automático no Store (`/metodosusd binanceauto off`), depois
+  `BINANCE_DISABLED = "0"`, deploy e `binance_enabled = 1` no painel.
+- Testes locais (`tests/bot/run.sh`) continuam exercitando a Binance (`BINANCE_DISABLED=0` no `.dev.vars`).
+
 ## Release: Stripe card top-ups (Checkout, USD) — 2026-10-04
 
 The customer taps **💰 Top up → 💳 Pay by card (Stripe)** (also "💳 Pay by card instead (Stripe)" on the OxaPay confirm

@@ -30,7 +30,18 @@ const enc = new TextEncoder();
 
 /* ─── config ─── */
 
+/**
+ * Kill switch: wrangler.toml [vars] BINANCE_DISABLED = "1" (2026-10-05). Binance Pay moved to @LiveiraStore_bot, which now
+ * auto-verifies the same Binance account; only ONE bot may verify it (duplicate protection is per database).
+ * When on, everything behaves as "unconfigured": option hidden, claims refused, cron/recheck/panel never call Binance.
+ * Code is kept — set BINANCE_DISABLED = "0" (and turn auto-verify off in the Store) to bring it back.
+ */
+export function binanceDisabled(env) {
+  return String(env.BINANCE_DISABLED || "").trim() === "1";
+}
+
 export function binanceConfigured(env) {
+  if (binanceDisabled(env)) return false;
   return !!(String(env.BINANCE_API_KEY || "").trim() && String(env.BINANCE_API_SECRET || "").trim());
 }
 

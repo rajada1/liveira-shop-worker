@@ -29,3 +29,8 @@ fallthrough = true
 [[services]]
 binding = "BINANCE_EGRESS"
 service = "liveira-shop-binance-egress"
+
+[vars]
+# Binance Pay desativado no Shop (2026-10-05): a conta Binance agora é verificada automaticamente só pelo @LiveiraStore_bot.
+# "1" = opção oculta + cron/verificação parados (código mantido). Ver DEPLOY_NOTES.md.
+BINANCE_DISABLED = "1"

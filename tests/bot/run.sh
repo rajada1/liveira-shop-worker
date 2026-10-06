@@ -24,6 +24,8 @@ BINANCE_API_SECRET=bn_test_secret
 BINANCE_API_BASE=http://127.0.0.1:9911
 BINANCE_CACHE_TTL_SEC=1
 V
+# Local tests exercise Binance even though production has BINANCE_DISABLED = "1" in wrangler.toml.
+grep -q '^BINANCE_DISABLED=' .dev.vars || echo 'BINANCE_DISABLED=0' >> .dev.vars
 # Fake NOWPayments (local only). Appended to an existing .dev.vars if missing.
 grep -q '^NOWPAYMENTS_API_BASE=' .dev.vars || cat >> .dev.vars <<'V'
 NOWPAYMENTS_API_KEY=np_test_key
