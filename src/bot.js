@@ -574,13 +574,19 @@ async function screenLicenses(env, s, user) {
   };
 }
 
-async function activeDownloads(env, userId) {
+/**
+ * Downloads list: every active product with a file is listed for ANY user (no license needed).
+ * Products that were deactivated stay listed only for users who still hold an active license for them.
+ */
+async function availableDownloads(env, userId) {
   const { results } = await env.DB.prepare(
-    `SELECT p.id, p.name, p.file_name, p.file_size, p.sort, MAX(t.expires_at) AS exp
-       FROM tokens t JOIN products p ON p.id = t.product_id
-      WHERE t.telegram_user_id = ? AND t.status = 'active' AND t.expires_at > ?
-        AND p.file_key IS NOT NULL
-      GROUP BY p.id ORDER BY p.sort ASC`
+    `SELECT p.id, p.name, p.file_name, p.file_size, p.sort
+       FROM products p
+      WHERE p.file_key IS NOT NULL
+        AND (p.active = 1 OR EXISTS (
+              SELECT 1 FROM tokens t
+               WHERE t.product_id = p.id AND t.telegram_user_id = ? AND t.status = 'active' AND t.expires_at > ?))
+      ORDER BY p.sort ASC`
   )
     .bind(userId, nowIso())
     .all();
@@ -604,7 +610,7 @@ async function screenDownloads(env, s, user) {
       reply_markup: kb([navRow("home", L)]),
     };
   }
-  const items = await activeDownloads(env, user.id);
+  const items = await availableDownloads(env, user.id);
   if (!items.length) {
     return {
       text: t(L, "dl.empty"),
@@ -1462,7 +1468,9 @@ async function route(env, s, user, nav, data) {
     if (!env.FILES) return { toast: t(L, "dl.off_toast"), alert: true };
     const product = await getProduct(env, pid);
     if (!product || !product.file_key) return { toast: t(L, "dl.no_file"), alert: true };
-    if (!(await hasActiveToken(env, user.id, pid))) return { toast: t(L, "dl.need_license"), alert: true };
+    // Downloads are public: any user can get the file of an active product. A deactivated product's file
+    // is still sent only to users with an active license for it (same rule as the Downloads list).
+    if (!product.active && !(await hasActiveToken(env, user.id, pid))) return { toast: t(L, "dl.need_license"), alert: true };
     await answerCallback(env, nav.queryId, t(L, "dl.sending"));
     nav.answered = true;
     const r = await sendProductFile(env, nav.chatId, product);

@@ -107,7 +107,8 @@ ev, _, scr = nav(A, 'buy:liveira_access', 'product', ['Choose a duration'], ['da
 check('product: duration buttons "3 days · $5.00"', '3 days · $5.00' in [b['text'] for b in buttons(scr)], [b['text'] for b in buttons(scr)])
 check('product: ⬅️ Back + 🏠 Home row', buttons(scr)[-2]['text'] == '⬅️ Back' and buttons(scr)[-1]['text'] == '🏠 Home')
 nav(A, 'licenses', 'licenses (empty)', ['No licenses yet', '🛒 Shop'], ['shop'])
-nav(A, 'downloads', 'downloads (empty)', ['No downloads yet'])
+ev, _, scr = nav(A, 'downloads', 'downloads public: listed without a license', ['Tap a product'], ['dl:liveira_access'])
+# (tapping dl: here would send a document below the menu and break the edit-in-place checks; covered by the 'public downloads' block)
 nav(A, 'profile', 'profile', ['👤 <b>Profile</b>', 'No top-ups yet', 'No purchases yet'], ['topup'])
 sql("INSERT OR REPLACE INTO settings (key,value) VALUES ('support_contact','@liveira_support')")
 ev, _, scr = nav(A, 'support', 'support', ['💬 <b>Support</b>', '@liveira_support'])
@@ -340,7 +341,7 @@ KB1, H1 = k[0]['mid'], sends[-1]['mid']
 r = navrow(C); check('chat_nav stores menu, keyboard message, version, last id', r['menu_msg_id'] == H1 and r['kb_msg_id'] == KB1 and r['kb_version'] == 20 and r['last_msg_id'] == H1, r)
 nav(C, 'shop', 'latest message tapped → edited in place', ['🛒 <b>Shop</b>'])
 ev, ans = C.cb('shop'); check('latest tap, same screen → "not modified" tolerated, no new message', len(ans) == 1 and not tg(ev, 'sendMessage') and not tg(ev, 'deleteMessage'))
-for label, want in [('🛒 Shop', '🛒 <b>Shop</b>'), ('💰 Top up', '💰 <b>Top up balance</b>'), ('🔑 My licenses', 'No licenses yet'), ('📥 Downloads', 'No downloads yet'), ('👤 Profile', '👤 <b>Profile</b>'), ('💬 Support', '💬 <b>Support</b>'), ('shop', '🛒 <b>Shop</b>')]:
+for label, want in [('🛒 Shop', '🛒 <b>Shop</b>'), ('💰 Top up', '💰 <b>Top up balance</b>'), ('🔑 My licenses', 'No licenses yet'), ('📥 Downloads', 'Tap a product'), ('👤 Profile', '👤 <b>Profile</b>'), ('💬 Support', '💬 <b>Support</b>'), ('shop', '🛒 <b>Shop</b>')]:
     old = C.mid; ev = C.msg(label); scr = last_screen(ev)
     check(f'keyboard text {label!r} → its screen sent at the bottom, old menu deleted, no edit',
           scr and scr['tg'] == 'sendMessage' and want in scr['body']['text'] and deleted(ev, old) and not tg(ev, 'editMessageText') and not kbmsgs(ev)
@@ -1319,6 +1320,22 @@ check('no balance debit, no topup rows', FA.bal() == b0 and not sql(f'SELECT id 
 check('claim audited (free_trial_claimed)', sql(f"SELECT 1 FROM audit_log WHERE action='free_trial_claimed' AND actor='tg:{FA.uid}'"))
 ev, ans = FA.cb('dl:cheat_fatal', mid=rec['mid'] if rec.get('mid') else None)
 check('📥 download works with the trial license', tg(ev, 'sendDocument') and tg(ev, 'sendDocument')[0]['body'].get('document') == 'CACHEDFATAL', [e.get('tg') for e in ev])
+# public downloads: a user with no license sees every active product with a file and can download it
+NL = User(555122, 'Nina', 'nina'); ev = NL.msg('/start'); NL.mid = last_screen(ev)['mid']
+ev, ans = NL.cb('downloads'); scr = last_screen(ev)
+check('public downloads: user without any license sees all active products with a file', scr and 'dl:liveira_access' in cbdata(scr) and 'dl:cheat_fatal' in cbdata(scr), scr and cbdata(scr))
+ev, ans = NL.cb('dl:cheat_fatal')
+check('public downloads: user without a license receives the file', tg(ev, 'sendDocument') and tg(ev, 'sendDocument')[0]['body'].get('document') == 'CACHEDFATAL', (ans, [e.get('tg') for e in ev]))
+sql("UPDATE products SET active=0 WHERE id='cheat_fatal'")
+NL.msg('/menu'); ev, ans = NL.cb('downloads'); scr = last_screen(ev)
+check('deactivated product: hidden from users without a license', scr and 'dl:cheat_fatal' not in cbdata(scr) and 'dl:liveira_access' in cbdata(scr), scr and cbdata(scr))
+ev, ans = NL.cb('dl:cheat_fatal')
+check('deactivated product: dl: refused without a license (need license toast, no file)', len(ans) == 1 and 'active license' in ans[0]['body'].get('text', '') and not tg(ev, 'sendDocument'), (ans, [e.get('tg') for e in ev]))
+FA.msg('/menu'); ev, ans = FA.cb('downloads'); scr = last_screen(ev)
+check('deactivated product: still listed for the license holder', scr and 'dl:cheat_fatal' in cbdata(scr), scr and cbdata(scr))
+ev, ans = FA.cb('dl:cheat_fatal')
+check('deactivated product: license holder still receives the file', tg(ev, 'sendDocument'), [e.get('tg') for e in ev])
+sql("UPDATE products SET active=1 WHERE id='cheat_fatal'")
 ev = FA.msg('/menu'); h = last_screen(ev)
 check('after claiming: 🎁 button hidden on home, licenses count 1', h and 'free' not in cbdata(h) and '🔑 Active licenses: <b>1</b>' in h['body']['text'], h and (cbdata(h), h['body']['text']))
 ev, ans, scr = nav(FA, 'licenses', 'licenses list shows the trial key', [key[-4:]], [])
