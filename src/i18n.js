@@ -125,7 +125,7 @@ const EN = {
   "lic.copy": "📋 Copy · {name} …{tail}",
   "lic.footer": "<i>Tap a key to copy it. Times in BRT.</i>",
   "dl.unavailable": "📥 <b>Downloads</b>\n\nDownloads are not available right now.\nYour license key works in the Liveira program.\n\n",
-  "dl.empty": "📥 <b>Downloads</b>\n\nNo downloads yet.\nFiles unlock for products you own with an <b>active</b> license — visit the 🛒 Shop.",
+  "dl.empty": "📥 <b>Downloads</b>\n\nNo downloads yet.\nNo files are available right now — check back soon or visit the 🛒 Shop.",
   "dl.pick": "📥 <b>Downloads</b>\n\nTap a product to receive its file here:",
   "dl.off_toast": "Downloads are not available right now.",
   "dl.no_file": "No file for this product.",
@@ -159,7 +159,7 @@ const EN = {
   "support.g1_admin": "1. Ask the admin to credit your balance.\n",
   "support.g2": "2. 🛒 Open the <b>Shop</b>, pick a product and a duration, confirm.\n",
   "support.g3": "3. 🔑 You get a <b>license key</b> — enter it in the Liveira program.\n",
-  "support.g4": "4. 📥 Products with a file can be downloaded in <b>Downloads</b> while your license is active.</blockquote>",
+  "support.g4": "4. 📥 Products with a file can be downloaded by anyone in <b>Downloads</b>.</blockquote>",
   "btn.msg_support": "💬 Message support",
 
   /* ─── top-up ─── */
@@ -478,7 +478,7 @@ const PT = {
   "lic.copy": "📋 Copiar · {name} …{tail}",
   "lic.footer": "<i>Toque numa chave para copiar. Horários de Brasília (BRT).</i>",
   "dl.unavailable": "📥 <b>Downloads</b>\n\nOs downloads não estão disponíveis agora.\nSua chave de licença funciona no programa Liveira.\n\n",
-  "dl.empty": "📥 <b>Downloads</b>\n\nNenhum download ainda.\nOs arquivos são liberados para produtos com licença <b>ativa</b> — visite a 🛒 Loja.",
+  "dl.empty": "📥 <b>Downloads</b>\n\nNenhum download ainda.\nNenhum arquivo disponível no momento — volte mais tarde ou visite a 🛒 Loja.",
   "dl.pick": "📥 <b>Downloads</b>\n\nToque num produto para receber o arquivo aqui:",
   "dl.off_toast": "Os downloads não estão disponíveis agora.",
   "dl.no_file": "Este produto não tem arquivo.",
@@ -512,7 +512,7 @@ const PT = {
   "support.g1_admin": "1. Peça ao admin para creditar seu saldo.\n",
   "support.g2": "2. 🛒 Abra a <b>Loja</b>, escolha um produto e a duração e confirme.\n",
   "support.g3": "3. 🔑 Você recebe uma <b>chave de licença</b> — digite-a no programa Liveira.\n",
-  "support.g4": "4. 📥 Produtos com arquivo podem ser baixados em <b>Downloads</b> enquanto a licença estiver ativa.</blockquote>",
+  "support.g4": "4. 📥 Produtos com arquivo podem ser baixados por qualquer pessoa em <b>Downloads</b>.</blockquote>",
   "btn.msg_support": "💬 Falar com o suporte",
 
   /* ─── top-up ─── */

@@ -354,7 +354,7 @@
       : el("div", { class: "muted f" }, "Nenhum arquivo enviado.");
     var body = el("div", null, info,
       field(p.file_key ? "Substituir por novo arquivo (máx. 50 MB)" : "Enviar arquivo (máx. 50 MB)", inp), prog, status,
-      el("div", { class: "muted small" }, "O arquivo é enviado pelo bot (botão Downloads) somente para usuários com token ativo deste produto."));
+      el("div", { class: "muted small" }, "O arquivo é enviado pelo bot (botão Downloads) para qualquer usuário enquanto o produto estiver ativo; produto desativado: só para quem tem token ativo dele."));
     var acts = [{ text: "Fechar" }];
     if (p.file_key) acts.push({ text: "Remover arquivo", cls: "d", onClick: function () {
       return confirmDlg("Remover o arquivo de \"" + p.name + "\"?", "Remover", true).then(function (ok) {
