@@ -245,10 +245,10 @@ s = last_screen(ADM.msg('/start')); check('maintenance: admin still gets home', 
 sql("UPDATE settings SET value='0' WHERE key='maintenance_mode'")
 
 # ───── toggle off
-sql("UPDATE settings SET value='0' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled','stripe_enabled')")
+sql("UPDATE settings SET value='0' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled','stripe_enabled','pix_enabled')")
 ev, _, scr = nav(A, 'topup', 'top-up disabled → unavailable (menu not latest)', ['unavailable'], move=True)
 ev, ans = A.cb('tun:10'); check('disabled → no invoice', not [e for e in ev if e.get('oxapay')])
-sql("UPDATE settings SET value='1' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled','stripe_enabled')")
+sql("UPDATE settings SET value='1' WHERE key IN ('crypto_topup_enabled','nowpayments_enabled','stripe_enabled','pix_enabled')")
 
 # ───── OxaPay security (unchanged behaviour)
 ev, _, _ = nav(A, 'tun:25', 'invoice $25'); inv = [e for e in ev if e.get('oxapay') == 'invoice'][0]; T4, P4 = inv['track_id'], inv['body']['order_id']
@@ -1504,6 +1504,72 @@ check('no migration 0011: non-member still gets the gate (no crash)', last_scree
 fpost('/_tg/member/-1001234567890/555041/member'); ev = P2.msg('/start')
 check('no migration 0011: member gets in (asked every time, no cache)', last_screen(ev) and 'Hi, <b>Noa</b>' in last_screen(ev)['body']['text'] and len(tg(ev, 'getChatMember')) == 1)
 sql("DELETE FROM settings WHERE key IN ('group_chat_id', 'group_invite_link')", state='/tmp/lvtest/state2')
+
+# ───── Pix top-ups via Mercado Pago (fake API on :9911/mp, PIX_FX_RATE=5.5)
+def mp_calls(ev, method=None): return [x for x in ev if x.get('mp') and (method is None or x['mp'] == method)]
+def px_last(u):
+    r = sql(f"SELECT * FROM payments WHERE provider='mercadopago' AND telegram_user_id={u.uid} ORDER BY created_at DESC LIMIT 1"); return r[0] if r else None
+def mp_id(pay): return pay['track_id'].split(':', 1)[1]
+def mp_hook(pid, base=None, q=True):
+    path = f"/mercadopago/webhook?data.id={pid}&type=payment" if q else '/mercadopago/webhook'
+    return req('POST', path, {'action': 'payment.updated', 'type': 'payment', 'data': {'id': str(pid)}}, base=base)
+PX = User(555090, 'Paula', 'paula'); ev = PX.msg('/start'); PX.mid = last_screen(ev)['mid']; PX0 = PX.bal() or 0
+ev, _, scr = nav(PX, 'topup', 'top-up menu offers 💠 Pay with Pix', ['Pay with Pix'], ['px'])
+ev, _, scr = nav(PX, 'px', 'Pix screen', ['💠 <b>Pay with Pix</b>', 'Min $1.00 · Max $500.00'], ['pxc:1', 'pk:', 'topup'])
+ev, ans = PX.cb('pk:5001'); check('pix keypad above the max → toast', ans and 'Maximum is $500.00' in ans[0]['body'].get('text', ''), ans)
+ev, _, scr = nav(PX, 'pkok:10', 'pix keypad 10 → confirm with BRL quote', ['💠 <b>Confirm Pix top-up</b>', 'Credit to your balance: <b>$10.00</b>', 'R$ 55,00', 'rate 5,5000'], ['pxn:10', 'px'])
+ev, ans = PX.cb('pxn:10'); pa = px_last(PX); calls = mp_calls(ev, 'POST'); b = calls[0]['body'] if calls else {}
+check('create → POST /v1/payments: pix, BRL 55.00, external_reference = our id, idempotency key, webhook URL, ~30 min expiry',
+      len(calls) == 1 and calls[0]['key_ok'] and b.get('payment_method_id') == 'pix' and b.get('transaction_amount') == 55.0 and b.get('external_reference') == pa['id']
+      and calls[0]['idem'] == f"liveira-shop-{pa['id']}" and b.get('notification_url') == 'https://liveira-shop.kelumayou.workers.dev/mercadopago/webhook'
+      and b.get('date_of_expiration', '').endswith('-03:00') and b['payer']['email'].startswith('tg555090@'), (calls, pa))
+card = last_screen(ev); ct = card['body']['text'] if card else ''
+check('pix card: BRL amount, copia-e-cola code, copy button, QR link, check + cancel',
+      'R$ 55,00' in ct and pa['pix_code'] in ct and any(x.get('copy_text', {}).get('text') == pa['pix_code'] for x in buttons(card))
+      and any(x.get('url', '').startswith('https://www.mercadopago.com.br/payments/') for x in buttons(card)) and f"tuchk:{pa['id']}" in cbdata(card) and f"tux:{pa['id']}" in cbdata(card), card and card['body'])
+check('payments row: provider mercadopago, pending, track mp:<id>, amount_usd 10, amount_brl 55, fx 5.5',
+      pa['status'] == 'pending' and pa['track_id'].startswith('mp:') and pa['amount_usd'] == 10 and pa['amount_brl'] == 55 and pa['fx_rate'] == 5.5 and pa['id'].startswith('px_'), pa)
+PX.mid = card['mid']
+ev, ans = PX.cb('pxn:10'); check('double tap → open Pix reused, no second create', not mp_calls(ev, 'POST') and len(sql(f"SELECT id FROM payments WHERE provider='mercadopago' AND telegram_user_id={PX.uid}")) == 1, ans)
+time.sleep(5.2)
+ev, ans = PX.cb(f"tuchk:{pa['id']}"); check('check before paying → "not paid yet", not credited', ans and 'not paid yet' in ans[0]['body'].get('text', '') and (PX.bal() or 0) == PX0, ans)
+s_, body, _ = mp_hook(mp_id(pa)); check('webhook while still pending → 200, not credited', s_ == 200 and (PX.bal() or 0) == PX0, (s_, body))
+fpost(f"/_mp/pay/{mp_id(pa)}", {'transaction_amount': 50.0})
+s_, body, _ = mp_hook(mp_id(pa)); pr = px_last(PX)
+check('approved with a different BRL amount → review, not credited', s_ == 200 and pr['status'] == 'review' and (PX.bal() or 0) == PX0, (s_, pr['status']))
+# second user: happy path through the webhook
+PY = User(555091, 'Pedro', 'pedro'); ev = PY.msg('/start'); PY.mid = last_screen(ev)['mid']
+ev, ans = PY.cb('pxn:7'); py = px_last(PY)
+check('7 USD → R$ 38,50 charged', py and py['amount_brl'] == 38.5, py)
+fpost(f"/_mp/pay/{mp_id(py)}")
+m = mark(); s_, body, _ = mp_hook(mp_id(py)); ev = since(m)
+check('webhook approved → re-read with the token, credited $7.00 once (topups method pix), user + admin notified',
+      s_ == 200 and abs((PY.bal() or 0) - 7) < 1e-9 and [r['amount'] for r in sql(f"SELECT amount FROM topups WHERE ref='{py['id']}' AND method='pix'")] == [7]
+      and mp_calls(ev, 'GET') and any('Pix' in x['body']['text'] for x in admin_msgs(ev)) and user_msgs(ev, PY), (s_, PY.bal()))
+s_, body, _ = mp_hook(mp_id(py)); check('webhook again → no double credit', s_ == 200 and abs(PY.bal() - 7) < 1e-9, PY.bal())
+s_, body, _ = mp_hook('123456789'); check('webhook for an unknown payment → 200 ignored', s_ == 200, s_)
+s_, body, _ = req('POST', '/mercadopago/webhook', {'type': 'merchant_order', 'data': {'id': '1'}}); check('non-payment topic → 200 ignored', s_ == 200, s_)
+check('audit pix_credit', sql(f"SELECT COUNT(*) AS n FROM audit_log WHERE action='pix_credit' AND json_extract(details_json,'$.payment_id')='{py['id']}'")[0]['n'] == 1)
+# cron fallback + API error on webhook
+ev, ans = PY.cb('pxn:3'); pz = px_last(PY); fpost(f"/_mp/pay/{mp_id(pz)}"); fpost('/_mp/mode/get/500')
+s_, body, _ = mp_hook(mp_id(pz)); check('webhook while the API fails → 500 (Mercado Pago retries), not credited', s_ == 500 and abs(PY.bal() - 7) < 1e-9, (s_, PY.bal()))
+fpost('/_mp/mode/get/200')
+sql(f"UPDATE payments SET created_at='2026-01-01T00:00:00.000Z', checked_at=NULL WHERE id='{pz['id']}'")
+sql(f"UPDATE payments SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-5 minutes'), checked_at=NULL WHERE id='{pz['id']}'")
+ev = cron(); check('cron picks up the missed approval → credited $3.00', abs(PY.bal() - 10) < 1e-9, PY.bal())
+# cancel
+ev, ans = PY.cb('pxn:4'); pc = px_last(PY); PY.mid = last_screen(ev)['mid']
+ev, ans = PY.cb(f"tux:{pc['id']}"); pc2 = px_last(PY)
+check('cancel → PUT cancelled at Mercado Pago, row canceled', pc2['status'] == 'canceled' and mp_calls(ev, 'PUT'), (pc2['status'], ans))
+# insufficient balance at checkout offers Pix
+PW = User(555092, 'Wes', 'wes'); ev = PW.msg('/start'); PW.mid = last_screen(ev)['mid']
+ev, ans = PW.cb('confirm:liveira_access:3'); scr = last_screen(ev)
+check('insufficient balance → "Top up … with Pix" button resuming the purchase', scr and any(c.startswith('pxc:') and c.endswith(':liveira_access:3') for c in cbdata(scr)), scr and cbdata(scr))
+s_, body, _ = req('GET', '/admin/api/pix/status', None, AH); d = json.loads(body)
+check('panel: Pix status (no secrets), webhook URL', d.get('available') is True and d.get('webhook_url', '').endswith('/mercadopago/webhook') and 'APP_USR' not in body, d)
+ev = cron(BASE2); check('no Mercado Pago token → cron makes no Mercado Pago request', not mp_calls(ev))
+P3 = User2(555093, 'Ina', 'ina'); ev = P3.msg('/start'); ev, ans = P3.cb('px')
+check('no Mercado Pago token → Pix unavailable screen', last_screen(ev) and 'Pix is currently unavailable' in last_screen(ev)['body']['text'], last_screen(ev))
 
 ans_all = [e for e in logs() if e.get('tg') == 'answerCallbackQuery']
 ids = [e['body']['callback_query_id'] for e in ans_all]

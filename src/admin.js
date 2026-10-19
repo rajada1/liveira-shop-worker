@@ -24,6 +24,7 @@ import { topupConfig, syncPayment, expireStale, callbackUrl, round2, oxapayAccep
 import { noteMessages } from "./chatnav.js";
 import { binanceConfigured, binanceStatus, binanceDiag, refreshHistory, verifyClaim, approveClaim, notifyClaim } from "./binance.js";
 import { npConfig, npConfigured, npStatus, npCheck, npApiStatus, refreshNpMin, createNpInvoice, ipnUrl } from "./nowpayments.js";
+import { pixStatus } from "./pix.js";
 import { spConfig, spConfigured, spStatus, spCheck, spAccount, createSpSession, expireSpSession, webhookUrl, spWebhookEndpoint } from "./stripe.js";
 import { checkGroup, validInviteLink } from "./group.js";
 
@@ -397,6 +398,7 @@ async function route(ctx, method, api) {
   if (api === "/nowpayments/test-invoice" && method === "POST") return npTestInvoiceApi(ctx);
 
   // Stripe (status / account + webhook check / test session that is expired right away; secrets are never returned)
+  if (api === "/pix/status" && method === "GET") return aj(await pixStatus(env, ctx.settings));
   if (api === "/stripe/status" && method === "GET") return aj(await spStatus(env, ctx.settings));
   if (api === "/stripe/test" && method === "POST") return spTestApi(ctx);
   if (api === "/stripe/test-session" && method === "POST") return spTestSessionApi(ctx);
@@ -1185,6 +1187,13 @@ async function putSettings({ request, env, settings, actor }) {
       v = String(round2(num(String(b[k]).replace(",", "."), "Mínimo do cartão (Stripe)", { min: 1, max: 100000 })));
     } else if (k === "stripe_max") {
       v = String(round2(num(String(b[k]).replace(",", "."), "Máximo do cartão (Stripe)", { min: 1, max: 100000 })));
+    } else if (k === "pix_min" || k === "pix_max") {
+      v = String(round2(num(String(b[k]).replace(",", "."), k === "pix_min" ? "Mínimo do Pix" : "Máximo do Pix", { min: 1, max: 100000 })));
+    } else if (k === "pix_usd_brl") {
+      const raw = String(b[k]).trim().replace(",", ".");
+      v = raw === "" || raw === "0" ? "" : String(num(raw, "Cotação USD→BRL do Pix", { min: 2, max: 20 }));
+    } else if (k === "pix_fx_spread") {
+      v = String(num(String(b[k]).trim().replace(",", ".") || "0", "Spread do Pix (%)", { min: 0, max: 50 }));
     } else if (k === "nowpayments_min") {
       const raw = String(b[k]).trim().replace(",", ".");
       v = raw === "" || raw === "0" ? "" : String(round2(num(raw, "Mínimo NOWPayments", { min: 1, max: 100000 })));
@@ -1205,7 +1214,7 @@ async function putSettings({ request, env, settings, actor }) {
         }
       }
       v = ids.join(",");
-    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled" || k === "binance_enabled" || k === "nowpayments_enabled" || k === "stripe_enabled" || k === "group_gate" || k === "feed_purchases" || k === "free_trial_enabled") {
+    } else if (k === "maintenance_mode" || k === "crypto_topup_enabled" || k === "binance_enabled" || k === "nowpayments_enabled" || k === "stripe_enabled" || k === "pix_enabled" || k === "group_gate" || k === "feed_purchases" || k === "free_trial_enabled") {
       v = b[k] === true || b[k] === "1" || b[k] === 1 ? "1" : "0";
     } else {
       v = String(b[k]).replace(/\r\n/g, "\n");

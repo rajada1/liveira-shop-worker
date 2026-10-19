@@ -149,6 +149,8 @@ export function invoiceCard(pay, s, supportLine, L = "en") {
   const open = st === "pending" || st === "paying";
   const np = pay.provider === "nowpayments";
   const sp = pay.provider === "stripe";
+  const px = pay.provider === "mercadopago";
+  if (px) return pixCard(pay, s, supportLine, L);
   let text = t(L, "card.title", { amt: e(money(pay.amount_usd, cur)), sfx: np ? " · NOWPayments" : sp ? t(L, "card.sfx_sp") : "" });
   text += t(L, "card.status", { st: statusLine(st, sp, L) });
   if (open && pay.expires_at) {
@@ -165,6 +167,31 @@ export function invoiceCard(pay, s, supportLine, L = "en") {
   const rows = [];
   if (open && pay.pay_link) rows.push([urlBtn(t(L, sp ? "btn.pay_card" : "btn.pay_now"), pay.pay_link, "success")]);
   if (open || (st === "canceled" && !sp)) rows.push([btn(t(L, "btn.check"), `tuchk:${pay.id}`, "primary")]);
+  if (st === "pending") rows.push([btn(t(L, "btn.cancel"), `tux:${pay.id}`, "danger")]);
+  if (["expired", "canceled", "error", "failed"].includes(st)) rows.push([btn(t(L, "btn.new_topup"), "topup", "success")]);
+  rows.push([HOME(L)]);
+  return { text, reply_markup: kb(rows) };
+}
+
+/** Pix (Mercado Pago) top-up card: BRL amount, copia-e-cola code (tap to copy), link to the QR code page. */
+function pixCard(pay, s, supportLine, L = "en") {
+  const cur = s.currency_symbol || "$";
+  const st = pay.status;
+  const open = st === "pending" || st === "paying";
+  const brl = `R$ ${Number(pay.amount_brl || 0).toFixed(2).replace(".", ",")}`;
+  let text = t(L, "card.title", { amt: e(money(pay.amount_usd, cur)), sfx: " · Pix" });
+  text += t(L, "card.status", { st: statusLine(st, false, L) });
+  text += t(L, "px.card_brl", { brl: e(brl), rate: e(Number(pay.fx_rate || 0).toFixed(4).replace(".", ",")) });
+  if (open && pay.expires_at) text += t(L, "px.card_open", { at: e(fmtTimeBrt(pay.expires_at)), rel: tgRelTime(pay.expires_at, "30 min") });
+  text += "\n";
+  if (open && pay.pix_code) text += t(L, "px.card_code") + `<code>${e(pay.pix_code)}</code>\n\n` + t(L, "px.how") + "\n";
+  if (st === "canceled") text += t(L, "card.canceled");
+  if (["underpaid", "refunding", "refunded", "failed", "review"].includes(st)) text += `${supportLine}\n\n`;
+  text += `Ref: <code>${e(pay.id)}</code>`;
+  const rows = [];
+  if (open && pay.pix_code && pay.pix_code.length <= 256) rows.push([{ text: t(L, "btn.px_copy"), copy_text: { text: pay.pix_code }, style: "success" }]);
+  if (open && pay.pay_link) rows.push([urlBtn(t(L, "btn.px_qr"), pay.pay_link)]);
+  if (open) rows.push([btn(t(L, "btn.px_check"), `tuchk:${pay.id}`, "primary")]);
   if (st === "pending") rows.push([btn(t(L, "btn.cancel"), `tux:${pay.id}`, "danger")]);
   if (["expired", "canceled", "error", "failed"].includes(st)) rows.push([btn(t(L, "btn.new_topup"), "topup", "success")]);
   rows.push([HOME(L)]);
