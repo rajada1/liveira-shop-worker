@@ -93,6 +93,14 @@ export const SETTING_DEFAULTS = {
   stripe_min: "5",
   stripe_max: "500",
   stripe_webhook_id: "",
+  // Pix top-ups via Mercado Pago (src/pix.js): shown only when MERCADOPAGO_ACCESS_TOKEN is set. pix_min / pix_max in USD.
+  // pix_usd_brl: fixed USD→BRL rate ("" = live quote, cached in pix_fx_cache); pix_fx_spread: % added on top of the rate.
+  pix_enabled: "1",
+  pix_min: "1",
+  pix_max: "500",
+  pix_usd_brl: "",
+  pix_fx_spread: "0",
+  pix_fx_cache: "",
   // Community group (src/group.js), like @LiveiraStore_bot: nothing is required while group_chat_id is empty.
   // group_gate: users must be in the group to use the bot (admins exempt); feed_purchases: "🛍 New purchase!" posts.
   // group_title is filled by the panel's "Verificar grupo" check (informational).
@@ -127,6 +135,11 @@ export const EDITABLE_SETTINGS = [
   "stripe_enabled",
   "stripe_min",
   "stripe_max",
+  "pix_enabled",
+  "pix_min",
+  "pix_max",
+  "pix_usd_brl",
+  "pix_fx_spread",
   "binance_pay_id",
   "binance_currencies",
   "binance_max",

@@ -59,6 +59,7 @@ import {
 import { getNav, claimMenu, setKeyboardMessage, noteMessage } from "./chatnav.js";
 import { npConfig, createNpInvoice, npCheck } from "./nowpayments.js";
 import { spConfig, createSpSession, spCheck, spCancel } from "./stripe.js";
+import { pixConfig, createPix, pixCheck, pixCancel, quoteBrl, PIX_LIFETIME_MIN } from "./pix.js";
 import {
   binanceConfig,
   binanceConfigured,
@@ -328,6 +329,16 @@ function shortfallBlock(s, env, bal, price, pid, days, L) {
     else {
       rows.push(cardRow, [btn(t(L, "sf.btn_other"), "topup")]);
       text += t(L, "sf.card", { min: e(money(spc.min, cur)) });
+    }
+  }
+  const pxc = pixConfig(s, env);
+  if (pxc.available) {
+    const amt = shortfallAmount(missing, pxc);
+    const pixRow = [btn(t(L, "sf.btn_pix", { amt: money(amt, cur) }), `pxc:${amt}:${pid}:${days}`, rows.length ? undefined : "success")];
+    if (rows.length) rows.splice(rows.length - 1, 0, pixRow);
+    else {
+      rows.push(pixRow, [btn(t(L, "sf.btn_other"), "topup")]);
+      text += t(L, "sf.pix", { min: e(money(pxc.min, cur)) });
     }
   }
   if (!rows.length) text += `\n${supportLine(s, L)}`;
@@ -629,6 +640,7 @@ const METHOD_KEY = {
   binance: "method.binance",
   nowpayments: "method.nowpayments",
   stripe: "method.stripe",
+  pix: "method.pix",
   stripe_refund: "method.stripe_refund",
   admin_add: "method.credit",
   panel_add: "method.credit",
@@ -717,7 +729,8 @@ async function screenTopup(env, s, user) {
   const bc = binanceConfig(s, env);
   const npc = npConfig(s, env);
   const spc = spConfig(s, env);
-  if (!tc.available && !bc.available && !npc.available && !spc.available) return unavailableTopup(s, L);
+  const pxc = pixConfig(s, env);
+  if (!tc.available && !bc.available && !npc.available && !spc.available && !pxc.available) return unavailableTopup(s, L);
   const cur = s.currency_symbol;
   const bal = await getBalance(env, user.id);
   const binanceLine = t(L, "topup.binance_line");
@@ -725,15 +738,17 @@ async function screenTopup(env, s, user) {
   const npRow = npc.available ? [btn(t(L, "btn.np"), "np", tc.available ? undefined : "primary")] : null;
   const spLine = t(L, "topup.sp_line", { min: e(money(spc.min, cur)) });
   const spRow = spc.available ? [btn(t(L, "btn.sp"), "sp", tc.available || npc.available ? undefined : "primary")] : null;
+  const pxLine = t(L, "topup.px_line", { min: e(money(pxc.min, cur)) });
+  const pxRow = pxc.available ? [btn(t(L, "btn.px"), "px", "success")] : null;
   if (!tc.available) {
-    const lines = [npc.available ? npLine : "", spc.available ? spLine : "", bc.available ? binanceLine : ""].filter(Boolean);
+    const lines = [pxc.available ? pxLine : "", npc.available ? npLine : "", spc.available ? spLine : "", bc.available ? binanceLine : ""].filter(Boolean);
     return {
       text:
         t(L, "topup.title") +
         t(L, "topup.current", { bal: e(money(bal, cur)) }) +
-        (npc.available || spc.available ? "" : t(L, "topup.ox_unavail")) +
+        (npc.available || spc.available || pxc.available ? "" : t(L, "topup.ox_unavail")) +
         lines.join("\n\n"),
-      reply_markup: kb([npRow, spRow, bc.available ? [btn(t(L, "btn.binance"), "bn", npc.available || spc.available ? undefined : "primary")] : null, navRow("home", L)]),
+      reply_markup: kb([pxRow, npRow, spRow, bc.available ? [btn(t(L, "btn.binance"), "bn", npc.available || spc.available ? undefined : "primary")] : null, navRow("home", L)]),
     };
   }
   const presetBtns = tc.presets.map((a) => btn(money(a, cur).replace(/\.00$/, ""), `tuc:${a}`, "primary"));
@@ -748,22 +763,24 @@ async function screenTopup(env, s, user) {
       howItWorks(s, { pickAmount: true }, L) +
       (npc.available ? `\n${npLine}` : "") +
       (spc.available ? `\n${spLine}` : "") +
+      (pxc.available ? `\n${pxLine}` : "") +
       (bc.available ? `\n${binanceLine}` : ""),
-    reply_markup: kb([...grid(presetBtns, presetBtns.length === 4 ? 2 : 3), otherRow, npRow, spRow, navRow("home", L)]),
+    reply_markup: kb([...grid(presetBtns, presetBtns.length === 4 ? 2 : 3), otherRow, pxRow, npRow, spRow, navRow("home", L)]),
   };
 }
 
 function screenKeypad(s, env, digits, note, mode = "kp", L = "en") {
   const np = mode === "np";
   const sp = mode === "sp";
-  const tc = np ? npConfig(s, env) : sp ? spConfig(s, env) : topupConfig(s, env);
-  if (!tc.available) return np ? npUnavailable(s, L) : sp ? spUnavailable(s, L) : unavailableTopup(s, L);
+  const px = mode === "px";
+  const tc = np ? npConfig(s, env) : sp ? spConfig(s, env) : px ? pixConfig(s, env) : topupConfig(s, env);
+  if (!tc.available) return np ? npUnavailable(s, L) : sp ? spUnavailable(s, L) : px ? pxUnavailable(s, L) : unavailableTopup(s, L);
   const cur = s.currency_symbol;
-  const P = np ? "nk" : sp ? "sk" : "kp";
+  const P = np ? "nk" : sp ? "sk" : px ? "pk" : "kp";
   const shown = digits ? Number(digits).toLocaleString("en-US") : "0";
   const valid = digits && Number(digits) >= tc.min && Number(digits) <= tc.max;
   const text =
-    t(L, "kp.title", { sfx: np ? " · NOWPayments" : sp ? t(L, "kp.sfx_card") : "" }) +
+    t(L, "kp.title", { sfx: np ? " · NOWPayments" : sp ? t(L, "kp.sfx_card") : px ? " · Pix" : "" }) +
     `<b>💵 ${e(cur)} ${e(shown)}</b>${digits ? "" : " ▏"}\n\n` +
     t(L, "kp.minmax", { min: e(money(tc.min, cur)), max: e(money(tc.max, cur)) }) +
     (np ? t(L, "kp.np_note") : "") +
@@ -777,7 +794,7 @@ function screenKeypad(s, env, digits, note, mode = "kp", L = "en") {
       [d(4), d(5), d(6)],
       [d(7), d(8), d(9)],
       [btn("⌫", `${P}:${digits.slice(0, -1)}`), d(0), btn("✅", `${P}ok:${digits}`, valid ? "success" : undefined)],
-      navRow(np ? "np" : sp ? "sp" : "topup", L),
+      navRow(np ? "np" : sp ? "sp" : px ? "px" : "topup", L),
     ]),
   };
 }
@@ -817,6 +834,72 @@ function spAltRow(s, env, amount, suffix, L) {
   const spc = spConfig(s, env);
   if (!spc.available || amount < spc.min || amount > spc.max) return null;
   return [btn(t(L, "btn.sp_alt"), `spn:${amount}${suffix}`)];
+}
+
+/* ─── Pix (Mercado Pago, BRL charge → USD credit) ─── */
+
+function pxUnavailable(s, L = "en") {
+  return { text: t(L, "px.unavailable", { support: supportLine(s, L) }), reply_markup: kb([navRow("topup", L)]) };
+}
+
+function screenPx(s, env, L = "en") {
+  const pxc = pixConfig(s, env);
+  if (!pxc.available) return pxUnavailable(s, L);
+  const cur = s.currency_symbol;
+  const presetBtns = pxc.presets.map((a) => btn(money(a, cur).replace(/\.00$/, ""), `pxc:${a}`, "primary"));
+  return {
+    text:
+      t(L, "px.title") +
+      t(L, "px.intro") +
+      t(L, "sp.minmax", { min: e(money(pxc.min, cur)), max: e(money(pxc.max, cur)) }) +
+      t(L, "common.choose_amount"),
+    reply_markup: kb([...grid(presetBtns, presetBtns.length === 4 ? 2 : 3), [btn(t(L, "btn.other"), "pk:")], navRow("topup", L)]),
+  };
+}
+
+async function screenConfirmPx(env, s, amount, resume, L = "en") {
+  const pxc = pixConfig(s, env);
+  if (!pxc.available) return pxUnavailable(s, L);
+  const q = await quoteBrl(env, s, amount);
+  if (!q) return { text: t(L, "px.head", { msg: t(L, "px.fx_fail"), support: supportLine(s, L) }), reply_markup: kb([navRow("px", L)]) };
+  const cur = s.currency_symbol;
+  const suffix = resume ? `:${resume.pid}:${resume.days}` : "";
+  const brl = `R$ ${q.brl.toFixed(2).replace(".", ",")}`;
+  return {
+    text:
+      t(L, "pxc.title") +
+      t(L, "pxc.amount", { amt: e(money(amount, cur)) }) +
+      t(L, "pxc.brl", { brl: e(brl), rate: e(q.rate.toFixed(4).replace(".", ",")) }) +
+      t(L, "pxc.valid", { n: PIX_LIFETIME_MIN }) +
+      (resume ? t(L, "spc.resume") : "") +
+      t(L, "spc.auto"),
+    reply_markup: kb([[btn(t(L, "btn.px_generate", { brl }), `pxn:${amount}${suffix}`, "success")], [btn(t(L, "btn.change_amount"), "px")], [HOME(L)]]),
+  };
+}
+
+function pxAmountError(pxc, amount, cur, L = "en") {
+  if (amount === null || !Number.isFinite(amount)) return t(L, "err.amount");
+  if (amount < pxc.min) return t(L, "err.px_min", { min: money(pxc.min, cur) });
+  if (amount > pxc.max) return t(L, "err.px_max", { max: money(pxc.max, cur) });
+  return null;
+}
+
+async function createPxFlow(env, s, user, nav, amount, resume) {
+  const L = user.lang;
+  const pxc = pixConfig(s, env);
+  if (!pxc.available) return show(env, nav, pxUnavailable(s, L));
+  const errMsg = pxAmountError(pxc, amount, s.currency_symbol, L);
+  if (errMsg) return show(env, nav, screenKeypad(s, env, "", errMsg, "px", L));
+  const r = await createPix(env, s, { userId: user.id, chatId: nav.chatId, amount, resume: resume ? `${resume.pid}:${resume.days}` : null });
+  if (!r.ok) {
+    const msg = t(L, r.reason === "too_many" ? "sp.too_many" : r.reason === "unconfigured" ? "px.unconf" : r.reason === "fx" ? "px.fx_fail" : "px.fail");
+    return show(env, nav, { text: t(L, "px.head", { msg, support: supportLine(s, L) }), reply_markup: kb([navRow("px", L)]) });
+  }
+  const card = invoiceCard(r.payment, s, supportLine(s, L), L);
+  if (r.reused && nav.messageId && r.payment.message_id === nav.messageId) nav.inPlace = true;
+  const res = await show(env, nav, { ...card, record: true });
+  if (res?.message_id) await setPaymentMessage(env, r.payment.id, nav.chatId, res.message_id);
+  return { ...res, toast: t(L, r.reused ? "toast.px_reused" : "toast.px_ready") };
 }
 
 /* ─── Stripe (hosted Checkout: credit / debit card, USD) ─── */
@@ -1045,7 +1128,13 @@ async function checkStatusFlow(env, s, user, nav, id) {
     return { toast: t(L, "toast.already_paid") };
   }
   let toast = null;
-  if (pay.provider === "stripe") {
+  if (pay.provider === "mercadopago") {
+    const r = await pixCheck(env, s, { ...pay, message_id: nav.messageId || pay.message_id }, "user_check");
+    if (r.action === "credited") return { toast: t(L, "toast.confirmed") };
+    if (r.action === "duplicate") return { toast: t(L, "toast.already_paid") };
+    if (r.action === "api_error") toast = t(L, "toast.api_err");
+    if (r.action === "pending") toast = t(L, "toast.px_nopay");
+  } else if (pay.provider === "stripe") {
     const r = await spCheck(env, s, { ...pay, message_id: nav.messageId || pay.message_id }, "user_check");
     if (r.action === "credited") return { toast: t(L, "toast.confirmed") };
     if (r.action === "duplicate") return { toast: t(L, "toast.already_paid") };
@@ -1343,6 +1432,7 @@ async function route(env, s, user, nav, data) {
   if (data === "np_paid") return npLatestFlow(env, s, user, nav);
   if (data === "sp" || data === "stripe") return show(env, nav, screenSp(s, env, L));
   if (data === "sp_paid") return spLatestFlow(env, s, user, nav);
+  if (data === "px" || data === "pix") return show(env, nav, screenPx(s, env, L));
   if (data === "bnp") {
     if (!binanceConfig(s, env).available) return show(env, nav, binanceUnavailable(s, L));
     await sendMessage(env, nav.chatId, e(t(L, "bn.prompt")), { reply_markup: { force_reply: true, input_field_placeholder: t(L, "bn.placeholder") } });
@@ -1407,6 +1497,29 @@ async function route(env, s, user, nav, data) {
     return show(env, nav, screenConfirmSp(s, env, p.amount, p.resume, L));
   }
 
+  // Pix keypad (pk:/pkok:), confirm (pxc) and create (pxn)
+  if ((m = /^pk:(\d{0,12})$/.exec(data))) {
+    const pxc = pixConfig(s, env);
+    const digits = m[1].replace(/^0+/, "");
+    if (digits.length > KEYPAD_MAX_DIGITS || (digits && Number(digits) > pxc.max)) return { toast: t(L, "toast.max", { max: money(pxc.max, s.currency_symbol) }) };
+    return show(env, nav, screenKeypad(s, env, digits, null, "px", L));
+  }
+  if ((m = /^pkok:(\d{0,12})$/.exec(data))) {
+    const err = pxAmountError(pixConfig(s, env), m[1] ? Number(m[1]) : 0, s.currency_symbol, L);
+    if (err) return { toast: err.slice(0, 190) };
+    return show(env, nav, await screenConfirmPx(env, s, Number(m[1]), null, L));
+  }
+  if ((m = /^(pxc|pxn):(.+)$/.exec(data))) {
+    const p = parseTopupData(m[2]);
+    const pxc = pixConfig(s, env);
+    if (!pxc.available) return show(env, nav, pxUnavailable(s, L));
+    if (!p) return { toast: t(L, "toast.invalid_amount") };
+    const err = pxAmountError(pxc, p.amount, s.currency_symbol, L);
+    if (err) return show(env, nav, screenKeypad(s, env, "", err, "px", L));
+    if (m[1] === "pxn") return createPxFlow(env, s, user, nav, p.amount, p.resume);
+    return show(env, nav, await screenConfirmPx(env, s, p.amount, p.resume, L));
+  }
+
   // NOWPayments keypad (nk:/nkok:), confirm (npc) and create (npn)
   if ((m = /^nk:(\d{0,12})$/.exec(data))) {
     const npc = npConfig(s, env);
@@ -1453,7 +1566,11 @@ async function route(env, s, user, nav, data) {
     const id = data.slice(4);
     const before = await env.DB.prepare("SELECT * FROM payments WHERE id=? AND telegram_user_id=?").bind(id, user.id).first();
     let ok;
-    if (before?.provider === "stripe") {
+    if (before?.provider === "mercadopago") {
+      const r = await pixCancel(env, s, before, user.id);
+      if (r.action === "credited" || r.action === "duplicate") return { toast: t(L, "toast.already_completed") };
+      ok = r.ok;
+    } else if (before?.provider === "stripe") {
       const r = await spCancel(env, s, before, user.id);
       if (r.action === "credited" || r.action === "duplicate") return { toast: t(L, "toast.already_completed") };
       ok = r.ok;
@@ -1530,7 +1647,7 @@ async function handleCallback(env, query, s) {
   }
 }
 
-const DEEP_LINKS = new Set(["shop", "topup", "binance", "nowpayments", "np_paid", "stripe", "sp_paid", "licenses", "downloads", "profile", "support", "help", "home", "menu", "free", "lang"]);
+const DEEP_LINKS = new Set(["shop", "topup", "binance", "nowpayments", "np_paid", "stripe", "sp_paid", "pix", "px", "licenses", "downloads", "profile", "support", "help", "home", "menu", "free", "lang"]);
 const ADMIN_CMDS = ["/addbal", "/subbal", "/setbal", "/bal"];
 
 async function handleCommand(env, message, s) {

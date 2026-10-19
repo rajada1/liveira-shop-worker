@@ -27,6 +27,10 @@ SP_DOC = {'mode', 'payment_method_types[0]', 'line_items[0][quantity]', 'line_it
           'metadata[topup_id]', 'metadata[telegram_user_id]', 'metadata[source]', 'payment_intent_data[metadata][topup_id]',
           'payment_intent_data[metadata][telegram_user_id]', 'payment_intent_data[metadata][source]', 'payment_intent_data[description]',
           'submit_type', 'success_url', 'cancel_url', 'expires_at'}
+# Mercado Pago (Pix): Bearer token, JSON, X-Idempotency-Key; POST/GET/PUT /mp/v1/payments
+MP_KEY = 'APP_USR-test-local-fake'; MP_PAYS, MP_IDEM = {}, {}; MP_MODE = {'get': 200, 'create': 200}
+mp_counter = itertools.count(90000000001)
+MP_DOC = {'transaction_amount', 'description', 'payment_method_id', 'external_reference', 'date_of_expiration', 'payer', 'notification_url', 'metadata'}
 # Telegram groups: getChatMember / getChat; membership per (chat, user) — default 'left' (never joined)
 GROUPS = {'-1001234567890': {'title': 'Liveira Test Group', 'type': 'supergroup'}, '-1009876543210': {'title': 'Liveira Test Group', 'type': 'supergroup'}}
 MEMBERS = {}  # (chat, user) -> {'status': ..., 'is_member': ...}
@@ -187,7 +191,39 @@ class H(BaseHTTPRequestHandler):
             if ss['status'] != 'open': return self.sp_err(400, 'invalid_request_error', 'Only Checkout Sessions with a status in ["open"] can be expired.')
             ss['status'] = 'expired'; return self._send(ss)
         return self.sp_err(404, 'invalid_request_error', 'Unrecognized request URL')
+    def mp(self, method, body=''):
+        path = self.path.split('?')[0]
+        d = json.loads(body) if body else None
+        log({'mp': method, 'path': path, 'key_ok': self.headers.get('Authorization') == 'Bearer ' + MP_KEY, 'idem': self.headers.get('X-Idempotency-Key'), 'body': d})
+        if self.headers.get('Authorization') != 'Bearer ' + MP_KEY: return self._send({'message': 'invalid access token', 'status': 401}, 401)
+        if method == 'POST' and path == '/mp/v1/payments':
+            for k in d:
+                if k not in MP_DOC: log({'violation': ['unexpected Mercado Pago field ' + k], 'method': 'mp payment', 'body': d})
+            idem = self.headers.get('X-Idempotency-Key')
+            if idem in MP_IDEM: return self._send(MP_PAYS[MP_IDEM[idem]], 201)
+            if MP_MODE['create'] != 200: return self._send({'message': 'fake create error', 'status': MP_MODE['create']}, MP_MODE['create'])
+            pid = str(next(mp_counter))
+            code = '00020101021226930014br.gov.bcb.pix2571pix-qr.mercadopago.com/instore/o/v2/' + pid + '5204000053039865406' + ('%.2f' % d['transaction_amount']) + '5802BR6304ABCD'
+            p = {'id': int(pid), 'status': 'pending', 'status_detail': 'pending_waiting_transfer', 'transaction_amount': d['transaction_amount'], 'currency_id': 'BRL',
+                 'external_reference': d['external_reference'], 'payment_method_id': 'pix', 'date_of_expiration': d.get('date_of_expiration'),
+                 'point_of_interaction': {'transaction_data': {'qr_code': code, 'qr_code_base64': 'iVBORw0KGgo=', 'ticket_url': 'https://www.mercadopago.com.br/payments/' + pid + '/ticket?caller_id=1'}}}
+            MP_PAYS[pid] = p; MP_IDEM[idem] = pid
+            return self._send(p, 201)
+        if path.startswith('/mp/v1/payments/'):
+            pid = path.rsplit('/', 1)[1]; p = MP_PAYS.get(pid)
+            if method == 'GET' and MP_MODE['get'] != 200: return self._send({'message': 'fake error'}, MP_MODE['get'])
+            if not p: return self._send({'message': 'Payment not found', 'status': 404}, 404)
+            if method == 'PUT':
+                if p['status'] != 'pending': return self._send({'message': 'Invalid status', 'status': 400}, 400)
+                p['status'] = d.get('status', p['status'])
+            return self._send(p)
+        return self._send({'message': 'not found'}, 404)
+    def do_PUT(self):
+        n = int(self.headers.get('Content-Length') or 0); body = self.rfile.read(n).decode(errors='replace') if n else ''
+        if self.path.startswith('/mp/v1/'): return self.mp('PUT', body)
+        self._send({'ok': False}, 404)
     def do_GET(self):
+        if self.path.startswith('/mp/v1/'): return self.mp('GET')
         if self.path.startswith('/stripe/v1/'): return self.sp_get()
         if self.path.startswith('/np/v1/'): return self.np_get()
         if self.path.startswith('/sapi/v1/pay/transactions'): return self.binance()
@@ -210,6 +246,12 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get('Content-Length') or 0); body = self.rfile.read(n).decode(errors='replace') if n else ''
         if self.path.startswith('/stripe/v1/'): return self.sp_post(body)
+        if self.path.startswith('/mp/v1/'): return self.mp('POST', body)
+        if self.path.startswith('/_mp/pay/'):  # set a Pix payment's fields (default: approved)
+            pid = self.path.split('/')[3]; o = json.loads(body) if body else {}
+            MP_PAYS[pid].update({'status': 'approved', **o}); return self._send({'ok': True})
+        if self.path.startswith('/_mp/mode/'):
+            _, _, _, k, st = self.path.split('/'); MP_MODE[k] = int(st); return self._send({'ok': True})
         if self.path.startswith('/_sp/pay/'):  # mark a session paid: complete/paid + PaymentIntent + Charge
             sid = self.path.split('/')[3]; ss = SP_SESS[sid]; o = json.loads(body) if body else {}
             pi, ch = 'pi_fake' + sid[-14:], 'ch_fake' + sid[-14:]

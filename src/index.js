@@ -6,6 +6,7 @@
  * - OxaPay payment callback (POST /oxapay/callback)
  * - NOWPayments IPN (POST /nowpayments/ipn, HMAC-SHA512 with the IPN secret; src/nowpayments.js)
  * - Stripe webhook (POST /stripe/webhook, Stripe-Signature HMAC-SHA256; src/stripe.js)
+ * - Mercado Pago Pix webhook (POST /mercadopago/webhook; payment re-read with the access token; src/pix.js)
  * - Cron (every minute): re-check pending Binance Pay claims (src/binance.js), NOWPayments payments and Stripe sessions;
  *   free trial "ended" reminders (src/freetrial.js)
  */
@@ -16,6 +17,7 @@ import { handleOxapayCallback } from "./oxapay.js";
 import { binanceCron } from "./binance.js";
 import { handleNpIpn, npCron } from "./nowpayments.js";
 import { handleStripeWebhook, spCron } from "./stripe.js";
+import { handleMpWebhook, pixCron } from "./pix.js";
 import { freeTrialCron } from "./freetrial.js";
 
 function unauthorized() {
@@ -154,6 +156,11 @@ export default {
       console.error("stripe cron error", err && err.stack ? err.stack : err);
     }
     try {
+      await pixCron(env);
+    } catch (err) {
+      console.error("pix cron error", err && err.stack ? err.stack : err);
+    }
+    try {
       await freeTrialCron(env);
     } catch (err) {
       console.error("free trial cron error", err && err.stack ? err.stack : err);
@@ -219,6 +226,17 @@ export default {
       } catch (err) {
         console.error("stripe webhook error", err && err.stack ? err.stack : err);
         return new Response("error", { status: 500 }); // non-2xx → Stripe retries; the cron also re-checks sessions
+      }
+    }
+
+    // Mercado Pago (Pix) webhook: the payment is always re-read with MERCADOPAGO_ACCESS_TOKEN before crediting
+    if (path === "/mercadopago/webhook") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      try {
+        return await handleMpWebhook(request, env);
+      } catch (err) {
+        console.error("mercadopago webhook error", err && err.stack ? err.stack : err);
+        return new Response("error", { status: 500 }); // Mercado Pago retries; the cron also re-checks
       }
     }
 

@@ -38,8 +38,14 @@ STRIPE_SECRET_KEY=sk_test_local_fake
 STRIPE_WEBHOOK_SECRET=whsec_test_local_0123456789abcdef
 STRIPE_API_BASE=http://127.0.0.1:9911/stripe/v1
 V
-grep -v -E '^(BINANCE_API_(KEY|SECRET)|NOWPAYMENTS_(API_KEY|IPN_SECRET)|STRIPE_(SECRET_KEY|WEBHOOK_SECRET))=' .dev.vars > tests/bot/nosecrets/.dev.vars
-MIGS="tests/bot/base_schema.sql migrations/0002_admin_panel.sql migrations/0003_oxapay.sql migrations/0004_bot_ux.sql migrations/0005_accepted_currencies.sql migrations/0006_chat_nav.sql migrations/0007_binance.sql migrations/0008_binance_order_id.sql migrations/0009_nowpayments.sql migrations/0010_stripe.sql migrations/0011_group.sql migrations/0012_lang.sql migrations/0013_free_trial.sql"
+# Fake Mercado Pago (Pix, local only) + fixed USD→BRL rate (no internet). Appended to an existing .dev.vars if missing.
+grep -q '^MERCADOPAGO_API_BASE=' .dev.vars || cat >> .dev.vars <<'V'
+MERCADOPAGO_ACCESS_TOKEN=APP_USR-test-local-fake
+MERCADOPAGO_API_BASE=http://127.0.0.1:9911/mp
+PIX_FX_RATE=5.5
+V
+grep -v -E '^(BINANCE_API_(KEY|SECRET)|NOWPAYMENTS_(API_KEY|IPN_SECRET)|STRIPE_(SECRET_KEY|WEBHOOK_SECRET)|MERCADOPAGO_ACCESS_TOKEN)=' .dev.vars > tests/bot/nosecrets/.dev.vars
+MIGS="tests/bot/base_schema.sql migrations/0002_admin_panel.sql migrations/0003_oxapay.sql migrations/0004_bot_ux.sql migrations/0005_accepted_currencies.sql migrations/0006_chat_nav.sql migrations/0007_binance.sql migrations/0008_binance_order_id.sql migrations/0009_nowpayments.sql migrations/0010_stripe.sql migrations/0011_group.sql migrations/0012_lang.sql migrations/0013_free_trial.sql migrations/0014_pix.sql"
 for st in state state2; do
   for f in $MIGS; do
     env -u CLOUDFLARE_API_TOKEN npx wrangler d1 execute liveira-shop --local --persist-to $T/$st --file $f >/dev/null 2>&1
